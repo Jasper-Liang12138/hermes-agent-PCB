@@ -48,6 +48,7 @@ jobs:
             --add-data "tools;tools" `
             --add-data "gateway;gateway" `
             --add-data "skills;skills" `
+            --add-data "config.ini;." `
             --hidden-import tiktoken_ext.openai_public `
             --hidden-import tiktoken_ext `
             --hidden-import anthropic `
@@ -57,66 +58,58 @@ jobs:
             --collect-all firecrawl `
             cli.py
 
+      - name: Write config.ini
+        shell: pwsh
+        run: |
+          $model = "${{ github.event.inputs.model }}"
+          $port  = "${{ github.event.inputs.ws_port }}"
+          @"
+          # ============================================================
+          # PCB BGA 逃逸布线智能体 — 配置文件
+          # 修改本文件后重启程序生效
+          # ============================================================
+
+          [model]
+          # 大模型 API 密钥
+          api_key  = your_api_key_here
+
+          # 模型名称
+          model    = $model
+
+          # API 接入地址（阿里云百炼示例）
+          base_url = https://dashscope.aliyuncs.com/compatible-mode/v1
+
+          # 版图数据传输模式：0 = 直接返回字符串，1 = 返回文件路径
+          board_data_use_file_path = 0
+
+          [router]
+          # 布线器可执行文件路径（相对于本 exe 所在目录）
+          cmd      = router.exe
+          work_dir = .
+
+          [server]
+          # WebSocket 监听地址和端口
+          host = 0.0.0.0
+          port = $port
+          "@ | Out-File -FilePath dist\agent\config.ini -Encoding utf8
+
       - name: Write install.bat
         shell: pwsh
         run: |
-          $port = "${{ github.event.inputs.ws_port }}"
-          $model = "${{ github.event.inputs.model }}"
           @"
           @echo off
           chcp 65001 >nul
-          setlocal
-          set HERMES=%USERPROFILE%\.hermes
-          set SCRIPT_DIR=%~dp0
+          cd /d "%~dp0"
 
           echo ============================================
           echo  PCB Agent 安装程序 v${{ github.event.inputs.version }}
           echo ============================================
           echo.
-
-          mkdir "%HERMES%" 2>nul
-          mkdir "%HERMES%\memories" 2>nul
-          mkdir "%HERMES%\skills\hardware" 2>nul
-
-          xcopy /E /Y /I "%SCRIPT_DIR%skills" "%HERMES%\skills\" >nul
-          echo [OK] PCB skill 已安装
-
-          if not exist "%HERMES%\.env" (
-              (
-                echo OPENAI_API_KEY=your_api_key_here
-                echo OPENAI_BASE_URL=https://your-endpoint/v1
-              ) > "%HERMES%\.env"
-              echo [!!] 请填写 API Key，正在打开配置文件...
-              notepad "%HERMES%\.env"
-          ) else (
-              echo [OK] .env 已存在，跳过
-          )
-
-          if not exist "%HERMES%\config.yaml" (
-              (
-                echo model:
-                echo   provider: "custom"
-                echo   default: "$model"
-                echo   base_url: ""
-                echo streaming:
-                echo   enabled: true
-                echo gateway:
-                echo   websocket:
-                echo     enabled: true
-                echo     host: "0.0.0.0"
-                echo     port: $port
-                echo agent:
-                echo   reasoning_effort: "medium"
-                echo display:
-                echo   show_reasoning: false
-              ) > "%HERMES%\config.yaml"
-              echo [OK] config.yaml 已生成
-          ) else (
-              echo [OK] config.yaml 已存在，跳过
-          )
-
+          echo 请编辑 config.ini 填入 api_key，然后运行 start.bat 启动。
           echo.
-          echo 安装完成！运行 start.bat 启动 Agent。
+          notepad "%~dp0config.ini"
+          echo.
+          echo 配置完成后，双击 start.bat 启动 Agent。
           pause
           "@ | Out-File -FilePath dist\agent\install.bat -Encoding utf8
 
@@ -129,20 +122,28 @@ jobs:
           chcp 65001 >nul
           cd /d "%~dp0"
 
-          if not exist "%USERPROFILE%\.hermes\.env" (
-              echo 未检测到配置，请先运行 install.bat
+          if not exist "%~dp0config.ini" (
+              echo [!] 找不到 config.ini，请确认文件完整
               pause
               exit /b 1
           )
 
-          set ROUTER_CMD=%~dp0router.exe
-          set ROUTER_WORK_DIR=%~dp0
+          findstr /C:"your_api_key_here" "%~dp0config.ini" >nul 2>&1
+          if not errorlevel 1 (
+              echo [!] 请先编辑 config.ini 填入 api_key，然后重新运行。
+              notepad "%~dp0config.ini"
+              pause
+              exit /b 1
+          )
 
           echo [*] 启动 PCB Agent Gateway...
           echo [*] WebSocket 监听: ws://127.0.0.1:$port
           echo [*] 按 Ctrl+C 退出
           echo.
-          agent.exe gateway
+          agent.exe --gateway
+          echo.
+          echo [!] Gateway 已退出，错误码: %ERRORLEVEL%
+          pause
           "@ | Out-File -FilePath dist\agent\start.bat -Encoding utf8
 
       - name: Write uninstall.bat
@@ -151,7 +152,7 @@ jobs:
           @"
           @echo off
           chcp 65001 >nul
-          echo 此操作将删除 %USERPROFILE%\.hermes\（包含记忆、配置）
+          echo 此操作将删除 %USERPROFILE%\.hermes\（包含记忆、日志）
           set /p CONFIRM=确认删除？(y/N):
           if /i "%CONFIRM%" neq "y" exit /b 0
           rmdir /S /Q "%USERPROFILE%\.hermes"

@@ -45,6 +45,7 @@ jobs:
             --add-data "gateway;gateway" `
             --add-data "skills;skills" `
             --add-data "test_client;test_client" `
+            --add-data "config.ini;." `
             --hidden-import tiktoken_ext.openai_public `
             --hidden-import tiktoken_ext `
             --hidden-import anthropic `
@@ -53,67 +54,6 @@ jobs:
             --hidden-import websockets `
             --collect-all firecrawl `
             cli.py
-
-      - name: Write start-gateway.bat
-        shell: pwsh
-        run: |
-          $port = "${{ github.event.inputs.ws_port }}"
-          $model = "${{ github.event.inputs.model }}"
-          @"
-          @echo off
-          chcp 65001 >nul
-          cd /d "%~dp0"
-
-          if not exist "%USERPROFILE%\.hermes\.env" (
-              echo [!] 未检测到配置，正在生成模板...
-              mkdir "%USERPROFILE%\.hermes" 2>nul
-              (
-                echo OPENAI_API_KEY=your_api_key_here
-                echo OPENAI_BASE_URL=https://your-endpoint/v1
-              ) > "%USERPROFILE%\.hermes\.env"
-              echo 请先编辑 %USERPROFILE%\.hermes\.env 填入 API Key，然后重新运行。
-              notepad "%USERPROFILE%\.hermes\.env"
-              pause
-              exit /b 1
-          )
-
-          if not exist "%USERPROFILE%\.hermes\config.yaml" (
-              (
-                echo model:
-                echo   provider: "custom"
-                echo   default: "$model"
-                echo   base_url: ""
-                echo streaming:
-                echo   enabled: true
-                echo gateway:
-                echo   websocket:
-                echo     enabled: true
-                echo     host: "0.0.0.0"
-                echo     port: $port
-                echo agent:
-                echo   reasoning_effort: "medium"
-                echo display:
-                echo   show_reasoning: true
-              ) > "%USERPROFILE%\.hermes\config.yaml"
-              echo [OK] config.yaml 已生成
-          )
-
-          set ROUTER_CMD=%~dp0router.exe
-          set ROUTER_WORK_DIR=%~dp0
-
-          echo [*] 安装 PCB skill...
-          mkdir "%USERPROFILE%\.hermes\skills\hardware\pcb-intelligence" 2>nul
-          xcopy /E /Y /I "%~dp0skills\hardware\pcb-intelligence" "%USERPROFILE%\.hermes\skills\hardware\pcb-intelligence\" >nul
-
-          echo [*] 启动 PCB Agent Gateway...
-          echo [*] WebSocket 监听: ws://127.0.0.1:$port
-          echo [*] 按 Ctrl+C 退出
-          echo.
-          agent.exe --gateway
-          echo.
-          echo [!] Gateway 已退出，错误码: %ERRORLEVEL%
-          pause
-          "@ | Out-File -FilePath dist\agent\start-gateway.bat -Encoding utf8
 
       - name: Build test-client.exe
         run: |
@@ -126,6 +66,74 @@ jobs:
 
       - name: Copy test-client.exe
         run: copy dist\test-client.exe dist\agent\test-client.exe
+
+      - name: Write config.ini
+        shell: pwsh
+        run: |
+          $model = "${{ github.event.inputs.model }}"
+          $port  = "${{ github.event.inputs.ws_port }}"
+          @"
+          # ============================================================
+          # PCB BGA 逃逸布线智能体 — 配置文件
+          # 修改本文件后重启程序生效
+          # ============================================================
+
+          [model]
+          # 大模型 API 密钥
+          api_key  = your_api_key_here
+
+          # 模型名称
+          model    = $model
+
+          # API 接入地址（阿里云百炼示例）
+          base_url = https://dashscope.aliyuncs.com/compatible-mode/v1
+
+          # 版图数据传输模式：0 = 直接返回字符串，1 = 返回文件路径
+          board_data_use_file_path = 0
+
+          [router]
+          # 布线器可执行文件路径（相对于本 exe 所在目录）
+          cmd      = router.exe
+          work_dir = .
+
+          [server]
+          # WebSocket 监听地址和端口
+          host = 0.0.0.0
+          port = $port
+          "@ | Out-File -FilePath dist\agent\config.ini -Encoding utf8
+
+      - name: Write start-gateway.bat
+        shell: pwsh
+        run: |
+          $port = "${{ github.event.inputs.ws_port }}"
+          @"
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+
+          if not exist "%~dp0config.ini" (
+              echo [!] 找不到 config.ini，请确认文件完整
+              pause
+              exit /b 1
+          )
+
+          findstr /C:"your_api_key_here" "%~dp0config.ini" >nul 2>&1
+          if not errorlevel 1 (
+              echo [!] 请先编辑 config.ini 填入 api_key，然后重新运行。
+              notepad "%~dp0config.ini"
+              pause
+              exit /b 1
+          )
+
+          echo [*] 启动 PCB Agent Gateway...
+          echo [*] WebSocket 监听: ws://127.0.0.1:$port
+          echo [*] 按 Ctrl+C 退出
+          echo.
+          agent.exe --gateway
+          echo.
+          echo [!] Gateway 已退出，错误码: %ERRORLEVEL%
+          pause
+          "@ | Out-File -FilePath dist\agent\start-gateway.bat -Encoding utf8
 
       - name: Write test-client.bat
         shell: pwsh
@@ -147,7 +155,7 @@ jobs:
           pause
           "@ | Out-File -FilePath dist\agent\test-client.bat -Encoding utf8
 
-      - name: Install PCB skill
+      - name: Copy PCB skill
         shell: pwsh
         run: |
           $skillSrc = "skills\hardware\pcb-intelligence"
@@ -165,16 +173,19 @@ jobs:
           ====================
 
           使用步骤：
-          1. 双击 start-gateway.bat  -> 启动 WebSocket 服务（ws://127.0.0.1:${{ github.event.inputs.ws_port }}）
-          2. 新开一个窗口，双击 test-client.bat  -> 启动交互式测试客户端
+          1. 编辑 config.ini，填入 api_key
+          2. 双击 start-gateway.bat  -> 启动 WebSocket 服务（ws://127.0.0.1:${{ github.event.inputs.ws_port }}）
+          3. 新开一个窗口，双击 test-client.bat  -> 启动交互式测试客户端
 
           test-client 操作说明：
           - 收到 tool-calls 时，直接回车使用 mock 数据；输入 skip 跳过；输入 json:{...} 自定义返回值
           - 收到 Agent 回复后，直接输入下一条消息继续对话
 
-          修改配置：
-          - API Key / 端点：%USERPROFILE%\.hermes\.env
-          - 模型 / 流式 / 思考：%USERPROFILE%\.hermes\config.yaml
+          修改配置（config.ini）：
+          - api_key   : LLM API 密钥
+          - model     : 模型名称
+          - base_url  : API 接入地址
+          - port      : WebSocket 端口（[server] 段）
           "@ | Out-File -FilePath dist\agent\README.txt -Encoding utf8
 
       - name: Upload artifact
