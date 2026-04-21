@@ -9714,6 +9714,10 @@ def main(
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio
+        import sys
+        # aiohttp WebSocket server requires SelectorEventLoop on Windows
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
         try:
