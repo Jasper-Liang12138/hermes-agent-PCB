@@ -6,7 +6,7 @@ import json
 import uuid
 from typing import Any
 
-import websockets
+import aiohttp
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -59,7 +59,7 @@ async def _ainput(prompt: str) -> str:
     return await asyncio.to_thread(input, prompt)
 
 
-async def _handle_tool_call(ws: websockets.WebSocketClientProtocol, msg: dict[str, Any]) -> None:
+async def _handle_tool_call(ws: aiohttp.ClientWebSocketResponse, msg: dict[str, Any]) -> None:
     content = msg.get("body", {}).get("content", {})
     call_id = content.get("id", "")
     tool_name = content.get("name", "")
@@ -83,46 +83,50 @@ async def _handle_tool_call(ws: websockets.WebSocketClientProtocol, msg: dict[st
     if not raw.strip():
         result = default_result
     elif raw.startswith("json:"):
-        result = json.loads(raw[len("json:") :].strip())
+        result = json.loads(raw[len("json:"):].strip())
     else:
         result = raw
 
     reply = _build_tool_result(call_id, result)
-    await ws.send(json.dumps(reply, ensure_ascii=False))
+    await ws.send_str(json.dumps(reply, ensure_ascii=False))
     print("\n[send tool-results]")
     print(_pretty(reply))
 
 
 async def _recv_loop(
-    ws: websockets.WebSocketClientProtocol,
+    ws: aiohttp.ClientWebSocketResponse,
     session_id: str,
     project_id: str,
 ) -> None:
-    async for raw in ws:
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            print("\n[recv raw]")
-            print(raw)
-            continue
+    async for raw_msg in ws:
+        if raw_msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                msg = json.loads(raw_msg.data)
+            except json.JSONDecodeError:
+                print("\n[recv raw]")
+                print(raw_msg.data)
+                continue
 
-        msg_type = msg.get("type", "")
-        if msg_type == "tool-calls":
-            await _handle_tool_call(ws, msg)
-            continue
+            msg_type = msg.get("type", "")
+            if msg_type == "tool-calls":
+                await _handle_tool_call(ws, msg)
+                continue
 
-        print(f"\n[recv {msg_type or 'unknown'}]")
-        print(_pretty(msg))
+            print(f"\n[recv {msg_type or 'unknown'}]")
+            print(_pretty(msg))
 
-        if msg_type in {"message", "error"}:
-            raw_user = await _ainput(
-                "\n如需继续发送用户消息，请输入内容；直接回车则继续等待服务端消息。\n> "
-            )
-            if raw_user.strip():
-                outgoing = _build_user_message(session_id, project_id, raw_user)
-                await ws.send(json.dumps(outgoing, ensure_ascii=False))
-                print("\n[send message]")
-                print(_pretty(outgoing))
+            if msg_type in {"message", "error"}:
+                raw_user = await _ainput(
+                    "\n如需继续发送用户消息，请输入内容；直接回车则继续等待服务端消息。\n> "
+                )
+                if raw_user.strip():
+                    outgoing = _build_user_message(session_id, project_id, raw_user)
+                    await ws.send_str(json.dumps(outgoing, ensure_ascii=False))
+                    print("\n[send message]")
+                    print(_pretty(outgoing))
+
+        elif raw_msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            break
 
 
 async def main() -> None:
@@ -139,22 +143,23 @@ async def main() -> None:
     print(f"sessionId: {args.session_id}")
     print(f"projectid: {args.project_id}")
 
-    for attempt in range(1, 11):
+    for attempt in range(1, 16):
         try:
-            ws_conn = await websockets.connect(url)
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url) as ws:
+                    print("\n[已连接]")
+                    first = _build_user_message(args.session_id, args.project_id, args.content)
+                    await ws.send_str(json.dumps(first, ensure_ascii=False))
+                    print("\n[send first message]")
+                    print(_pretty(first))
+                    await _recv_loop(ws, args.session_id, args.project_id)
             break
-        except Exception:
-            if attempt == 10:
+        except aiohttp.ClientConnectorError:
+            if attempt == 15:
+                print(f"[!] 连接失败，已重试 {attempt} 次，放弃。")
                 raise
-            print(f"[!] 连接失败，{attempt}/10，2秒后重试...")
+            print(f"[!] 连接失败（{attempt}/15），2秒后重试...")
             await asyncio.sleep(2)
-
-    async with ws_conn as ws:
-        first = _build_user_message(args.session_id, args.project_id, args.content)
-        await ws.send(json.dumps(first, ensure_ascii=False))
-        print("\n[send first message]")
-        print(_pretty(first))
-        await _recv_loop(ws, args.session_id, args.project_id)
 
 
 if __name__ == "__main__":
