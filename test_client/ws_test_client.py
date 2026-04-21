@@ -139,7 +139,17 @@ async def main() -> None:
     print(f"sessionId: {args.session_id}")
     print(f"projectid: {args.project_id}")
 
-    async with websockets.connect(url) as ws:
+    for attempt in range(1, 11):
+        try:
+            ws_conn = await websockets.connect(url)
+            break
+        except Exception:
+            if attempt == 10:
+                raise
+            print(f"[!] 连接失败，{attempt}/10，2秒后重试...")
+            await asyncio.sleep(2)
+
+    async with ws_conn as ws:
         first = _build_user_message(args.session_id, args.project_id, args.content)
         await ws.send(json.dumps(first, ensure_ascii=False))
         print("\n[send first message]")
