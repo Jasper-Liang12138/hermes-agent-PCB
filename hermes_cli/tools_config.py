@@ -473,10 +473,12 @@ def _get_platform_tools(
 
     platform_toolsets = config.get("platform_toolsets", {})
     toolset_names = platform_toolsets.get(platform)
+    used_platform_default = False
 
     if toolset_names is None or not isinstance(toolset_names, list):
         default_ts = PLATFORMS[platform]["default_toolset"]
         toolset_names = [default_ts]
+        used_platform_default = True
 
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.
@@ -559,6 +561,13 @@ def _get_platform_tools(
             enabled_toolsets.update(enabled_mcp_servers)
     else:
         enabled_toolsets.update(explicit_mcp_servers)
+
+    # When a platform is using its implicit default toolset, preserve that
+    # composite toolset name too. Some platform defaults add non-configurable,
+    # platform-specific tools (for example hermes-websocket -> PCB tools) that
+    # cannot be recovered by reverse-mapping configurable toolsets alone.
+    if used_platform_default:
+        enabled_toolsets.add(default_ts)
 
     return enabled_toolsets
 

@@ -1,0 +1,1 @@
+(pcb_data (component (name U27) (package BGA256)))

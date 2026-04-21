@@ -8,10 +8,90 @@ This module provides:
 Usage:
     # Start the gateway
     python -m gateway.run
-    
+
     # Or from CLI
     python cli.py --gateway
 """
+
+# ============================================================================
+# 本地配置加载（config.ini → 环境变量 + ~/.hermes/config.yaml）
+# 必须在所有 import 之前执行，确保框架读取到正确的配置
+# ============================================================================
+import configparser as _cp, pathlib as _pl, os as _os
+
+_config_ini = _pl.Path(__file__).parent.parent / "config.ini"
+_cfg = _cp.ConfigParser()
+_cfg.read(_config_ini, encoding="utf-8")
+
+if _cfg.has_section("model"):
+    _m = _cfg["model"]
+    if _m.get("api_key", "").strip():
+        _os.environ["OPENAI_API_KEY"] = _m["api_key"].strip()
+    if _m.get("base_url", "").strip():
+        _os.environ["OPENAI_BASE_URL"] = _m["base_url"].strip()
+
+    # auth.json 的 active_provider 可能是 openai-codex 或其他，
+    # 设置了自定义 base_url 时需要强制设为 "custom"，使框架走 custom endpoint 路径
+    try:
+        import json as _json
+        _auth_path = _pl.Path.home() / ".hermes" / "auth.json"
+        _auth = _json.loads(_auth_path.read_text(encoding="utf-8")) if _auth_path.exists() else {}
+        _auth = _auth or {}
+        if _auth.get("active_provider") != "custom":
+            _auth["active_provider"] = "custom"
+            _auth_path.write_text(_json.dumps(_auth, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+    # 同步 model / base_url 到 ~/.hermes/config.yaml
+    try:
+        import yaml as _yaml
+        _hermes_cfg_path = _pl.Path.home() / ".hermes" / "config.yaml"
+        _hermes_cfg_path.parent.mkdir(exist_ok=True)
+        _hermes_cfg = _yaml.safe_load(_hermes_cfg_path.read_text(encoding="utf-8")) if _hermes_cfg_path.exists() else {}
+        _hermes_cfg = _hermes_cfg or {}
+        _hermes_cfg.setdefault("model", {}).update({
+            k: v for k, v in {
+                "default":  _m.get("model", "").strip() or None,
+                "base_url": _m.get("base_url", "").strip() or None,
+                "provider": "custom",  # 使用自定义端点而非 openai-codex
+            }.items() if v
+        })
+        _ws_host = _cfg.get("server", "host", fallback="0.0.0.0")
+        _ws_port = int(_cfg.get("server", "port", fallback="8765"))
+        _hermes_cfg.setdefault("gateway", {}).setdefault("websocket", {}).update({
+            "enabled": True,
+            "host": _ws_host,
+            "port": _ws_port,
+        })
+        # 注册 websocket 到 platforms，使 get_connected_platforms() 能遍历到它
+        _hermes_cfg.setdefault("platforms", {}).setdefault("websocket", {}).update({
+            "enabled": True,
+            "extra": {"host": _ws_host, "port": _ws_port},
+        })
+        # 注册项目 skills 目录为外部 skills dir
+        _project_skills_dir = str(_pl.Path(__file__).parent.parent / "skills")
+        _ext_dirs = _hermes_cfg.setdefault("skills", {}).get("external_dirs", [])
+        if not isinstance(_ext_dirs, list):
+            _ext_dirs = []
+        if _project_skills_dir not in _ext_dirs:
+            _ext_dirs.append(_project_skills_dir)
+        _hermes_cfg.setdefault("skills", {})["external_dirs"] = _ext_dirs
+        _hermes_cfg_path.write_text(_yaml.dump(_hermes_cfg, allow_unicode=True), encoding="utf-8")
+    except Exception as _e:
+        import warnings
+        warnings.warn(f"config.ini → config.yaml 同步失败: {_e}")
+
+if _cfg.has_section("router"):
+    _r = _cfg["router"]
+    if _r.get("cmd", "").strip():
+        _os.environ["ROUTER_CMD"] = _r["cmd"].strip()
+    if _r.get("work_dir", "").strip():
+        _os.environ["ROUTER_WORK_DIR"] = _r["work_dir"].strip()
+
+if _cfg.has_section("model") and _cfg["model"].get("board_data_use_file_path", "").strip():
+    _os.environ["BOARD_DATA_USE_FILE_PATH"] = _cfg["model"]["board_data_use_file_path"].strip()
+# ============================================================================
 
 import asyncio
 import json
@@ -2250,6 +2330,12 @@ class GatewayRunner:
                 return None
             return BlueBubblesAdapter(config)
 
+        elif platform == Platform.WEBSOCKET:
+            # WebSocket adapter for PCB intelligence (Qiyunfang protocol)
+            # Implements bidirectional communication for BGA fanout routing
+            from gateway.platforms.websocket import WebSocketAdapter
+            return WebSocketAdapter(config)
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -3094,6 +3180,7 @@ class GatewayRunner:
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview,
         )
+        turn_options = self._extract_turn_options_from_event(event)
 
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
@@ -3484,7 +3571,7 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if not history and source.platform and source.platform not in {Platform.LOCAL, Platform.WEBHOOK, Platform.WEBSOCKET}:
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
             if not os.getenv(env_key):
@@ -3551,6 +3638,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                turn_options=turn_options,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -3606,16 +3694,20 @@ class GatewayRunner:
                 session_entry.session_id = agent_result["session_id"]
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
-            try:
-                from gateway.display_config import resolve_display_setting as _rds
-                _show_reasoning_effective = _rds(
-                    _load_gateway_config(),
-                    _platform_config_key(source.platform),
-                    "show_reasoning",
-                    getattr(self, "_show_reasoning", False),
-                )
-            except Exception:
-                _show_reasoning_effective = getattr(self, "_show_reasoning", False)
+            _thinking_override = turn_options.get("thinking")
+            if _thinking_override is None:
+                try:
+                    from gateway.display_config import resolve_display_setting as _rds
+                    _show_reasoning_effective = _rds(
+                        _load_gateway_config(),
+                        _platform_config_key(source.platform),
+                        "show_reasoning",
+                        getattr(self, "_show_reasoning", False),
+                    )
+                except Exception:
+                    _show_reasoning_effective = getattr(self, "_show_reasoning", False)
+            else:
+                _show_reasoning_effective = bool(_thinking_override)
             if _show_reasoning_effective and response:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
@@ -4779,6 +4871,53 @@ class GatewayRunner:
         if hasattr(raw, "guild") and raw.guild:
             return raw.guild.id
         return None
+
+    @staticmethod
+    def _normalize_turn_options(options: Any) -> Dict[str, Any]:
+        """
+        Normalize per-turn runtime options from platform payloads.
+
+        Supported keys:
+          - streaming: bool
+          - thinking: bool
+          - reasoningEffort / reasoning_effort: none|minimal|low|medium|high|xhigh
+        """
+        if not isinstance(options, dict):
+            return {}
+
+        normalized: Dict[str, Any] = {}
+
+        if "streaming" in options:
+            val = options.get("streaming")
+            if isinstance(val, bool):
+                normalized["streaming"] = val
+            elif isinstance(val, (str, int, float)):
+                normalized["streaming"] = is_truthy_value(val, default=False)
+
+        if "thinking" in options:
+            val = options.get("thinking")
+            if isinstance(val, bool):
+                normalized["thinking"] = val
+            elif isinstance(val, (str, int, float)):
+                normalized["thinking"] = is_truthy_value(val, default=False)
+
+        effort = options.get("reasoningEffort", options.get("reasoning_effort"))
+        if isinstance(effort, str):
+            effort = effort.strip().lower()
+            if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+                normalized["reasoning_effort"] = effort
+
+        return normalized
+
+    @classmethod
+    def _extract_turn_options_from_event(cls, event: Optional[MessageEvent]) -> Dict[str, Any]:
+        """Extract normalized per-turn options from event.raw_message."""
+        if not event:
+            return {}
+        raw = getattr(event, "raw_message", None)
+        if not isinstance(raw, dict):
+            return {}
+        return cls._normalize_turn_options(raw.get("options"))
 
     async def _handle_voice_command(self, event: MessageEvent) -> str:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
@@ -7259,6 +7398,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        turn_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -7277,6 +7417,7 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        turn_options = self._normalize_turn_options(turn_options or {})
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -7633,6 +7774,16 @@ class GatewayRunner:
 
             pr = self._provider_routing
             reasoning_config = self._load_reasoning_config()
+            _effort_override = turn_options.get("reasoning_effort")
+            if _effort_override:
+                reasoning_config = (
+                    {"enabled": False}
+                    if _effort_override == "none"
+                    else {"enabled": True, "effort": _effort_override}
+                )
+            elif turn_options.get("thinking") is False:
+                # Frontend explicitly disabled thinking for this turn.
+                reasoning_config = {"enabled": False}
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
@@ -7655,6 +7806,8 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if "streaming" in turn_options:
+                _streaming_enabled = bool(turn_options.get("streaming"))
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -8493,8 +8646,10 @@ class GatewayRunner:
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_turn_options = {}
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    next_turn_options = self._extract_turn_options_from_event(pending_event)
                     next_message = await self._prepare_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -8513,6 +8668,7 @@ class GatewayRunner:
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    turn_options=next_turn_options,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

@@ -157,6 +157,7 @@ def _discover_tools():
         "tools.process_registry",
         "tools.send_message_tool",
         # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
+        "tools.pcb_tools",  # PCB intelligence: BGA fanout routing (Qiyunfang + BJTU router)
         "tools.homeassistant_tool",
     ]
     import importlib
