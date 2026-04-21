@@ -1,0 +1,179 @@
+name: Build Dev Package (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "默认模型名称"
+        default: "qwen3.5-122b-a10b"
+        required: false
+      ws_port:
+        description: "WebSocket 端口"
+        default: "8765"
+        required: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install -e ".[all]"
+
+      - name: Build agent.exe
+        run: |
+          pyinstaller `
+            --name agent `
+            --onedir `
+            --noconfirm `
+            --add-data "agent;agent" `
+            --add-data "hermes_cli;hermes_cli" `
+            --add-data "plugins;plugins" `
+            --add-data "tools;tools" `
+            --add-data "gateway;gateway" `
+            --add-data "skills;skills" `
+            --add-data "test_client;test_client" `
+            --hidden-import tiktoken_ext.openai_public `
+            --hidden-import tiktoken_ext `
+            --hidden-import anthropic `
+            --hidden-import openai `
+            --hidden-import aiohttp `
+            --hidden-import websockets `
+            cli.py
+
+      - name: Write start-gateway.bat
+        shell: pwsh
+        run: |
+          $port = "${{ github.event.inputs.ws_port }}"
+          $model = "${{ github.event.inputs.model }}"
+          @"
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+
+          if not exist "%USERPROFILE%\.hermes\.env" (
+              echo [!] 未检测到配置，正在生成模板...
+              mkdir "%USERPROFILE%\.hermes" 2>nul
+              (
+                echo OPENAI_API_KEY=your_api_key_here
+                echo OPENAI_BASE_URL=https://your-endpoint/v1
+              ) > "%USERPROFILE%\.hermes\.env"
+              echo 请先编辑 %USERPROFILE%\.hermes\.env 填入 API Key，然后重新运行。
+              notepad "%USERPROFILE%\.hermes\.env"
+              pause
+              exit /b 1
+          )
+
+          if not exist "%USERPROFILE%\.hermes\config.yaml" (
+              (
+                echo model:
+                echo   provider: "custom"
+                echo   default: "$model"
+                echo   base_url: ""
+                echo streaming:
+                echo   enabled: true
+                echo gateway:
+                echo   websocket:
+                echo     enabled: true
+                echo     host: "0.0.0.0"
+                echo     port: $port
+                echo agent:
+                echo   reasoning_effort: "medium"
+                echo display:
+                echo   show_reasoning: true
+              ) > "%USERPROFILE%\.hermes\config.yaml"
+              echo [OK] config.yaml 已生成
+          )
+
+          set ROUTER_CMD=%~dp0router.exe
+          set ROUTER_WORK_DIR=%~dp0
+
+          echo [*] 启动 PCB Agent Gateway...
+          echo [*] WebSocket 监听: ws://127.0.0.1:$port
+          echo [*] 按 Ctrl+C 退出
+          echo.
+          agent.exe gateway
+          "@ | Out-File -FilePath dist\agent\start-gateway.bat -Encoding utf8
+
+      - name: Write test-client.bat
+        shell: pwsh
+        run: |
+          $port = "${{ github.event.inputs.ws_port }}"
+          @"
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+
+          set SESSION_ID=dev-%RANDOM%
+          set PROJECT_ID=proj-test
+
+          echo ============================================
+          echo  PCB Agent 开发测试客户端
+          echo  连接: ws://127.0.0.1:$port
+          echo  sessionId: %SESSION_ID%
+          echo  projectid: %PROJECT_ID%
+          echo ============================================
+          echo  确保 start-gateway.bat 已在另一个窗口运行
+          echo ============================================
+          echo.
+
+          agent.exe -c "
+          import asyncio, sys
+          sys.path.insert(0, '.')
+          from test_client.ws_test_client import main
+          import argparse
+          import sys
+          sys.argv = ['ws_test_client', '--port', '$port', '--session-id', '%SESSION_ID%', '--project-id', '%PROJECT_ID%']
+          asyncio.run(main())
+          "
+          pause
+          "@ | Out-File -FilePath dist\agent\test-client.bat -Encoding utf8
+
+      - name: Install PCB skill
+        shell: pwsh
+        run: |
+          $skillSrc = "skills\hardware\pcb-intelligence"
+          $skillDst = "dist\agent\skills\hardware\pcb-intelligence"
+          if (Test-Path $skillSrc) {
+            New-Item -ItemType Directory -Force -Path $skillDst | Out-Null
+            Copy-Item -Recurse -Force "$skillSrc\*" $skillDst
+          }
+
+      - name: Write README.txt
+        shell: pwsh
+        run: |
+          @"
+          PCB Agent 开发测试包
+          ====================
+
+          使用步骤：
+          1. 双击 start-gateway.bat  -> 启动 WebSocket 服务（ws://127.0.0.1:${{ github.event.inputs.ws_port }}）
+          2. 新开一个窗口，双击 test-client.bat  -> 启动交互式测试客户端
+
+          test-client 操作说明：
+          - 收到 tool-calls 时，直接回车使用 mock 数据；输入 skip 跳过；输入 json:{...} 自定义返回值
+          - 收到 Agent 回复后，直接输入下一条消息继续对话
+
+          修改配置：
+          - API Key / 端点：%USERPROFILE%\.hermes\.env
+          - 模型 / 流式 / 思考：%USERPROFILE%\.hermes\config.yaml
+          "@ | Out-File -FilePath dist\agent\README.txt -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcb-agent-dev-win
+          path: dist/agent/
+          retention-days: 14

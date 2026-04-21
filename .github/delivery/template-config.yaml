@@ -1,0 +1,12 @@
+model:
+  provider: "custom"
+  default: "qwen3.5-122b-a10b"
+  base_url: "https://your-endpoint/v1"  # 与 template.env 的 OPENAI_BASE_URL 保持一致
+
+compression:
+  enabled: true
+  threshold: 0.85
+  summary_model: "qwen3.5-122b-a10b"
+
+terminal:
+  backend: "local"

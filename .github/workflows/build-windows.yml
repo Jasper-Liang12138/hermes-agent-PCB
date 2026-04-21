@@ -1,0 +1,118 @@
+name: Build Windows Package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: false
+        default: "dev"
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller `
+            --name agent `
+            --onedir `
+            --noconfirm `
+            --add-data "agent;agent" `
+            --add-data "hermes_cli;hermes_cli" `
+            --add-data "plugins;plugins" `
+            --add-data "tools;tools" `
+            --add-data "cli-config.yaml.example;." `
+            --hidden-import tiktoken_ext.openai_public `
+            --hidden-import tiktoken_ext `
+            --hidden-import anthropic `
+            --hidden-import openai `
+            --hidden-import prompt_toolkit `
+            --hidden-import pydantic `
+            cli.py
+
+      - name: Prepare delivery package
+        shell: pwsh
+        run: |
+          $PKG = "PCB-AGENT"
+          New-Item -ItemType Directory -Force $PKG | Out-Null
+
+          # exe + _internal
+          Copy-Item -Recurse dist\agent\* $PKG\
+
+          # PCB skill
+          New-Item -ItemType Directory -Force "$PKG\skills\hardware\pcb-intelligence" | Out-Null
+          if (Test-Path "skills\hardware\pcb-intelligence") {
+            Copy-Item -Recurse "skills\hardware\pcb-intelligence\*" `
+              "$PKG\skills\hardware\pcb-intelligence\"
+          }
+
+          # Delivery scripts and templates
+          Copy-Item ".github\delivery\install.bat"           $PKG\
+          Copy-Item ".github\delivery\start.bat"             $PKG\
+          Copy-Item ".github\delivery\uninstall.bat"         $PKG\
+          Copy-Item ".github\delivery\template.env"          $PKG\
+          Copy-Item ".github\delivery\template-config.yaml"  $PKG\
+
+          # Optional docs
+          if (Test-Path "docs") {
+            Copy-Item -Recurse docs $PKG\docs
+          }
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $v = "${{ github.ref_name }}"
+          } else {
+            $v = "${{ inputs.version }}"
+          }
+          echo "tag=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Zip package
+        shell: pwsh
+        run: |
+          $zip = "PCB-AGENT-${{ steps.version.outputs.tag }}-windows.zip"
+          Compress-Archive -Path PCB-AGENT\* -DestinationPath $zip
+          echo "ZIP=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCB-AGENT-${{ steps.version.outputs.tag }}-windows
+          path: "*.zip"
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true
