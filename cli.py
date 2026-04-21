@@ -9716,7 +9716,10 @@ def main(
         import asyncio
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
-        asyncio.run(start_gateway())
+        try:
+            asyncio.run(start_gateway())
+        except KeyboardInterrupt:
+            pass
         return
 
     # Skip worktree for list commands (they exit immediately)

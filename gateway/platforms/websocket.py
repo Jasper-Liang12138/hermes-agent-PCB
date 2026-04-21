@@ -204,29 +204,33 @@ class WebSocketAdapter(BasePlatformAdapter):
                         project_id = data.get("projectid", "")
                         self._connections[session_id] = (ws, project_id)
 
-                        # 新 session 默认走聊天通道；后续由路由器切换到 PCB 通道
-                        if session_id not in self._session_modes:
-                            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
-                        if session_id not in self._session_flow_states:
-                            self._set_flow_state(session_id, _FLOW_IDLE)
-
-                        # 更新工具单例的当前 session_id
                         try:
-                            from tools.pcb_tools import WebSocketTransportSingleton
-                            WebSocketTransportSingleton.get_instance().current_session_id = session_id
-                        except ImportError:
-                            pass
+                            # 新 session 默认走聊天通道；后续由路由器切换到 PCB 通道
+                            if session_id not in self._session_modes:
+                                self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+                            if session_id not in self._session_flow_states:
+                                self._set_flow_state(session_id, _FLOW_IDLE)
 
-                        # 每条新消息开启新的 msgId（流式时同一回复共用）
-                        self._stream_msg_ids[session_id] = uuid.uuid4().hex[:12]
-                        self._stream_fields_fingerprint.pop(session_id, None)
-                        task = asyncio.create_task(
-                            self._handle_user_message(ws, data, session_id, project_id)
-                        )
-                        self._session_tasks.setdefault(session_id, set()).add(task)
-                        task.add_done_callback(
-                            lambda t, sid=session_id: self._on_session_task_done(sid, t)
-                        )
+                            # 更新工具单例的当前 session_id
+                            try:
+                                from tools.pcb_tools import WebSocketTransportSingleton
+                                WebSocketTransportSingleton.get_instance().current_session_id = session_id
+                            except ImportError:
+                                pass
+
+                            # 每条新消息开启新的 msgId（流式时同一回复共用）
+                            self._stream_msg_ids[session_id] = uuid.uuid4().hex[:12]
+                            self._stream_fields_fingerprint.pop(session_id, None)
+                            task = asyncio.create_task(
+                                self._handle_user_message(ws, data, session_id, project_id)
+                            )
+                            self._session_tasks.setdefault(session_id, set()).add(task)
+                            task.add_done_callback(
+                                lambda t, sid=session_id: self._on_session_task_done(sid, t)
+                            )
+                        except Exception:
+                            logger.exception("Error dispatching message for session %s", session_id)
+                            await self._send_error(ws, "内部错误，请重试", session_id=session_id, project_id=project_id)
 
                     elif msg_type == "tool-results":
                         self._resolve_tool_result(data)
