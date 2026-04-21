@@ -385,7 +385,7 @@ TOOLSETS = {
 
     "hermes-websocket": {
         "description": "WebSocket toolset - PCB BGA fanout routing agent (Qiyunfang protocol)",
-        "tools": _HERMES_CORE_TOOLS + ["getProjectData", "GetSelectedElements", "route"],
+        "tools": _HERMES_CORE_TOOLS + ["getProjectData", "GetSelectedElements", "route", "pcb_extract_bga"],
         "includes": []
     },
 

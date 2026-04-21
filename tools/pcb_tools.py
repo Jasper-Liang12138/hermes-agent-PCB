@@ -200,7 +200,9 @@ registry.register(
         "name": "getProjectData",
         "description": (
             "获取 PCB 项目数据（S 表达式格式）。"
-            "调用后分析返回的数据，识别所有 BGA 元件，并通过 ##PCB_FIELDS## 标记返回 selection 列表供用户选择。"
+            "若 pcb_extract_bga 工具可用，获取数据后立即调用它提取 BGA 列表；"
+            "否则直接分析数据识别 BGA 元件。"
+            "最终通过 ##PCB_FIELDS## 标记将 selection 返回给用户选择。"
         ),
         "parameters": {
             "type": "object",

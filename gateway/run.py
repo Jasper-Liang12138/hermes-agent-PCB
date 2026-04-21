@@ -91,6 +91,20 @@ if _cfg.has_section("router"):
 
 if _cfg.has_section("model") and _cfg["model"].get("board_data_use_file_path", "").strip():
     _os.environ["BOARD_DATA_USE_FILE_PATH"] = _cfg["model"]["board_data_use_file_path"].strip()
+
+if _cfg.has_section("pcb"):
+    try:
+        import yaml as _yaml
+        _hermes_cfg_path = _pl.Path.home() / ".hermes" / "config.yaml"
+        _hermes_cfg_path.parent.mkdir(exist_ok=True)
+        _hermes_cfg = _yaml.safe_load(_hermes_cfg_path.read_text(encoding="utf-8")) if _hermes_cfg_path.exists() else {}
+        _hermes_cfg = _hermes_cfg or {}
+        _raw = _cfg["pcb"].get("use_long_context_module", "true").strip().lower()
+        _hermes_cfg.setdefault("pcb", {})["use_long_context_module"] = _raw not in ("false", "0", "no", "off")
+        _hermes_cfg_path.write_text(_yaml.dump(_hermes_cfg, allow_unicode=True), encoding="utf-8")
+    except Exception as _e:
+        import warnings
+        warnings.warn(f"config.ini [pcb] → config.yaml 同步失败: {_e}")
 # ============================================================================
 
 import asyncio
