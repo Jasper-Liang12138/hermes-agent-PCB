@@ -1,8 +1,12 @@
-name: Build Dev Package (Windows)
+name: Build Delivery Package (Windows)
 
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "版本号（如 1.0.0）"
+        default: "1.0.0"
+        required: true
       model:
         description: "默认模型名称"
         default: "qwen3.5-122b-a10b"
@@ -44,7 +48,6 @@ jobs:
             --add-data "tools;tools" `
             --add-data "gateway;gateway" `
             --add-data "skills;skills" `
-            --add-data "test_client;test_client" `
             --hidden-import tiktoken_ext.openai_public `
             --hidden-import tiktoken_ext `
             --hidden-import anthropic `
@@ -54,7 +57,7 @@ jobs:
             --collect-all firecrawl `
             cli.py
 
-      - name: Write start-gateway.bat
+      - name: Write install.bat
         shell: pwsh
         run: |
           $port = "${{ github.event.inputs.ws_port }}"
@@ -62,22 +65,34 @@ jobs:
           @"
           @echo off
           chcp 65001 >nul
-          cd /d "%~dp0"
+          setlocal
+          set HERMES=%USERPROFILE%\.hermes
+          set SCRIPT_DIR=%~dp0
 
-          if not exist "%USERPROFILE%\.hermes\.env" (
-              echo [!] 未检测到配置，正在生成模板...
-              mkdir "%USERPROFILE%\.hermes" 2>nul
+          echo ============================================
+          echo  PCB Agent 安装程序 v${{ github.event.inputs.version }}
+          echo ============================================
+          echo.
+
+          mkdir "%HERMES%" 2>nul
+          mkdir "%HERMES%\memories" 2>nul
+          mkdir "%HERMES%\skills\hardware" 2>nul
+
+          xcopy /E /Y /I "%SCRIPT_DIR%skills" "%HERMES%\skills\" >nul
+          echo [OK] PCB skill 已安装
+
+          if not exist "%HERMES%\.env" (
               (
                 echo OPENAI_API_KEY=your_api_key_here
                 echo OPENAI_BASE_URL=https://your-endpoint/v1
-              ) > "%USERPROFILE%\.hermes\.env"
-              echo 请先编辑 %USERPROFILE%\.hermes\.env 填入 API Key，然后重新运行。
-              notepad "%USERPROFILE%\.hermes\.env"
-              pause
-              exit /b 1
+              ) > "%HERMES%\.env"
+              echo [!!] 请填写 API Key，正在打开配置文件...
+              notepad "%HERMES%\.env"
+          ) else (
+              echo [OK] .env 已存在，跳过
           )
 
-          if not exist "%USERPROFILE%\.hermes\config.yaml" (
+          if not exist "%HERMES%\config.yaml" (
               (
                 echo model:
                 echo   provider: "custom"
@@ -93,9 +108,31 @@ jobs:
                 echo agent:
                 echo   reasoning_effort: "medium"
                 echo display:
-                echo   show_reasoning: true
-              ) > "%USERPROFILE%\.hermes\config.yaml"
+                echo   show_reasoning: false
+              ) > "%HERMES%\config.yaml"
               echo [OK] config.yaml 已生成
+          ) else (
+              echo [OK] config.yaml 已存在，跳过
+          )
+
+          echo.
+          echo 安装完成！运行 start.bat 启动 Agent。
+          pause
+          "@ | Out-File -FilePath dist\agent\install.bat -Encoding utf8
+
+      - name: Write start.bat
+        shell: pwsh
+        run: |
+          $port = "${{ github.event.inputs.ws_port }}"
+          @"
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+
+          if not exist "%USERPROFILE%\.hermes\.env" (
+              echo 未检测到配置，请先运行 install.bat
+              pause
+              exit /b 1
           )
 
           set ROUTER_CMD=%~dp0router.exe
@@ -106,41 +143,23 @@ jobs:
           echo [*] 按 Ctrl+C 退出
           echo.
           agent.exe gateway
-          "@ | Out-File -FilePath dist\agent\start-gateway.bat -Encoding utf8
+          "@ | Out-File -FilePath dist\agent\start.bat -Encoding utf8
 
-      - name: Build test-client.exe
-        run: |
-          pip install websockets
-          pyinstaller `
-            --name test-client `
-            --onefile `
-            --noconfirm `
-            test_client/ws_test_client.py
-
-      - name: Copy test-client.exe
-        run: copy dist\test-client.exe dist\agent\test-client.exe
-
-      - name: Write test-client.bat
+      - name: Write uninstall.bat
         shell: pwsh
         run: |
-          $port = "${{ github.event.inputs.ws_port }}"
           @"
           @echo off
           chcp 65001 >nul
-          cd /d "%~dp0"
-
-          echo ============================================
-          echo  PCB Agent 开发测试客户端
-          echo  连接: ws://127.0.0.1:$port
-          echo  确保 start-gateway.bat 已在另一个窗口运行
-          echo ============================================
-          echo.
-
-          test-client.exe --port $port --project-id proj-test
+          echo 此操作将删除 %USERPROFILE%\.hermes\（包含记忆、配置）
+          set /p CONFIRM=确认删除？(y/N):
+          if /i "%CONFIRM%" neq "y" exit /b 0
+          rmdir /S /Q "%USERPROFILE%\.hermes"
+          echo 已卸载。
           pause
-          "@ | Out-File -FilePath dist\agent\test-client.bat -Encoding utf8
+          "@ | Out-File -FilePath dist\agent\uninstall.bat -Encoding utf8
 
-      - name: Install PCB skill
+      - name: Copy PCB skill
         shell: pwsh
         run: |
           $skillSrc = "skills\hardware\pcb-intelligence"
@@ -150,29 +169,18 @@ jobs:
             Copy-Item -Recurse -Force "$skillSrc\*" $skillDst
           }
 
-      - name: Write README.txt
+      - name: Copy delivery docs
         shell: pwsh
         run: |
-          @"
-          PCB Agent 开发测试包
-          ====================
-
-          使用步骤：
-          1. 双击 start-gateway.bat  -> 启动 WebSocket 服务（ws://127.0.0.1:${{ github.event.inputs.ws_port }}）
-          2. 新开一个窗口，双击 test-client.bat  -> 启动交互式测试客户端
-
-          test-client 操作说明：
-          - 收到 tool-calls 时，直接回车使用 mock 数据；输入 skip 跳过；输入 json:{...} 自定义返回值
-          - 收到 Agent 回复后，直接输入下一条消息继续对话
-
-          修改配置：
-          - API Key / 端点：%USERPROFILE%\.hermes\.env
-          - 模型 / 流式 / 思考：%USERPROFILE%\.hermes\config.yaml
-          "@ | Out-File -FilePath dist\agent\README.txt -Encoding utf8
+          $docsDir = "dist\agent\docs"
+          New-Item -ItemType Directory -Force -Path $docsDir | Out-Null
+          if (Test-Path ".github\delivery\使用说明.md") {
+            Copy-Item ".github\delivery\使用说明.md" $docsDir
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pcb-agent-dev-win
+          name: pcb-agent-v${{ github.event.inputs.version }}-windows
           path: dist/agent/
-          retention-days: 14
+          retention-days: 30
