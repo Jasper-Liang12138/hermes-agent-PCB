@@ -101,11 +101,18 @@ jobs:
           set ROUTER_CMD=%~dp0router.exe
           set ROUTER_WORK_DIR=%~dp0
 
+          echo [*] 安装 PCB skill...
+          mkdir "%USERPROFILE%\.hermes\skills\hardware\pcb-intelligence" 2>nul
+          xcopy /E /Y /I "%~dp0skills\hardware\pcb-intelligence" "%USERPROFILE%\.hermes\skills\hardware\pcb-intelligence\" >nul
+
           echo [*] 启动 PCB Agent Gateway...
           echo [*] WebSocket 监听: ws://127.0.0.1:$port
           echo [*] 按 Ctrl+C 退出
           echo.
-          agent.exe gateway
+          agent.exe --gateway
+          echo.
+          echo [!] Gateway 已退出，错误码: %ERRORLEVEL%
+          pause
           "@ | Out-File -FilePath dist\agent\start-gateway.bat -Encoding utf8
 
       - name: Build test-client.exe
