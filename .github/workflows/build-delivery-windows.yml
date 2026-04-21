@@ -15,6 +15,14 @@ on:
         description: "WebSocket 端口"
         default: "8765"
         required: false
+      stream:
+        description: "是否开启流式传输（true/false）"
+        default: "true"
+        required: false
+      thinking:
+        description: "是否开启思考模式（true/false）"
+        default: "false"
+        required: false
 
 jobs:
   build:
@@ -41,6 +49,7 @@ jobs:
           pyinstaller `
             --name agent `
             --onedir `
+            --noconsole `
             --noconfirm `
             --add-data "agent;agent" `
             --add-data "hermes_cli;hermes_cli" `
@@ -61,8 +70,10 @@ jobs:
       - name: Write config.ini
         shell: pwsh
         run: |
-          $model = "${{ github.event.inputs.model }}"
-          $port  = "${{ github.event.inputs.ws_port }}"
+          $model    = "${{ github.event.inputs.model }}"
+          $port     = "${{ github.event.inputs.ws_port }}"
+          $stream   = "${{ github.event.inputs.stream }}"
+          $thinking = "${{ github.event.inputs.thinking }}"
           @"
           # ============================================================
           # PCB BGA 逃逸布线智能体 — 配置文件
@@ -81,6 +92,12 @@ jobs:
 
           # 版图数据传输模式：0 = 直接返回字符串，1 = 返回文件路径
           board_data_use_file_path = 0
+
+          # 是否开启流式传输（true/false）
+          stream   = $stream
+
+          # 是否开启思考模式（true/false）
+          thinking = $thinking
 
           [router]
           # 布线器可执行文件路径（相对于本 exe 所在目录）

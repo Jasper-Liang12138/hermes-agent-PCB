@@ -460,6 +460,8 @@ def _ensure_user_systemd_env() -> None:
     We detect the standard socket path and set the vars so all subsequent
     subprocess calls inherit them.
     """
+    if sys.platform == "win32":
+        return
     uid = os.getuid()
     if "XDG_RUNTIME_DIR" not in os.environ:
         runtime_dir = f"/run/user/{uid}"
@@ -519,6 +521,9 @@ def print_systemd_scope_conflict_warning() -> None:
 
 
 def _require_root_for_system_service(action: str) -> None:
+    if sys.platform == "win32":
+        print(f"System gateway {action} is not supported on Windows.")
+        sys.exit(1)
     if os.geteuid() != 0:
         print(f"System gateway {action} requires root. Re-run with sudo.")
         sys.exit(1)
@@ -679,8 +684,9 @@ def _launchd_user_home() -> Path:
     Profile-mode Hermes often sets ``HOME`` to a profile-scoped directory, but
     launchd user agents still live under the actual account home.
     """
+    if sys.platform == "win32":
+        return Path.home()
     import pwd
-
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
@@ -1191,6 +1197,8 @@ def get_launchd_label() -> str:
 
 def _launchd_domain() -> str:
     import os
+    if sys.platform == "win32":
+        return "gui/0"
     return f"gui/{os.getuid()}"
 
 

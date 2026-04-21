@@ -410,6 +410,10 @@ def get_running_pid() -> Optional[int]:
     except (ProcessLookupError, PermissionError):
         remove_pid_file()
         return None
+    except OSError:
+        # Windows raises OSError (WinError 87) when the process doesn't exist
+        remove_pid_file()
+        return None
 
     recorded_start = record.get("start_time")
     current_start = _get_process_start_time(pid)
