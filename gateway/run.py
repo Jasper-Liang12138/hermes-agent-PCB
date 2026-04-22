@@ -70,6 +70,8 @@ if _cfg.has_section("model"):
             "extra": {"host": _ws_host, "port": _ws_port},
         })
         # 注册项目 skills 目录为外部 skills dir
+        # 默认启用流式输出
+        _hermes_cfg.setdefault("streaming", {}).setdefault("enabled", True)
         _project_skills_dir = str(_pl.Path(__file__).parent.parent / "skills")
         _ext_dirs = _hermes_cfg.setdefault("skills", {}).get("external_dirs", [])
         if not isinstance(_ext_dirs, list):
@@ -8140,6 +8142,23 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                 }
+
+            if source.platform == Platform.WEBSOCKET:
+                _agent = agent_holder[0]
+                return {
+                    "final_response": final_response,
+                    "last_reasoning": result.get("last_reasoning"),
+                    "messages": result.get("messages", []),
+                    "api_calls": result.get("api_calls", 0),
+                    "tools": tools_holder[0] or [],
+                    "history_offset": len(agent_history),
+                    "last_prompt_tokens": _last_prompt_toks,
+                    "input_tokens": _input_toks,
+                    "output_tokens": _output_toks,
+                    "model": _resolved_model,
+                    "session_id": getattr(_agent, "session_id", session_id) if _agent else session_id,
+                    "response_previewed": result.get("response_previewed", False),
+                }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
@@ -8203,7 +8222,7 @@ class GatewayRunner:
             _effective_history_offset = 0 if _session_was_split else len(agent_history)
 
             # Auto-generate session title after first exchange (non-blocking)
-            if final_response and self._session_db:
+            if final_response and self._session_db and source.platform != Platform.WEBSOCKET:
                 try:
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []

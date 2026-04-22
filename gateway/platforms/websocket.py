@@ -119,6 +119,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         # session_id -> (WebSocketResponse, project_id)
         self._connections: Dict[str, Tuple[web.WebSocketResponse, str]] = {}
+        self._pending_outbound: Dict[str, list[Dict[str, Any]]] = {}
 
         # call_id -> asyncio.Future，等待 tool-results 回来
         self._pending_tool_calls: Dict[str, asyncio.Future] = {}
@@ -183,7 +184,11 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     async def _websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
         """处理来自启云方 PCB 客户端的 WebSocket 连接。"""
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(
+            timeout=120.0,
+            receive_timeout=3600.0,
+            heartbeat=None,
+        )
         await ws.prepare(request)
         logger.info("PCB client connected: %s", request.remote)
 
@@ -221,12 +226,16 @@ class WebSocketAdapter(BasePlatformAdapter):
                             # 每条新消息开启新的 msgId（流式时同一回复共用）
                             self._stream_msg_ids[session_id] = uuid.uuid4().hex[:12]
                             self._stream_fields_fingerprint.pop(session_id, None)
+                            await self._send_processing_status(session_id, project_id, "已收到，正在处理...")
                             task = asyncio.create_task(
                                 self._handle_user_message(ws, data, session_id, project_id)
                             )
+                            keepalive_task = asyncio.create_task(
+                                self._send_processing_keepalive(session_id, project_id, task)
+                            )
                             self._session_tasks.setdefault(session_id, set()).add(task)
                             task.add_done_callback(
-                                lambda t, sid=session_id: self._on_session_task_done(sid, t)
+                                lambda t, sid=session_id, kt=keepalive_task: self._on_session_task_done(sid, t, kt)
                             )
                         except Exception:
                             logger.exception("Error dispatching message for session %s", session_id)
@@ -234,6 +243,35 @@ class WebSocketAdapter(BasePlatformAdapter):
 
                     elif msg_type == "tool-results":
                         self._resolve_tool_result(data)
+
+                    elif msg_type == "ping":
+                        session_id = data.get("sessionId") or session_id or f"ws_{id(ws)}"
+                        project_id = data.get("projectid", "")
+                        self._connections[session_id] = (ws, project_id)
+                        try:
+                            await ws.send_json({
+                                "sessionId": session_id,
+                                "projectid": project_id,
+                                "type": "pong",
+                                "body": {"role": "agent", "content": "ok"},
+                            })
+                        except Exception:
+                            logger.debug("Failed to send websocket pong for session=%s", session_id, exc_info=True)
+
+                    elif msg_type in {"init", "resume"}:
+                        session_id = data.get("sessionId") or f"ws_{id(ws)}"
+                        project_id = data.get("projectid", "")
+                        self._connections[session_id] = (ws, project_id)
+                        if session_id not in self._session_modes:
+                            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+                        if session_id not in self._session_flow_states:
+                            self._set_flow_state(session_id, _FLOW_IDLE)
+                        try:
+                            from tools.pcb_tools import WebSocketTransportSingleton
+                            WebSocketTransportSingleton.get_instance().current_session_id = session_id
+                        except ImportError:
+                            pass
+                        await self._flush_pending_outbound(session_id)
 
                     else:
                         logger.warning("Unknown message type: %s", msg_type)
@@ -243,22 +281,42 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         finally:
             if session_id:
-                self._connections.pop(session_id, None)
-                self._stream_msg_ids.pop(session_id, None)
-                self._stream_fields_fingerprint.pop(session_id, None)
-                self._session_modes.pop(session_id, None)
-                self._session_mode_lock_until.pop(session_id, None)
-                self._session_flow_states.pop(session_id, None)
-                for task in list(self._session_tasks.pop(session_id, set())):
-                    task.cancel()
-                try:
-                    from tools.pcb_tools import WebSocketTransportSingleton
-                    WebSocketTransportSingleton.get_instance().clear_session(session_id)
-                except ImportError:
-                    pass
-            logger.info("PCB client disconnected: %s", request.remote)
+                current = self._connections.get(session_id)
+                if current and current[0] is ws:
+                    self._connections.pop(session_id, None)
+            logger.info(
+                "PCB client disconnected: %s session=%s close_code=%s exception=%r",
+                request.remote,
+                session_id,
+                ws.close_code,
+                ws.exception(),
+            )
 
         return ws
+
+    async def _send_or_queue(self, session_id: str, message: Dict[str, Any]) -> bool:
+        ws_info = self._connections.get(session_id)
+        if not ws_info or ws_info[0].closed:
+            self._pending_outbound.setdefault(session_id, []).append(message)
+            logger.info("Queued websocket payload for disconnected session=%s type=%s", session_id, message.get("type"))
+            return False
+        await ws_info[0].send_json(message)
+        return True
+
+    async def _flush_pending_outbound(self, session_id: str) -> None:
+        queued = self._pending_outbound.pop(session_id, [])
+        if not queued:
+            return
+        logger.info("Flushing %d queued websocket payload(s) for session=%s", len(queued), session_id)
+        for message in queued:
+            try:
+                sent = await self._send_or_queue(session_id, message)
+                if not sent:
+                    break
+            except Exception:
+                self._pending_outbound.setdefault(session_id, []).insert(0, message)
+                logger.exception("Failed flushing queued websocket payload for session=%s", session_id)
+                break
 
     async def _handle_user_message(
         self,
@@ -321,8 +379,15 @@ class WebSocketAdapter(BasePlatformAdapter):
                     content=response,
                 )
 
-    def _on_session_task_done(self, session_id: str, task: asyncio.Task) -> None:
+    def _on_session_task_done(
+        self,
+        session_id: str,
+        task: asyncio.Task,
+        keepalive_task: Optional[asyncio.Task] = None,
+    ) -> None:
         """Drop completed per-session tasks and log unexpected failures."""
+        if keepalive_task:
+            keepalive_task.cancel()
         tasks = self._session_tasks.get(session_id)
         if tasks is not None:
             tasks.discard(task)
@@ -334,6 +399,42 @@ class WebSocketAdapter(BasePlatformAdapter):
             pass
         except Exception:
             logger.exception("WebSocket session task failed: %s", session_id)
+
+    async def _send_processing_status(
+        self,
+        session_id: str,
+        project_id: str,
+        content: str,
+    ) -> None:
+        msg_id = self._stream_msg_ids.get(session_id, uuid.uuid4().hex[:12])
+        await self._send_or_queue(session_id, {
+            "sessionId": session_id,
+            "projectid": project_id,
+            "type": "message",
+            "body": {
+                "msgId": msg_id,
+                "role": "agent",
+                "content": content,
+                "isFinal": False,
+            },
+        })
+
+    async def _send_processing_keepalive(
+        self,
+        session_id: str,
+        project_id: str,
+        task: asyncio.Task,
+    ) -> None:
+        try:
+            while not task.done():
+                await asyncio.sleep(8)
+                if task.done():
+                    break
+                await self._send_processing_status(session_id, project_id, "仍在处理，请稍候...")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("WebSocket processing keepalive failed: session=%s", session_id, exc_info=True)
 
     def _resolve_tool_result(self, data: Dict[str, Any]):
         """收到 tool-results 时，解析 call_id，resolve 对应的 Future。
@@ -410,12 +511,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         3. 剩余文本 → content 字段
         """
         ws_info = self._connections.get(chat_id)
-        if not ws_info:
-            return SendResult(success=False, error=f"Session not found: {chat_id}")
-
-        ws, project_id = ws_info
-        if ws.closed:
-            return SendResult(success=False, error="Connection closed")
+        project_id = ws_info[1] if ws_info else ""
 
         # 1. 提取思考内容（框架 show_reasoning 注入的前缀格式）
         thinking, content_no_thinking = self._extract_thinking(content)
@@ -450,7 +546,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         }
 
         try:
-            await ws.send_json(message)
+            sent = await self._send_or_queue(chat_id, message)
             logger.info(
                 "Sent websocket message: session=%s msg_id=%s isFinal=%s keys=%s",
                 chat_id,
@@ -458,7 +554,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 body.get("isFinal"),
                 sorted(body.keys()),
             )
-            return SendResult(success=True, message_id=msg_id)
+            return SendResult(success=True, message_id=msg_id, error=None if sent else "queued")
         except Exception as e:
             logger.error("Failed to send message to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
@@ -478,12 +574,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         同一次回复共用同一个 msgId，客户端靠 msgId 识别是否为追加内容。
         """
         ws_info = self._connections.get(chat_id)
-        if not ws_info:
-            return SendResult(success=False, error=f"Session not found: {chat_id}")
-
-        ws, project_id = ws_info
-        if ws.closed:
-            return SendResult(success=False, error="Connection closed")
+        project_id = ws_info[1] if ws_info else ""
 
         thinking, content_no_thinking = self._extract_thinking(content)
         clean_content, pcb_fields = self._extract_pcb_fields(content_no_thinking)
@@ -529,7 +620,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         }
 
         try:
-            await ws.send_json(message)
+            sent = await self._send_or_queue(chat_id, message)
             logger.info(
                 "Sent websocket delta: session=%s msg_id=%s isFinal=%s keys=%s",
                 chat_id,
@@ -537,7 +628,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 body.get("isFinal"),
                 sorted(body.keys()),
             )
-            return SendResult(success=True, message_id=msg_id)
+            return SendResult(success=True, message_id=msg_id, error=None if sent else "queued")
         except Exception as e:
             logger.error("Failed to send stream delta to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
@@ -548,21 +639,13 @@ class WebSocketAdapter(BasePlatformAdapter):
         call_id: str,
         tool_name: str,
         arguments: Dict[str, Any],
-        timeout: float = 30.0,
+        timeout: float = 360.0,
     ) -> Any:
         """
         向 PCB 客户端发送工具调用请求，等待结果返回。
 
         在主 event loop 中运行（由 pcb_tools.py 通过 run_coroutine_threadsafe 调度）。
         """
-        ws_info = self._connections.get(session_id)
-        if not ws_info:
-            raise RuntimeError(f"Session not found: {session_id}")
-
-        ws, _ = ws_info
-        if ws.closed:
-            raise RuntimeError("Connection closed")
-
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_tool_calls[call_id] = future
         self._pending_tool_names[call_id] = tool_name
@@ -581,7 +664,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         try:
             logger.info("Sending tool call: session=%s call_id=%s tool=%s", session_id, call_id, tool_name)
-            await ws.send_json(message)
+            await self._send_or_queue(session_id, message)
         except Exception as e:
             self._pending_tool_calls.pop(call_id, None)
             raise RuntimeError(f"Failed to send tool call: {e}") from e
