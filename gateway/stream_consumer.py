@@ -229,7 +229,10 @@ class GatewayStreamConsumer:
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 
-                    current_update_visible = await self._send_or_edit(display_text)
+                    current_update_visible = await self._send_or_edit(
+                        display_text,
+                        is_final=got_done,
+                    )
                     self._last_edit_time = time.monotonic()
 
                 if got_done:
@@ -243,9 +246,15 @@ class GatewayStreamConsumer:
                         elif current_update_visible:
                             self._final_response_sent = True
                         elif self._message_id:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                is_final=True,
+                            )
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                is_final=True,
+                            )
                     return
 
                 if commentary_text is not None:
@@ -277,7 +286,7 @@ class GatewayStreamConsumer:
             # Best-effort final edit on cancellation
             if self._accumulated and self._message_id:
                 try:
-                    await self._send_or_edit(self._accumulated)
+                    await self._send_or_edit(self._accumulated, is_final=True)
                 except Exception:
                     pass
         except Exception as e:
@@ -480,7 +489,7 @@ class GatewayStreamConsumer:
             logger.error("Commentary send error: %s", e)
         return False
 
-    async def _send_or_edit(self, text: str) -> bool:
+    async def _send_or_edit(self, text: str, *, is_final: bool = False) -> bool:
         """Send or edit the streaming message.
 
         Returns True if the text was successfully delivered (sent or edited),
@@ -504,6 +513,7 @@ class GatewayStreamConsumer:
                         chat_id=self.chat_id,
                         message_id=self._message_id,
                         content=text,
+                        is_final=is_final,
                     )
                     if result.success:
                         self._already_sent = True
@@ -528,7 +538,7 @@ class GatewayStreamConsumer:
                                 self._MAX_FLOOD_STRIKES,
                                 self._current_edit_interval,
                             )
-                            if self._flood_strikes < self._MAX_FLOOD_STRIKES:
+                            if self._flood_strikes < self._MAX_FLOOD_STRIKES and not is_final:
                                 # Don't disable edits yet — just slow down.
                                 # Update _last_edit_time so the next edit
                                 # respects the new interval.
@@ -559,7 +569,10 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
-                    metadata=self.metadata,
+                    metadata={
+                        **(self.metadata or {}),
+                        "stream_is_final": is_final,
+                    },
                 )
                 if result.success:
                     if result.message_id:

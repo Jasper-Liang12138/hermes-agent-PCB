@@ -19,16 +19,14 @@ metadata:
 
 对接启云方 PCB 设计工具，通过 WebSocket 双向通信，支持以下场景：
 1. **完整布线流程**：获取项目数据 → BGA 选择 → 生成扇出参数 → 执行布线 → 返回结果
-2. **拆线重步**：获取框选元素 → 沿用历史参数重新布线
-3. **对话查询**：项目信息查询、版本查询、工具列表查询
+2. **对话查询**：项目信息查询、版本查询、工具列表查询
 
 ## 工具
 
 | 工具名 | 类型 | 功能 |
 |--------|------|------|
 | `getProjectData` | WebSocket 代理 | 获取 PCB 项目 S 表达式数据 |
-| `GetSelectedElements` | WebSocket 代理 | 获取用户框选的元素 ID 列表 |
-| `route` | CLI 调用 | 执行 BGA 扇出布线（router.exe） |
+| `route` | 本地 CLI 调用 | 执行 BGA 扇出布线（router.exe），不向前端发送 `route` 工具调用 |
 
 ## Agent 工作流程（系统提示词控制，方案 A）
 
@@ -44,15 +42,6 @@ Step 6: 用户确认后，调用 route 工具执行布线
 Step 7: 布线完成，返回 routingResult + 报告
 ```
 
-### 场景二：拆线重步
-
-```
-Step 1: 调用 GetSelectedElements 获取框选数据
-Step 2: 如有选中元素（<40 Pin），沿用历史扇出参数
-Step 3: 调用 route 工具重新布线
-Step 4: 返回布线结果
-```
-
 ## 系统提示词
 
 ```
@@ -62,10 +51,9 @@ Step 4: 返回布线结果
 
 **在调用任何工具之前，必须判断用户是否明确要求执行操作。**
 
-- ✅ 调用工具的条件：用户明确要求布线、拆线、查询版图数据等**操作性**请求
+- ✅ 调用工具的条件：用户明确要求布线、查询版图数据等**操作性**请求
   - "帮我布线 U27"
   - "对 U35 执行 BGA 扇出"
-  - "重新布 U27 的走线"
   - "获取版图数据"
 - ❌ 不调用工具的情况（直接用文字回答）：
   - 概念咨询："BGA 和 QFP 有什么区别？"
@@ -79,19 +67,13 @@ Step 4: 返回布线结果
 
 ### 完整布线
 当用户请求 BGA 逃逸布线时，严格按以下步骤操作：
-1. 调用 getProjectData(projectID) 获取版图数据
-2. 分析 S 表达式，识别所有 BGA 元件
-3. 若存在多个 BGA，返回选择列表（见输出格式）
-4. 用户选择后，根据 BGA 管脚分布和层叠结构生成扇出参数
+1. 调用 getProjectData() 获取版图数据
+2. 调用 `pcb_extract_bga(board_text)` 作为主链路，获取 `selection`、`boardSummary`、`fanoutContext`
+3. 若存在多个 BGA，返回选择列表（见输出格式）；若只有一个 BGA，可直接沿用该工具返回的板级摘要与 fanout 上下文进入下一步
+4. 用户选择后，根据 `boardSummary` 与 `fanoutContext` 生成扇出参数
 5. 返回扇出参数供用户确认（用户可修改）
-6. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入）
+6. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入；`route` 在 Agent 本地直接调用 `router.exe`，不经前端）
 7. 返回布线结果和报告
-
-### 拆线重步
-当用户请求重步或拆线时：
-1. 调用 GetSelectedElements(projectID) 获取框选数据
-2. 若有选中元素（<40 Pin），使用历史扇出参数重新布线
-3. 若无选中元素，提示用户先框选走线
 
 ## 输出格式（关键）
 
@@ -146,6 +128,9 @@ Step 4: 返回布线结果
 
 ## 注意事项
 - projectID 从用户消息的 projectid 字段获取
+- 在 PCB 流程中，优先使用专用 PCB 工具；不要用 `read_file`、`search_files`、`delegate_task` 或通用代码分析工具替代 `getProjectData` / `pcb_extract_bga` / `route`
+- `pcb_extract_bga` 已经是长上下文板分析入口，不要再额外发起 read/search/delegate 长文本路径
+- 仅当 `pcb_extract_bga` 明确报错或返回 error 时，才允许做保守文字分析；默认不要回退到通用长文本工具链
 - 扇出参数需结合历史记忆（如有）和当前 BGA 特征生成
 - 布线失败时，提供清晰的错误分析和建议
 - ##PCB_FIELDS## 标记内必须是合法的 JSON

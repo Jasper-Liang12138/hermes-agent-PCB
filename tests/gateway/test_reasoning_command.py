@@ -275,3 +275,144 @@ class TestReasoningCommand:
         assert result["final_response"] == "ok"
         assert _CapturingAgent.last_init is not None
         assert "homeassistant" in set(_CapturingAgent.last_init["enabled_toolsets"])
+
+    def test_run_agent_websocket_chat_turn_strips_websocket_pcb_toolset(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"platform_toolsets": {}},
+        )
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        import hermes_cli.tools_config as tools_config
+        monkeypatch.setattr(
+            tools_config,
+            "_get_platform_tools",
+            lambda *_args, **_kwargs: {"web", "memory", "hermes-websocket"},
+        )
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+
+        source = SessionSource(
+            platform=Platform.WEBSOCKET,
+            chat_id="ws-chat",
+            chat_name="WebSocket",
+            chat_type="dm",
+            user_id="user-1",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="BGA 和 QFP 有什么区别？",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-ws-chat",
+                session_key="agent:main:websocket:dm",
+                turn_options={"route_mode": "chat"},
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
+        assert "web" in enabled_toolsets
+        assert "memory" in enabled_toolsets
+        assert "hermes-websocket" not in enabled_toolsets
+
+    def test_run_agent_websocket_pcb_turn_uses_pcb_only_toolset(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"platform_toolsets": {}},
+        )
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        import hermes_cli.tools_config as tools_config
+        monkeypatch.setattr(
+            tools_config,
+            "_get_platform_tools",
+            lambda *_args, **_kwargs: {
+                "web",
+                "browser",
+                "file",
+                "delegation",
+                "memory",
+                "hermes-websocket",
+            },
+        )
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+
+        source = SessionSource(
+            platform=Platform.WEBSOCKET,
+            chat_id="ws-pcb",
+            chat_name="WebSocket",
+            chat_type="dm",
+            user_id="user-1",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="帮我对 U27 做 BGA 逃逸布线",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-ws-pcb",
+                session_key="agent:main:websocket:dm",
+                turn_options={"route_mode": "pcb"},
+            )
+        )
+
+        assert result["final_response"] == "ok"
+        assert _CapturingAgent.last_init is not None
+        enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
+        assert "memory" in enabled_toolsets
+        assert "hermes-websocket-pcb" in enabled_toolsets
+        assert "web" not in enabled_toolsets
+        assert "browser" not in enabled_toolsets
+        assert "file" not in enabled_toolsets
+        assert "delegation" not in enabled_toolsets
+        assert "hermes-websocket" not in enabled_toolsets

@@ -178,6 +178,49 @@ class TestStreamRunMediaStripping:
 
         assert consumer.already_sent
 
+    @pytest.mark.asyncio
+    async def test_final_edit_passes_is_final_true(self):
+        """最终一次 edit_message 调用应显式带 is_final=True。"""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        edit_result = SimpleNamespace(success=True)
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=edit_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(" world")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        assert adapter.edit_message.call_count >= 1
+        assert adapter.edit_message.call_args_list[-1][1]["is_final"] is True
+
+    @pytest.mark.asyncio
+    async def test_final_only_first_send_marks_stream_is_final(self):
+        """若整段流式内容只在完成时首次发送，应把 final 标记塞进 metadata。"""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=1.0, buffer_threshold=9999)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Short response.")
+        consumer.finish()
+        await consumer.run()
+
+        metadata = adapter.send.call_args_list[0][1]["metadata"]
+        assert metadata["stream_is_final"] is True
+
 
 # ── Segment break (tool boundary) tests ──────────────────────────────────
 

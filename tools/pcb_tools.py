@@ -17,6 +17,7 @@ import json
 import asyncio
 import subprocess
 import os
+import shlex
 import uuid
 import logging
 from concurrent.futures import Future as ThreadFuture
@@ -29,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 _ROUTE_MODE_CHAT = "chat"
 _ROUTE_MODE_PCB = "pcb"
+
+
+def _router_command_args(router_cmd: str) -> list[str]:
+    """Build subprocess args without shell so Windows Unicode paths are safe."""
+    router_cmd = router_cmd.strip() or "router.exe"
+    expanded_cmd = os.path.expandvars(os.path.expanduser(router_cmd))
+    if Path(expanded_cmd).exists():
+        return [expanded_cmd]
+    try:
+        parts = shlex.split(router_cmd, posix=False)
+    except ValueError:
+        return [router_cmd]
+    return [part.strip("\"") for part in parts] or ["router.exe"]
 
 
 # ============================================================================
@@ -70,6 +84,21 @@ class WebSocketTransportSingleton:
     def get_main_loop(self) -> Optional[asyncio.AbstractEventLoop]:
         return self._main_loop
 
+    def resolve_session_id(self, session_id: Optional[str] = None) -> Optional[str]:
+        candidate = str(session_id or "").strip()
+        if candidate:
+            if candidate in self._session_modes or candidate in self._cached_project_data:
+                return candidate
+            try:
+                connections = getattr(self._websocket_adapter, "_connections", {}) or {}
+                if candidate in connections:
+                    return candidate
+            except Exception:
+                pass
+        if self.current_session_id:
+            return self.current_session_id
+        return candidate or None
+
     def set_session_mode(self, session_id: str, mode: str) -> None:
         if not session_id:
             return
@@ -77,6 +106,7 @@ class WebSocketTransportSingleton:
         self._session_modes[session_id] = normalized
 
     def get_session_mode(self, session_id: Optional[str]) -> str:
+        session_id = self.resolve_session_id(session_id)
         if not session_id:
             return _ROUTE_MODE_CHAT
         return self._session_modes.get(session_id, _ROUTE_MODE_CHAT)
@@ -90,20 +120,26 @@ class WebSocketTransportSingleton:
         if self.current_session_id == session_id:
             self.current_session_id = None
 
-    def cache_project_data(self, data: str) -> None:
+    def cache_project_data(self, data: str, session_id: Optional[str] = None) -> None:
         """保存 getProjectData 返回的版图数据，供 route 工具直接使用。"""
-        session_id = self.current_session_id
+        session_id = self.resolve_session_id(session_id)
         if not session_id:
             return
         self._cached_project_data[session_id] = data
 
-    def get_cached_project_data(self) -> Optional[str]:
-        session_id = self.current_session_id
+    def get_cached_project_data(self, session_id: Optional[str] = None) -> Optional[str]:
+        session_id = self.resolve_session_id(session_id)
         if not session_id:
             return None
         return self._cached_project_data.get(session_id)
 
-    def call_tool_sync(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> Any:
+    def call_tool_sync(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: float = 30.0,
+        session_id: Optional[str] = None,
+    ) -> Any:
         """
         在 executor 线程中同步调用 WebSocket 工具，等待结果。
 
@@ -118,7 +154,7 @@ class WebSocketTransportSingleton:
         if not loop or not loop.is_running():
             raise RuntimeError("Main event loop not available")
 
-        session_id = self.current_session_id
+        session_id = self.resolve_session_id(session_id)
         if not session_id:
             raise RuntimeError("No active WebSocket session. Is the PCB client connected?")
         if not self.is_pcb_mode(session_id):
@@ -146,8 +182,8 @@ class WebSocketTransportSingleton:
 _transport = WebSocketTransportSingleton.get_instance()
 
 
-def _session_mode_error(tool_name: str) -> str:
-    session_id = _transport.current_session_id
+def _session_mode_error(tool_name: str, session_id: Optional[str] = None) -> str:
+    session_id = _transport.resolve_session_id(session_id)
     mode = _transport.get_session_mode(session_id)
     return (
         f"工具 {tool_name} 被拒绝：当前会话处于 {mode} 模式。"
@@ -159,33 +195,32 @@ def _session_mode_error(tool_name: str) -> str:
 # Tool 1: getProjectData
 # ============================================================================
 
-def get_project_data(projectID: str) -> str:
+def get_project_data(session_id: Optional[str] = None) -> str:
     """
     获取 PCB 项目数据（S 表达式格式）。
 
     通过 WebSocket 代理调用启云方 PCB 客户端的 PdslExport.ExportDbData 接口。
     Agent 拿到数据后分析其中的 BGA 元件，生成选择列表。
 
-    Args:
-        projectID: PCB 项目的 UUID
-
     Returns:
         PCB 数据的 S 表达式字符串
     """
-    if not _transport.is_pcb_mode(_transport.current_session_id):
-        msg = _session_mode_error("getProjectData")
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("getProjectData", session_id)
         logger.warning(msg)
         return json.dumps({"error": msg}, ensure_ascii=False)
 
     try:
-        logger.info("getProjectData start: projectID=%s", projectID)
+        logger.info("getProjectData start")
         result = _transport.call_tool_sync(
             tool_name="getProjectData",
-            arguments={"projectID": projectID},
+            arguments={},
             timeout=30.0,
+            session_id=session_id,
         )
         data = result if isinstance(result, str) else json.dumps(result)
-        _transport.cache_project_data(data)  # 缓存供 route 工具使用
+        _transport.cache_project_data(data, session_id=session_id)  # 缓存供 route 工具使用
         logger.info("getProjectData success: %d chars", len(data))
         return data
     except Exception as e:
@@ -209,13 +244,13 @@ registry.register(
             "properties": {
                 "projectID": {
                     "type": "string",
-                    "description": "PCB 项目的 UUID，从用户消息的 projectid 字段获取",
+                    "description": "兼容旧版保留字段；当前前端工具获取当前打开版图，无需传参",
                 }
             },
-            "required": ["projectID"],
+            "required": [],
         },
     },
-    handler=lambda args, **kwargs: get_project_data(args.get("projectID", "")),
+    handler=lambda args, **kwargs: get_project_data(session_id=kwargs.get("session_id")),
     check_fn=lambda: _transport.get_adapter() is not None,
 )
 
@@ -224,7 +259,7 @@ registry.register(
 # Tool 2: GetSelectedElements
 # ============================================================================
 
-def get_selected_elements(projectID: str) -> str:
+def get_selected_elements(projectID: str, session_id: Optional[str] = None) -> str:
     """
     获取用户在 PCB 中框选的元素 ID 列表。
 
@@ -237,8 +272,9 @@ def get_selected_elements(projectID: str) -> str:
     Returns:
         JSON 字符串: {"ids": ["wire_001", "wire_002", ...]}
     """
-    if not _transport.is_pcb_mode(_transport.current_session_id):
-        msg = _session_mode_error("GetSelectedElements")
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("GetSelectedElements", session_id)
         logger.warning(msg)
         return json.dumps({"error": msg}, ensure_ascii=False)
 
@@ -248,6 +284,7 @@ def get_selected_elements(projectID: str) -> str:
             tool_name="GetSelectedElements",
             arguments={"projectID": projectID},
             timeout=30.0,
+            session_id=session_id,
         )
         data = result if isinstance(result, str) else json.dumps(result)
         logger.info("GetSelectedElements success: %d chars", len(data))
@@ -277,7 +314,10 @@ registry.register(
             "required": ["projectID"],
         },
     },
-    handler=lambda args, **kwargs: get_selected_elements(args.get("projectID", "")),
+    handler=lambda args, **kwargs: get_selected_elements(
+        args.get("projectID", ""),
+        session_id=kwargs.get("session_id"),
+    ),
     check_fn=lambda: _transport.get_adapter() is not None,
 )
 
@@ -286,7 +326,7 @@ registry.register(
 # Tool 3: route
 # ============================================================================
 
-def route_bga(userData: str) -> str:
+def route_bga(userData: str, session_id: Optional[str] = None) -> str:
     """
     执行 BGA 扇出布线算法（北科大规则布线器）。
 
@@ -308,8 +348,9 @@ def route_bga(userData: str) -> str:
     Returns:
         JSON 字符串: {"routingResult": "...", "report": "..."}
     """
-    if not _transport.is_pcb_mode(_transport.current_session_id):
-        msg = _session_mode_error("route")
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("route", session_id)
         logger.warning(msg)
         return json.dumps({"routingResult": "", "report": msg}, ensure_ascii=False)
 
@@ -320,31 +361,16 @@ def route_bga(userData: str) -> str:
         return json.dumps({"routingResult": "", "report": f"无效的 userData JSON: {userData[:200]}"})
 
     # 从 session 缓存取版图数据
-    project_data = _transport.get_cached_project_data()
+    project_data = _transport.get_cached_project_data(session_id=session_id)
     if not project_data:
         return json.dumps({"routingResult": "", "report": "缺少版图数据，请先调用 getProjectData"})
-
-    # 优先走 WebSocket 代理，便于与启云方 PCB 客户端 / test_client 交互联调。
-    # 若当前没有活跃 WebSocket session，再回退到本地 router.exe。
-    if _transport.get_adapter() is not None and _transport.current_session_id:
-        try:
-            logger.info("route proxy start via websocket")
-            result = _transport.call_tool_sync(
-                tool_name="route",
-                arguments={"userData": userData},
-                timeout=300.0,
-            )
-            data = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-            logger.info("route proxy success: %d chars", len(data))
-            return data
-        except Exception as e:
-            logger.error("route proxy failed, falling back to local router: %s", e)
 
     router_cmd = os.getenv("ROUTER_CMD", "router.exe")
     work_dir = Path(os.getenv("ROUTER_WORK_DIR", "."))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        logger.info("route local start: session=%s router=%s work_dir=%s", session_id, router_cmd, work_dir)
         # Step 1: 写入版图数据
         (work_dir / "版图信息.txt").write_text(project_data, encoding="utf-8")
 
@@ -374,23 +400,24 @@ def route_bga(userData: str) -> str:
             constraint_path.unlink()
 
         # Step 4: 执行布线器
-        logger.info("Executing router: %s in %s", router_cmd, work_dir)
+        router_args = _router_command_args(router_cmd)
+        logger.info("Executing router: %s in %s", router_args, work_dir)
         proc = subprocess.run(
-            router_cmd,
+            router_args,
             cwd=work_dir,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            shell=True,
             timeout=300,
         )
 
         if proc.returncode != 0:
+            output = "\n".join(part for part in [proc.stdout.strip(), proc.stderr.strip()] if part)
             return json.dumps({
                 "routingResult": "",
-                "report": f"布线器执行失败 (exit {proc.returncode}):\n{proc.stderr[:500]}",
-            })
+                "report": f"布线器执行失败 (exit {proc.returncode}):\n{output[:1000]}",
+            }, ensure_ascii=False)
 
         # Step 5: 读取输出文件
         result_file = work_dir / "routing_input.txt"
@@ -436,7 +463,10 @@ registry.register(
             "required": ["userData"],
         },
     },
-    handler=lambda args, **kwargs: route_bga(args.get("userData", "")),
+    handler=lambda args, **kwargs: route_bga(
+        args.get("userData", ""),
+        session_id=kwargs.get("session_id"),
+    ),
     check_fn=lambda: True,
 )
 

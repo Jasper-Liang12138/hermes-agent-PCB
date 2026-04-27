@@ -1,4 +1,4 @@
-/venv/
+﻿/venv/
 /_pycache/
 *.pyc*
 __pycache__/
@@ -58,3 +58,34 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+# Local Python environments
+.venv311/
+
+# Local build/package artifacts
+/build/
+/dist/
+*.spec
+
+# Local runtime/test scratch files
+.tmp-hermes-agent-home/
+*.log
+*.err.log
+*.out.log
+exit-code-capture.txt
+tmp_*.py
+tmp_*.json
+tmp_*.txt
+source-*.log
+source-*.txt
+# Logs and captured process output
+*.log
+*.log.*
+*.err
+*.out
+*.err.log
+*.out.log
+*_stderr.log
+*_stdout.log
+*-stderr.log
+*-stdout.log
+

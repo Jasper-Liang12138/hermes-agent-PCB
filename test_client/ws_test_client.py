@@ -184,6 +184,11 @@ async def _send_loop(
         if line.lower() in {"/quit", "/exit", "quit", "exit"}:
             print("正在退出...")
             state.stop_requested = True
+            try:
+                outgoing = _build_user_message(session_id, project_id, "/quit")
+                await ws.send_str(json.dumps(outgoing, ensure_ascii=False))
+            except aiohttp.ClientError:
+                pass
             await ws.close()
             return
 
@@ -224,20 +229,6 @@ async def _send_resume(
     }, ensure_ascii=False))
 
 
-async def _heartbeat_loop(
-    ws: aiohttp.ClientWebSocketResponse,
-    session_id: str,
-    project_id: str,
-    state: ClientState,
-) -> None:
-    # heartbeat disabled
-    try:
-        while not ws.closed and not state.stop_requested:
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        pass
-
-
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Agent WebSocket 测试客户端")
     parser.add_argument("--host", default=DEFAULT_HOST, help="WebSocket 主机，默认 127.0.0.1")
@@ -267,7 +258,8 @@ async def main() -> None:
                 break
 
             try:
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=None, sock_read=None)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.ws_connect(url) as ws:
                         attempt = 0
                         state.connected = True
@@ -285,11 +277,8 @@ async def main() -> None:
                         send_task = asyncio.create_task(
                             _send_loop(ws, args.session_id, args.project_id, state, input_queue)
                         )
-                        heartbeat_task = asyncio.create_task(
-                            _heartbeat_loop(ws, args.session_id, args.project_id, state)
-                        )
                         done, pending = await asyncio.wait(
-                            {recv_task, send_task, heartbeat_task},
+                            {recv_task, send_task},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         for task in pending:

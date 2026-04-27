@@ -389,6 +389,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-websocket-pcb": {
+        "description": "WebSocket PCB-focused toolset with only PCB routing primitives",
+        "tools": ["getProjectData", "GetSelectedElements", "route", "pcb_extract_bga", "memory", "todo"],
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],

@@ -4897,6 +4897,7 @@ class GatewayRunner:
           - streaming: bool
           - thinking: bool
           - reasoningEffort / reasoning_effort: none|minimal|low|medium|high|xhigh
+          - routeMode / route_mode: chat|pcb
         """
         if not isinstance(options, dict):
             return {}
@@ -4923,7 +4924,50 @@ class GatewayRunner:
             if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
                 normalized["reasoning_effort"] = effort
 
+        route_mode = options.get("routeMode", options.get("route_mode"))
+        if isinstance(route_mode, str):
+            route_mode = route_mode.strip().lower()
+            if route_mode in {"chat", "pcb"}:
+                normalized["route_mode"] = route_mode
+
         return normalized
+
+    @staticmethod
+    def _apply_turn_toolset_overrides(
+        source: SessionSource,
+        enabled_toolsets: List[str],
+        turn_options: Dict[str, Any],
+    ) -> List[str]:
+        updated = list(enabled_toolsets or [])
+        route_mode = str(turn_options.get("route_mode") or "").strip().lower()
+        pcb_excluded = {
+            "web",
+            "browser",
+            "terminal",
+            "file",
+            "code_execution",
+            "skills",
+            "session_search",
+            "clarify",
+            "delegation",
+            "cronjob",
+            "messaging",
+            "tts",
+            "image_gen",
+            "moa",
+            "homeassistant",
+            "rl",
+            "hermes-websocket",
+        }
+
+        if source.platform == Platform.WEBSOCKET and route_mode == "chat":
+            updated = [ts for ts in updated if ts != "hermes-websocket"]
+        elif source.platform == Platform.WEBSOCKET and route_mode == "pcb":
+            updated = [ts for ts in updated if ts not in pcb_excluded]
+            if "hermes-websocket-pcb" not in updated:
+                updated.append("hermes-websocket-pcb")
+
+        return sorted(set(updated))
 
     @classmethod
     def _extract_turn_options_from_event(cls, event: Optional[MessageEvent]) -> Dict[str, Any]:
@@ -7437,6 +7481,11 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._apply_turn_toolset_overrides(
+            source,
+            enabled_toolsets,
+            turn_options,
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

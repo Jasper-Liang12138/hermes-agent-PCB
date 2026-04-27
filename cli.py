@@ -9715,9 +9715,15 @@ def main(
     if gateway:
         import asyncio
         import sys
+        import signal
         # aiohttp WebSocket server requires SelectorEventLoop on Windows
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            # In packaged Windows gateway mode the console can deliver CTRL_C_EVENT
+            # while a long-running agent turn is active, which cancels asyncio.run()
+            # and shuts down the executor. The PCB gateway is meant to be controlled
+            # by the wrapper window lifecycle, so keep SIGINT from tearing it down.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
         try:
