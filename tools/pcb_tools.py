@@ -20,6 +20,7 @@ import os
 import shlex
 import uuid
 import logging
+import re
 from concurrent.futures import Future as ThreadFuture
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -43,6 +44,84 @@ def _router_command_args(router_cmd: str) -> list[str]:
     except ValueError:
         return [router_cmd]
     return [part.strip("\"") for part in parts] or ["router.exe"]
+
+
+def _clean_component_refdes(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        value = value.get("label") or value.get("name") or value.get("refdes")
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().strip("`'\"").strip("，。,.!?！？:：;；")
+    if not cleaned:
+        return None
+    match = re.search(r"[A-Za-z_][A-Za-z0-9_.-]*", cleaned)
+    return match.group(0) if match else None
+
+
+def _component_from_payload(*payloads: Any) -> Optional[str]:
+    keys = (
+        "selectedBGA",
+        "selected_bga",
+        "selectedBga",
+        "targetRefdes",
+        "target_refdes",
+        "component",
+        "refdes",
+        "label",
+    )
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in keys:
+            refdes = _clean_component_refdes(payload.get(key))
+            if refdes:
+                return refdes
+    return None
+
+
+def _component_from_session(session_id: Optional[str]) -> Optional[str]:
+    try:
+        adapter = _transport.get_adapter()
+        selected_targets = getattr(adapter, "_session_selected_targets", {}) or {}
+        return _clean_component_refdes(selected_targets.get(session_id))
+    except Exception:
+        return None
+
+
+def _infer_component_from_project_data(project_data: str) -> Optional[str]:
+    if not isinstance(project_data, str) or not project_data.strip():
+        return None
+
+    quoted_matches = list(re.finditer(r'\(component\s+"([^"]+)"', project_data))
+    for index, match in enumerate(quoted_matches):
+        label = match.group(1).strip()
+        next_start = quoted_matches[index + 1].start() if index + 1 < len(quoted_matches) else len(project_data)
+        block = project_data[match.start():next_start]
+        if "bga" in block.lower():
+            return label
+    if quoted_matches:
+        return quoted_matches[0].group(1).strip()
+
+    named_matches = list(re.finditer(r'\(component\s+\(name\s+"([^"]+)"\)', project_data))
+    for index, match in enumerate(named_matches):
+        label = match.group(1).strip()
+        next_start = named_matches[index + 1].start() if index + 1 < len(named_matches) else len(project_data)
+        block = project_data[match.start():next_start]
+        if "bga" in block.lower():
+            return label
+    if named_matches:
+        return named_matches[0].group(1).strip()
+
+    return None
+
+
+def _resolve_component_refdes(user_data_obj: Any, route_params: Any, session_id: Optional[str], project_data: str) -> str:
+    return (
+        _component_from_payload(user_data_obj, route_params)
+        or _component_from_session(session_id)
+        or _infer_component_from_project_data(project_data)
+        or "U1"
+    )
 
 
 # ============================================================================
@@ -341,9 +420,10 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         userData: 扇出参数 JSON 字符串，格式：
             {
               "orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}, ...],
+              "selectedBGA": "U27",
               "constraints": {"LineWidth": 4, "LineSpacing": 3}
             }
-            orderLines 必填；constraints 可选。
+            orderLines 必填；selectedBGA 建议传入；constraints 可选。
 
     Returns:
         JSON 字符串: {"routingResult": "...", "report": "..."}
@@ -374,20 +454,24 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         # Step 1: 写入版图数据
         (work_dir / "版图信息.txt").write_text(project_data, encoding="utf-8")
 
-        # Step 2: 写入 order_input.txt — 每行格式：{线网名} {层名} {布线顺序}
-        order_lines = user_data_obj.get("orderLines", [])
+        route_params = user_data_obj.get("fanoutParams") if isinstance(user_data_obj.get("fanoutParams"), dict) else user_data_obj
+
+        # Step 2: 写入 order_input.txt — 每行格式：{线网名} {层名} {布线顺序}，最后一行是器件位号
+        order_lines = route_params.get("orderLines", [])
         if not order_lines:
             return json.dumps({"routingResult": "", "report": "userData.orderLines 为空，无法布线"})
         logger.info("route local start: %d order lines", len(order_lines))
+        component_refdes = _resolve_component_refdes(user_data_obj, route_params, session_id, project_data)
         order_text = "\n".join(
             f"{item['net']} {item['layer']} {item['order']}"
             for item in order_lines
         )
+        order_text = f"{order_text}\n\n{component_refdes}"
         (work_dir / "order_input.txt").write_text(order_text, encoding="utf-8")
-        logger.info("Wrote order_input.txt: %d lines", len(order_lines))
+        logger.info("Wrote order_input.txt: %d lines, component=%s", len(order_lines), component_refdes)
 
         # Step 3: 写入 constraint.txt（可选）— 格式：LineWidth {n}\nLineSpacing {n}
-        constraints = user_data_obj.get("constraints")
+        constraints = route_params.get("constraints") or user_data_obj.get("constraints")
         constraint_path = work_dir / "constraint.txt"
         if constraints and isinstance(constraints, dict):
             line_width = constraints.get("LineWidth")
@@ -401,6 +485,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
 
         # Step 4: 执行布线器
         router_args = _router_command_args(router_cmd)
+        router_args.extend(["--component", component_refdes])
         logger.info("Executing router: %s in %s", router_args, work_dir)
         proc = subprocess.run(
             router_args,
@@ -455,8 +540,8 @@ registry.register(
                     "description": (
                         "扇出参数 JSON 字符串，格式：\n"
                         '{"orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}, ...], '
-                        '"constraints": {"LineWidth": 4, "LineSpacing": 3}}\n'
-                        "orderLines 必填，constraints 可选。"
+                        '"selectedBGA": "U27", "constraints": {"LineWidth": 4, "LineSpacing": 3}}\n'
+                        "orderLines 必填，selectedBGA 建议传入并会写到 order_input.txt 最后一行，constraints 可选。"
                     ),
                 },
             },

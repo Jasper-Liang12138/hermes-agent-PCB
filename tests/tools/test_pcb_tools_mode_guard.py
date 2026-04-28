@@ -99,7 +99,7 @@ def test_route_runs_local_router_even_with_active_websocket_adapter(monkeypatch,
         raise AssertionError("route must not be proxied to frontend")
 
     def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
-        assert cmd == ["router.exe"]
+        assert cmd == ["router.exe", "--component", "U27"]
         assert cwd == tmp_path
         assert capture_output is True
         assert text is True
@@ -115,13 +115,40 @@ def test_route_runs_local_router_even_with_active_websocket_adapter(monkeypatch,
     monkeypatch.setenv("ROUTER_CMD", "router.exe")
     monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
 
-    result = pcb_tools.route_bga('{"orderLines":[{"net":"GND","layer":"SIG03","order":1}],"constraints":{"LineWidth":4,"LineSpacing":3}}')
+    result = pcb_tools.route_bga('{"orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"U27","constraints":{"LineWidth":4,"LineSpacing":3}}')
     payload = json.loads(result)
 
     assert payload == {"routingResult": "(routes (done))", "report": "布线成功"}
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "U27")))'
-    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1"
+    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU27"
     assert (tmp_path / "constraint.txt").read_text(encoding="utf-8") == "LineWidth 4\nLineSpacing 3"
+
+
+def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-route-selected"
+    transport.set_session_mode("sess-route-selected", "pcb")
+    transport._cached_project_data["sess-route-selected"] = (
+        '(pcb_data (component (name "U27") (package "BGA-256")) '
+        '(component (name "U35") (package "BGA-484")))'
+    )
+    transport._websocket_adapter = SimpleNamespace(_session_selected_targets={"sess-route-selected": "U35"})
+
+    def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
+        assert cmd == ["router.exe", "--component", "U35"]
+        (tmp_path / "routing_input.txt").write_text("(routes (u35))", encoding="utf-8")
+        (tmp_path / "data.txt").write_text("布线成功", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
+    monkeypatch.setenv("ROUTER_CMD", "router.exe")
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
+
+    result = pcb_tools.route_bga('{"orderLines":[{"net":"GND","layer":"SIG03","order":1}]}')
+    payload = json.loads(result)
+
+    assert payload == {"routingResult": "(routes (u35))", "report": "布线成功"}
+    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU35"
 
 
 def test_handle_function_call_uses_explicit_session_for_get_project_data(monkeypatch):
@@ -169,7 +196,7 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
     transport._cached_project_data["sess-explicit-route"] = '(pcb_data (component (name "FPGA1")))'
 
     def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
-        assert cmd == ["router.exe"]
+        assert cmd == ["router.exe", "--component", "FPGA1"]
         assert cwd == tmp_path
         (tmp_path / "routing_input.txt").write_text("(routes (fpga1))", encoding="utf-8")
         (tmp_path / "data.txt").write_text("布线成功", encoding="utf-8")
@@ -181,10 +208,11 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
 
     result = handle_function_call(
         "route",
-        {"userData": '{"orderLines":[{"net":"GND","layer":"SIG03","order":1}]}'},
+        {"userData": '{"orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"FPGA1"}'},
         session_id="sess-explicit-route",
     )
     payload = json.loads(result)
 
     assert payload == {"routingResult": "(routes (fpga1))", "report": "布线成功"}
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "FPGA1")))'
+    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nFPGA1"

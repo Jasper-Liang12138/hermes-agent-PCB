@@ -215,6 +215,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_mode_lock_until: Dict[str, float] = {}
         self._session_flow_states: Dict[str, str] = {}
         self._session_selection_labels: Dict[str, Tuple[str, ...]] = {}
+        self._session_selected_targets: Dict[str, str] = {}
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
@@ -1140,6 +1141,7 @@ class WebSocketAdapter(BasePlatformAdapter):
     def _reset_flow(self, session_id: str) -> None:
         self._set_flow_state(session_id, _FLOW_IDLE)
         self._session_selection_labels.pop(session_id, None)
+        self._session_selected_targets.pop(session_id, None)
 
     @staticmethod
     def _as_bool(value: Any) -> bool:
@@ -1190,6 +1192,9 @@ class WebSocketAdapter(BasePlatformAdapter):
             label = normalized_labels.get(candidate.casefold())
             if label:
                 return label
+            for normalized, original in normalized_labels.items():
+                if re.search(rf"(?<![A-Za-z0-9_]){re.escape(normalized)}(?![A-Za-z0-9_])", candidate, re.IGNORECASE):
+                    return original
         return None
 
     @staticmethod
@@ -1580,7 +1585,9 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
 
         if flow_state == _FLOW_WAIT_SELECTION:
-            if self._extract_selected_label(session_id, text):
+            selected_label = self._extract_selected_label(session_id, text)
+            if selected_label:
+                self._session_selected_targets[session_id] = selected_label
                 return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="selection_step", intent=_INTENT_PCB_SELECT_TARGET)
             if _CONFIRM_RE.search(text):
                 return _RouteDecision(
@@ -1606,7 +1613,9 @@ class WebSocketAdapter(BasePlatformAdapter):
             if _CONFIRM_RE.search(text):
                 self._set_flow_state(session_id, _FLOW_ROUTING)
                 return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="confirm_route", intent=_INTENT_PCB_CONFIRM_ROUTE)
-            if self._extract_selected_label(session_id, text):
+            selected_label = self._extract_selected_label(session_id, text)
+            if selected_label:
+                self._session_selected_targets[session_id] = selected_label
                 return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="reselect_before_confirm", intent=_INTENT_PCB_SELECT_TARGET)
             return _RouteDecision(
                 mode=_ROUTE_MODE_PCB,
@@ -1659,6 +1668,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                     if label:
                         labels.append(label)
             self._session_selection_labels[session_id] = tuple(labels)
+            self._session_selected_targets.pop(session_id, None)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
 
@@ -1785,7 +1795,89 @@ class WebSocketAdapter(BasePlatformAdapter):
                 logger.warning("Failed to parse PCB_FIELDS: %s | content: %s", e, match.group(1)[:200])
             clean = clean.replace(match.group(0), "")
 
+        # 容错：流式/模型偶发漏写 ##PCB_FIELDS_END## 时，只要标记后已有完整 JSON，
+        # 仍提取结构字段并从正文剥离，避免前端把 selection 当普通文本展示。
+        clean = WebSocketAdapter._extract_unclosed_pcb_fields(clean, fields)
         return clean.strip(), fields
+
+    @staticmethod
+    def _extract_unclosed_pcb_fields(content: str, fields: Dict[str, Any]) -> str:
+        clean = content
+        search_pos = 0
+        marker = "##PCB_FIELDS##"
+        while True:
+            marker_start = clean.find(marker, search_pos)
+            if marker_start < 0:
+                break
+            bounds = WebSocketAdapter._json_payload_bounds(clean, marker_start + len(marker))
+            if bounds is None:
+                search_pos = marker_start + len(marker)
+                continue
+            json_start, json_end = bounds
+            raw_payload = clean[json_start:json_end].strip()
+            try:
+                data = json.loads(raw_payload)
+            except json.JSONDecodeError as e:
+                logger.warning("Failed to parse unclosed PCB_FIELDS: %s | content: %s", e, raw_payload[:200])
+                search_pos = json_end
+                continue
+            if isinstance(data, dict):
+                fields.update(data)
+            clean = clean[:marker_start] + clean[json_end:]
+            search_pos = marker_start
+
+        # 清掉模型误输出的残留标记前缀，例如 "##PCB_FIELDS请从..."。
+        return re.sub(r"##PCB_FIELDS(?:_END)?#*", "", clean)
+
+    @staticmethod
+    def _json_payload_bounds(content: str, start: int) -> Optional[Tuple[int, int]]:
+        pos = start
+        length = len(content)
+        while pos < length and content[pos].isspace():
+            pos += 1
+        if content.startswith("```", pos):
+            newline = content.find("\n", pos)
+            if newline < 0:
+                return None
+            pos = newline + 1
+            while pos < length and content[pos].isspace():
+                pos += 1
+
+        opener_index = -1
+        for idx in range(pos, length):
+            if content[idx] in "{[":
+                opener_index = idx
+                break
+            if not content[idx].isspace():
+                return None
+        if opener_index < 0:
+            return None
+
+        stack = []
+        in_string = False
+        escaped = False
+        pairs = {"{": "}", "[": "]"}
+        for idx in range(opener_index, length):
+            char = content[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in pairs:
+                stack.append(pairs[char])
+            elif char in "}]":
+                if not stack or stack[-1] != char:
+                    return None
+                stack.pop()
+                if not stack:
+                    return opener_index, idx + 1
+        return None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "websocket", "chat_id": chat_id}

@@ -462,6 +462,29 @@ def test_stream_fields_emitted_without_true_final():
     asyncio.get_event_loop().run_until_complete(_run_stream_fields_emitted_without_true_final())
 
 
+def test_extract_pcb_fields_accepts_missing_end_marker():
+    content = (
+        "请从以下 BGA 元件中选择要进行逃逸布线的目标：\n\n"
+        "##PCB_FIELDS##\n"
+        "{\n"
+        '  "selection": [\n'
+        '    {"label": "U27", "detail": "BGA-256, 1.0mm pitch"},\n'
+        '    {"label": "U35", "detail": "BGA-484, 0.8mm pitch"}\n'
+        "  ]\n"
+        "}\n"
+        "##PCB_FIELDS请从以下 BGA 元件中选择要进行逃逸布线的目标： ▉"
+    )
+
+    clean, fields = WebSocketAdapter._extract_pcb_fields(content)
+
+    assert fields["selection"] == [
+        {"label": "U27", "detail": "BGA-256, 1.0mm pitch"},
+        {"label": "U35", "detail": "BGA-484, 0.8mm pitch"},
+    ]
+    assert "##PCB_FIELDS" not in clean
+    assert '"selection"' not in clean
+
+
 async def _run_stream_delta_is_accumulated_and_final_true() -> None:
     """增量流式输入时，WebSocket 输出应始终携带累计全文，最终帧 isFinal=true。"""
     adapter = _make_adapter()

@@ -102,6 +102,7 @@ Step 7: 布线完成，返回 routingResult + 报告
 ##PCB_FIELDS##
 {
   "fanoutParams": {
+    "selectedBGA": "U27",
     "orderLines": [
       {"net": "GND", "layer": "SIG03", "order": 1},
       {"net": "VCC", "layer": "SIG03", "order": 2},
@@ -139,6 +140,7 @@ Step 7: 布线完成，返回 routingResult + 报告
 ## fanoutParams 格式规范（重要）
 
 fanoutParams 必须包含：
+- `selectedBGA`：用户选择/当前要布线的 BGA 器件位号（如 `U27`）；route 会把它写入 `order_input.txt` 最后一行
 - `orderLines`：数组，每项为 `{"net": "线网名", "layer": "层名", "order": 布线顺序整数}`
   - net：线网名称（如 GND、VCC、DDR_D0）
   - layer：逃逸层名（如 SIG03、SIG04）
@@ -147,7 +149,7 @@ fanoutParams 必须包含：
 
 调用 route 工具时只传 userData，不传 projectData：
 ```json
-{"userData": "{\"orderLines\":[{\"net\":\"GND\",\"layer\":\"SIG03\",\"order\":1}],\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}"}
+{"userData": "{\"selectedBGA\":\"U27\",\"orderLines\":[{\"net\":\"GND\",\"layer\":\"SIG03\",\"order\":1}],\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}"}
 ```
 ```
 
