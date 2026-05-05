@@ -220,6 +220,108 @@ def test_websocket_pcb_flow_round_trip():
     asyncio.get_event_loop().run_until_complete(_run_websocket_pcb_flow_round_trip())
 
 
+def test_websocket_reroute_intent_loads_reroute_skill_without_bootstrap():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-intent"
+
+    decision = adapter._decide_route(
+        session_id,
+        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+    )
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
+def test_websocket_reroute_llm_intent_takes_priority_over_keyword_fallback():
+    adapter = _make_adapter()
+
+    chat_decision = adapter._decide_route(
+        "sess-reroute-llm-chat",
+        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+        llm_intent={
+            "intent": "chat",
+            "route_mode": "chat",
+            "confidence": 0.91,
+            "should_call_get_project_data": False,
+        },
+    )
+    assert chat_decision.mode == "chat"
+    assert chat_decision.intent == "chat"
+
+    reroute_decision = adapter._decide_route(
+        "sess-reroute-llm-direct",
+        "把这些未布通网络重新整理一下",
+        llm_intent={
+            "intent": "pcb_reroute_selected",
+            "route_mode": "pcb",
+            "confidence": 0.88,
+            "should_call_get_project_data": False,
+        },
+    )
+    assert reroute_decision.mode == "pcb"
+    assert reroute_decision.intent == "pcb_reroute_selected"
+    assert reroute_decision.bootstrap_get_project is False
+
+
+async def _run_websocket_reroute_fields_round_trip() -> None:
+    port = _free_port()
+    adapter = _make_adapter(port)
+    session_id = "sess-reroute-fields"
+    project_id = "proj-reroute-001"
+    observed_auto_skill: list[str | None] = []
+
+    reroute_fields = {
+        "rerouteResult": {
+            "type": "local_reroute",
+            "selectedNets": ["net13", "net17"],
+            "operations": [{"action": "reroute_net", "net": "net13"}],
+        },
+        "checkReport": {"passed": True, "checks": []},
+        "explanation": "局部重布结果已生成",
+    }
+
+    async def handler(event):
+        observed_auto_skill.append(event.auto_skill)
+        assert "不要再次调用 getProjectData" not in event.text
+        return (
+            "已完成局部拆线重布。\n\n"
+            "##PCB_FIELDS##\n"
+            f"{json.dumps(reroute_fields, ensure_ascii=False)}\n"
+            "##PCB_FIELDS_END##"
+        )
+
+    adapter.set_message_handler(handler)
+    await adapter.connect()
+
+    try:
+        uri = f"http://127.0.0.1:{port}"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
+                await ws.send_str(
+                    _user_message(
+                        session_id,
+                        project_id,
+                        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+                    )
+                )
+
+                msg = await _recv_json(ws)
+                assert msg["type"] == "message"
+                assert msg["body"]["rerouteResult"] == reroute_fields["rerouteResult"]
+                assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
+                assert msg["body"]["explanation"] == reroute_fields["explanation"]
+    finally:
+        await adapter.disconnect()
+
+    assert observed_auto_skill == ["hardware/pcb-reroute"]
+
+
+def test_websocket_reroute_fields_round_trip():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip())
+
+
 async def _run_websocket_chat_turn_not_misrouted() -> None:
     """普通聊天应走 chat 通道，不应强制 auto_skill=pcb。"""
     port = _free_port()

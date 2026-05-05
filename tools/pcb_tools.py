@@ -143,6 +143,7 @@ class WebSocketTransportSingleton:
     _main_loop: Optional[asyncio.AbstractEventLoop] = None
     current_session_id: Optional[str] = None
     _cached_project_data: Dict[str, str] = {}  # session_id -> getProjectData 结果缓存
+    _cached_reroute_context: Dict[str, Dict[str, Any]] = {}  # session_id -> drop_net 结果缓存
     _session_modes: Dict[str, str] = {}  # session_id -> chat/pcb
 
     @classmethod
@@ -196,6 +197,7 @@ class WebSocketTransportSingleton:
     def clear_session(self, session_id: str) -> None:
         self._session_modes.pop(session_id, None)
         self._cached_project_data.pop(session_id, None)
+        self._cached_reroute_context.pop(session_id, None)
         if self.current_session_id == session_id:
             self.current_session_id = None
 
@@ -211,6 +213,19 @@ class WebSocketTransportSingleton:
         if not session_id:
             return None
         return self._cached_project_data.get(session_id)
+
+    def cache_reroute_context(self, data: Dict[str, Any], session_id: Optional[str] = None) -> None:
+        """保存 drop_net 返回的拆线上下文，供 reroute 工具使用。"""
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return
+        self._cached_reroute_context[session_id] = data
+
+    def get_cached_reroute_context(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return None
+        return self._cached_reroute_context.get(session_id)
 
     def call_tool_sync(
         self,
@@ -556,4 +571,434 @@ registry.register(
 )
 
 
-logger.info("PCB tools registered: getProjectData, GetSelectedElements, route")
+_NET_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]*")
+
+
+def extract_reroute_nets(user_text: str) -> list[str]:
+    """Extract net names from a natural-language reroute request."""
+    text = str(user_text or "")
+    found: list[str] = []
+
+    for match in _NET_TOKEN_RE.finditer(text):
+        found.append(match.group(0))
+
+    for quoted in re.findall(r"[`'\"“”‘’]([^`'\"“”‘’]{1,80})[`'\"“”‘’]", text):
+        candidate = quoted.strip()
+        if _NET_TOKEN_RE.fullmatch(candidate):
+            found.append(candidate)
+
+    seen: set[str] = set()
+    nets: list[str] = []
+    for raw in found:
+        net = raw.strip().strip("，。,.!?！？:：;；、")
+        if not net:
+            continue
+        key = net.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        nets.append(net)
+    return nets
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {"droppedBoardData": value}
+    return {"result": value}
+
+
+def _first_text_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _read_board_file(path_text: str) -> tuple[str, str]:
+    """Read a PCB board text file returned by the EDA mock tool."""
+    if not path_text:
+        return "", ""
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        logger.warning("drop_net returned board data path that is not a file: %s", path_text)
+        return "", path_text
+    try:
+        return path.read_text(encoding="utf-8"), str(path)
+    except OSError as exc:
+        logger.warning("Failed reading dropped board data file %s: %s", path_text, exc)
+        return "", str(path)
+
+
+def _resolve_dropped_board_data(drop_result: Dict[str, Any]) -> tuple[str, str]:
+    """Resolve dropped board text from direct content or a returned file path."""
+    direct = _first_text_value(
+        drop_result,
+        ("droppedBoardData", "boardData", "projectData"),
+    )
+    file_path = _first_text_value(
+        drop_result,
+        (
+            "droppedBoardDataFilePath",
+            "droppedBoardFilePath",
+            "boardDataFilePath",
+            "projectDataFilePath",
+            "filePath",
+            "path",
+        ),
+    )
+    if direct:
+        return direct, file_path
+    if file_path:
+        return _read_board_file(file_path)
+    return "", ""
+
+
+def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = None) -> str:
+    """
+    从用户文本提取需要删除的 net，并通过 WebSocket 请求 EDA 执行 MOCK 拆线。
+
+    EDA 侧负责真正删除走线，并返回拆线后的版图数据与被拆对象信息。
+    """
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("drop_net", session_id)
+        logger.warning(msg)
+        return json.dumps({"selectedNets": [], "error": msg}, ensure_ascii=False)
+
+    nets = extract_reroute_nets(userText)
+    if not nets:
+        return json.dumps(
+            {
+                "selectedNets": [],
+                "error": "未从用户文本中识别到需要拆线的 net，请明确写出如 net13、net17。",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        logger.info("drop_net start: session=%s projectID=%s nets=%s", session_id, projectID, nets)
+        result = _transport.call_tool_sync(
+            tool_name="drop_net_mock",
+            arguments={"projectID": projectID, "nets": nets, "userText": userText},
+            timeout=60.0,
+            session_id=session_id,
+        )
+        drop_result = _json_object(result)
+        dropped_board_data, dropped_board_path = _resolve_dropped_board_data(drop_result)
+        payload = {
+            "selectedNets": nets,
+            "dropResult": drop_result,
+            "droppedBoardData": dropped_board_data,
+            "droppedBoardDataFilePath": dropped_board_path,
+            "droppedObjects": drop_result.get("droppedObjects") or drop_result.get("removedObjects") or [],
+            "localContext": drop_result.get("localContext") or {},
+        }
+        _transport.cache_reroute_context(payload, session_id=session_id)
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as e:
+        logger.error("drop_net failed: %s", e)
+        return json.dumps({"selectedNets": nets, "error": str(e)}, ensure_ascii=False)
+
+
+registry.register(
+    name="drop_net",
+    toolset="pcb",
+    schema={
+        "name": "drop_net",
+        "description": (
+            "从用户文本中提取要拆除的 net，并请求 EDA 客户端执行 MOCK 局部拆线。"
+            "不要调用 GetSelectedElements；本工具只依赖用户文本中的 net 名称。"
+            "客户端可返回 droppedBoardData 或 droppedBoardDataFilePath；若返回文件路径，本工具会读取文件内容并缓存。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "userText": {
+                    "type": "string",
+                    "description": "用户原始拆线重布请求，例如：请帮我把 BGA U2 的 net13、net17 拆线后重新布线",
+                },
+                "projectID": {
+                    "type": "string",
+                    "description": "PCB 项目的 UUID，可从用户消息的 projectid 字段传入；缺省也可由前端使用当前工程。",
+                },
+            },
+            "required": ["userText"],
+        },
+    },
+    handler=lambda args, **kwargs: drop_net(
+        args.get("userText", ""),
+        projectID=args.get("projectID", ""),
+        session_id=kwargs.get("session_id"),
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
+
+
+def _build_fallback_reroute_payload(
+    *,
+    nets: list[str],
+    dropped_board_data: str,
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    check_report: Dict[str, Any],
+    explanation_suffix: str = "",
+) -> Dict[str, Any]:
+    reroute_result = {
+        "type": "local_reroute",
+        "mode": "selected_nets_after_drop",
+        "selectedNets": nets,
+        "operations": [
+            {
+                "action": "reroute_net",
+                "net": net,
+                "scope": "local",
+                "preserveOtherNets": True,
+            }
+            for net in nets
+        ],
+        "constraints": constraints,
+        "droppedObjects": dropped_objects,
+        "localContext": local_context,
+        "droppedBoardDataFilePath": dropped_board_path,
+        "droppedBoardDataChars": len(dropped_board_data or ""),
+    }
+    explanation = (
+        "已基于用户文本中的 net 名称和 EDA 拆线结果生成局部重布结果包；"
+        "本结果限定在 selectedNets 范围内，其他网络默认保护。"
+    )
+    if explanation_suffix:
+        explanation = f"{explanation}{explanation_suffix}"
+    return {
+        "rerouteResult": reroute_result,
+        "checkReport": check_report,
+        "explanation": explanation,
+    }
+
+
+def _normalize_reroute_model_payload(
+    model_payload: Dict[str, Any],
+    *,
+    fallback_payload: Dict[str, Any],
+    context_stats: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    result = dict(fallback_payload)
+    if isinstance(model_payload.get("rerouteResult"), dict):
+        merged_result = dict(result["rerouteResult"])
+        merged_result.update(model_payload["rerouteResult"])
+        if context_stats:
+            merged_result.setdefault("contextStats", context_stats)
+        result["rerouteResult"] = merged_result
+    if isinstance(model_payload.get("checkReport"), dict):
+        result["checkReport"] = model_payload["checkReport"]
+    if isinstance(model_payload.get("explanation"), str) and model_payload["explanation"].strip():
+        result["explanation"] = model_payload["explanation"].strip()
+    return result
+
+
+def _generate_reroute_with_model(
+    *,
+    nets: list[str],
+    dropped_board_data: str,
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    check_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Use the PCB chunking service and configured LLM to generate reroute output."""
+    fallback_payload = _build_fallback_reroute_payload(
+        nets=nets,
+        dropped_board_data=dropped_board_data,
+        dropped_board_path=dropped_board_path,
+        dropped_objects=dropped_objects,
+        local_context=local_context,
+        constraints=constraints,
+        check_report=check_report,
+    )
+    if not dropped_board_data:
+        return fallback_payload
+
+    try:
+        from tools import pcb_chunking_tool as chunking
+
+        runtime = chunking._resolve_model_runtime_config()
+        adapter = chunking._OpenAICompatibleChatAdapter(
+            base_url=runtime["base_url"],
+            model=runtime["model"],
+            api_key=runtime["api_key"],
+            timeout_s=300,
+        )
+        token_counter = adapter.get_token_counter()
+        context_result = chunking._build_board_context(dropped_board_data, token_counter=token_counter)
+        context_text = context_result["contextText"]
+        context_stats = context_result.get("stats") or {}
+
+        system_prompt = (
+            "你是一名 PCB 局部拆线重布助手。只输出 JSON，不要输出 Markdown、解释性段落或代码块。\n"
+            "目标：基于拆线后的版图分块上下文、待重布 net、被拆对象和局部上下文，生成局部重布结果包。\n"
+            "不要编造不可确认的几何细节；如果无法给出真实线段，输出可执行意图级 operations。"
+        )
+        user_prompt = (
+            "请生成如下 JSON 结构：\n"
+            "{\n"
+            '  "rerouteResult": {"type": "local_reroute", "mode": "selected_nets_after_drop", "selectedNets": [], "operations": []},\n'
+            '  "checkReport": {"passed": true, "checks": []},\n'
+            '  "explanation": "简短中文说明"\n'
+            "}\n\n"
+            f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
+            f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
+            f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
+            f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
+            f"droppedBoardDataFilePath: {dropped_board_path or ''}\n\n"
+            f"chunkStats:\n{json.dumps(context_stats, ensure_ascii=False, indent=2)}\n\n"
+            f"拆线后版图分块上下文:\n{context_text}\n"
+        )
+        prompt_bundle = chunking._PromptBundle(system=system_prompt, user=user_prompt)
+        generation_config = chunking._GenerationConfig(max_new_tokens=1600, temperature=0.1)
+        raw_text, _model_meta = adapter.generate(prompt_bundle, generation_config)
+        model_payload = chunking._extract_first_json_object(raw_text)
+        return _normalize_reroute_model_payload(
+            model_payload,
+            fallback_payload=fallback_payload,
+            context_stats=context_stats,
+        )
+    except Exception as exc:
+        logger.warning("reroute model generation failed; using fallback payload: %s", exc)
+        return _build_fallback_reroute_payload(
+            nets=nets,
+            dropped_board_data=dropped_board_data,
+            dropped_board_path=dropped_board_path,
+            dropped_objects=dropped_objects,
+            local_context=local_context,
+            constraints=constraints,
+            check_report=check_report,
+            explanation_suffix=f"（模型重布生成不可用，已回退到结构化结果包：{exc}）",
+        )
+
+
+def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
+    """
+    基于 drop_net 缓存的拆线上下文生成精简局部重布结果包。
+
+    第一版不调用外部全局 router，只输出 EDA 可继续落地/展示的局部重布请求。
+    """
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("reroute", session_id)
+        logger.warning(msg)
+        return json.dumps({"rerouteResult": None, "checkReport": {"passed": False, "errors": [msg]}}, ensure_ascii=False)
+
+    try:
+        user_data_obj = json.loads(userData) if isinstance(userData, str) and userData.strip() else {}
+        if not isinstance(user_data_obj, dict):
+            user_data_obj = {}
+    except json.JSONDecodeError:
+        return json.dumps(
+            {
+                "rerouteResult": None,
+                "checkReport": {"passed": False, "errors": [f"无效的 userData JSON: {userData[:200]}"]},
+            },
+            ensure_ascii=False,
+        )
+
+    cached = _transport.get_cached_reroute_context(session_id=session_id) or {}
+    nets = (
+        user_data_obj.get("selectedNets")
+        or user_data_obj.get("nets")
+        or cached.get("selectedNets")
+        or extract_reroute_nets(user_data_obj.get("userText", ""))
+    )
+    nets = [str(net).strip() for net in nets if str(net).strip()] if isinstance(nets, list) else []
+
+    if not nets:
+        return json.dumps(
+            {
+                "rerouteResult": None,
+                "checkReport": {"passed": False, "errors": ["缺少 selectedNets，无法生成局部重布结果。"]},
+            },
+            ensure_ascii=False,
+        )
+
+    dropped_board_data = (
+        user_data_obj.get("droppedBoardData")
+        or cached.get("droppedBoardData")
+        or _transport.get_cached_project_data(session_id=session_id)
+        or ""
+    )
+    dropped_board_path = (
+        user_data_obj.get("droppedBoardDataFilePath")
+        or cached.get("droppedBoardDataFilePath")
+        or ""
+    )
+    if not dropped_board_data and dropped_board_path:
+        dropped_board_data, dropped_board_path = _read_board_file(str(dropped_board_path))
+    dropped_objects = user_data_obj.get("droppedObjects") or cached.get("droppedObjects") or []
+    local_context = user_data_obj.get("localContext") or cached.get("localContext") or {}
+    constraints = user_data_obj.get("constraints") or {}
+
+    check_report = {
+        "passed": True,
+        "checks": [
+            {"name": "net_extraction", "passed": bool(nets), "detail": f"识别到 {len(nets)} 个待重布 net"},
+            {"name": "dropped_board_data", "passed": bool(dropped_board_data), "detail": "已获得拆线后版图数据" if dropped_board_data else "未获得拆线后版图数据，按上下文请求生成"},
+            {"name": "connectivity_scope", "passed": True, "detail": "仅对 selectedNets 生成局部重布请求，不触碰其他网络"},
+        ],
+    }
+    if not dropped_board_data:
+        check_report["passed"] = False
+
+    payload = _generate_reroute_with_model(
+        nets=nets,
+        dropped_board_data=dropped_board_data,
+        dropped_board_path=str(dropped_board_path or ""),
+        dropped_objects=dropped_objects,
+        local_context=local_context,
+        constraints=constraints,
+        check_report=check_report,
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+registry.register(
+    name="reroute",
+    toolset="pcb",
+    schema={
+        "name": "reroute",
+        "description": (
+            "基于 drop_net 的拆线后上下文生成局部拆线重布结果包。"
+            "用于局部重布流程，不调用全局 BGA fanout router。"
+            "如存在拆线后版图文本，会复用 PCB 分块模块构造长上下文并调用配置的 LLM 生成结果；失败时回退到结构化结果包。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "userData": {
+                    "type": "string",
+                    "description": (
+                        "可选 JSON 字符串，可包含 selectedNets、droppedBoardData、droppedObjects、"
+                        "droppedBoardDataFilePath、localContext、constraints；为空时使用 drop_net 缓存。"
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kwargs: reroute(
+        args.get("userData", ""),
+        session_id=kwargs.get("session_id"),
+    ),
+    check_fn=lambda: True,
+)
+
+
+logger.info("PCB tools registered: getProjectData, GetSelectedElements, route, drop_net, reroute")

@@ -17,12 +17,14 @@ def _restore_transport_state():
     prev_session = transport.current_session_id
     prev_modes = dict(transport._session_modes)
     prev_cache = dict(transport._cached_project_data)
+    prev_reroute_cache = dict(transport._cached_reroute_context)
     prev_adapter = transport._websocket_adapter
     prev_loop = transport._main_loop
     yield
     transport.current_session_id = prev_session
     transport._session_modes = prev_modes
     transport._cached_project_data = prev_cache
+    transport._cached_reroute_context = prev_reroute_cache
     transport._websocket_adapter = prev_adapter
     transport._main_loop = prev_loop
 
@@ -216,3 +218,145 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
     assert payload == {"routingResult": "(routes (fpga1))", "report": "布线成功"}
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "FPGA1")))'
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nFPGA1"
+
+
+def test_extract_reroute_nets_from_user_text():
+    assert pcb_tools.extract_reroute_nets("请把 BGA U2 的 net13、net17 拆线后重新布线") == ["net13", "net17"]
+    assert pcb_tools.extract_reroute_nets("reroute NET_A1 and net_A1, then net/B2") == ["NET_A1", "net/B2"]
+    assert pcb_tools.extract_reroute_nets("这里只解释概念，不指定网络") == []
+
+
+def test_drop_net_blocked_in_chat_mode():
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-chat-drop"
+    transport.set_session_mode("sess-chat-drop", "chat")
+
+    result = pcb_tools.drop_net("请把 net13 拆线后重布", projectID="proj1")
+    payload = json.loads(result)
+
+    assert payload["selectedNets"] == []
+    assert "被拒绝" in payload["error"]
+
+
+def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop"
+    transport.set_session_mode("sess-pcb-drop", "pcb")
+    seen = {}
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        seen["tool_name"] = tool_name
+        seen["arguments"] = arguments
+        seen["timeout"] = timeout
+        seen["session_id"] = session_id
+        return {
+            "droppedBoardData": "(pcb after drop)",
+            "droppedObjects": [{"net": "net13", "id": "w1"}],
+            "localContext": {"bbox": [0, 0, 10, 10]},
+        }
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("请把 BGA U2 的 net13、net17 拆线后重新布线", projectID="proj1")
+    payload = json.loads(result)
+
+    assert seen == {
+        "tool_name": "drop_net_mock",
+        "arguments": {
+            "projectID": "proj1",
+            "nets": ["net13", "net17"],
+            "userText": "请把 BGA U2 的 net13、net17 拆线后重新布线",
+        },
+        "timeout": 60.0,
+        "session_id": "sess-pcb-drop",
+    }
+    assert payload["selectedNets"] == ["net13", "net17"]
+    assert payload["droppedBoardData"] == "(pcb after drop)"
+    assert transport.get_cached_reroute_context("sess-pcb-drop")["selectedNets"] == ["net13", "net17"]
+
+
+def test_drop_net_reads_returned_board_file_path(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-file"
+    transport.set_session_mode("sess-pcb-drop-file", "pcb")
+    board_path = tmp_path / "after_drop.s_expr"
+    board_path.write_text("(pcb after drop from file)", encoding="utf-8")
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        return {
+            "droppedBoardDataFilePath": str(board_path),
+            "droppedObjects": [{"net": "net13", "id": "w-file"}],
+        }
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("请把 BGA U2 的 net13 拆线后重新布线", projectID="proj1")
+    payload = json.loads(result)
+
+    assert payload["droppedBoardData"] == "(pcb after drop from file)"
+    assert payload["droppedBoardDataFilePath"] == str(board_path)
+    cached = transport.get_cached_reroute_context("sess-pcb-drop-file")
+    assert cached["droppedBoardData"] == "(pcb after drop from file)"
+    assert cached["droppedBoardDataFilePath"] == str(board_path)
+
+
+def test_reroute_uses_cached_drop_context(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute"
+    transport.set_session_mode("sess-pcb-reroute", "pcb")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13", "net17"],
+            "droppedBoardData": "(pcb after drop)",
+            "droppedObjects": [{"net": "net13"}],
+            "localContext": {"bbox": [0, 0, 10, 10]},
+        },
+        session_id="sess-pcb-reroute",
+    )
+    monkeypatch.setattr(
+        pcb_tools,
+        "_generate_reroute_with_model",
+        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    )
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["type"] == "local_reroute"
+    assert payload["rerouteResult"]["selectedNets"] == ["net13", "net17"]
+    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
+    assert payload["checkReport"]["passed"] is True
+    assert "局部重布" in payload["explanation"]
+
+
+def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-file"
+    transport.set_session_mode("sess-pcb-reroute-file", "pcb")
+    board_path = tmp_path / "after_drop.s_expr"
+    board_path.write_text("(pcb after drop model input)", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardDataFilePath": str(board_path),
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-file",
+    )
+    seen = {}
+
+    def _fake_generate(**kwargs):
+        seen.update(kwargs)
+        payload = pcb_tools._build_fallback_reroute_payload(**kwargs)
+        payload["rerouteResult"]["source"] = "fake_model"
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-file")
+    payload = json.loads(result)
+
+    assert seen["dropped_board_data"] == "(pcb after drop model input)"
+    assert seen["dropped_board_path"] == str(board_path)
+    assert payload["rerouteResult"]["source"] == "fake_model"

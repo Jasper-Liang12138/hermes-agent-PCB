@@ -4,13 +4,13 @@
   用户消息:   {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"user",  "content":"..."}}
   工具调用:   {"type":"tool-calls",   "body":{"role":"agent", "content":{"id":"...", "name":"...", "arguments":{...}}}}
   工具结果:   {"type":"tool-results", "body":{"role":"tool",  "content":{"id":"...", "result":"..."}}}
-  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult]}}
+  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult/rerouteResult/checkReport/explanation]}}
   错误:       {"sessionId":"...", "projectid":"...", "type":"error",        "body":{"role":"agent", "code":50001, "message":"..."}}
 
 结构化字段传递机制：
   Agent 在文本响应中嵌入特殊标记：
     ##PCB_FIELDS##
-    {"selection": [...], "fanoutParams": {...}, "routingResult": "..."}
+    {"selection": [...], "fanoutParams": {...}, "routingResult": "...", "rerouteResult": {...}}
     ##PCB_FIELDS_END##
   WebSocketAdapter.send() 解析并剥离这些标记，将字段放入 body。
 
@@ -85,6 +85,7 @@ _FLOW_BOOTSTRAP_GET_PROJECT = "bootstrap_get_project"
 _FLOW_WAIT_SELECTION = "wait_selection"
 _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
+_REROUTE_RE = re.compile(r"(拆线|删除.*net|删.*net|重布|重新布|重走|reroute|ripup|rip-up)", re.IGNORECASE)
 
 # 高精度触发：必须同时命中动作词 + PCB 领域词，才进入 PCB 主链路。
 _PCB_ACTION_RE = re.compile(
@@ -92,7 +93,7 @@ _PCB_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _PCB_DOMAIN_RE = re.compile(
-    r"(pcb|板子|版图|bga|fpga|芯片|器件|封装|扇出|逃逸|布线|走线|选中元件|projectdata|getprojectdata|getselectedelements|route|fanout)",
+    r"(pcb|板子|版图|bga|fpga|芯片|器件|封装|扇出|逃逸|布线|走线|线网|网络|net|选中元件|projectdata|getprojectdata|getselectedelements|route|fanout)",
     re.IGNORECASE,
 )
 _SELECTION_RE = re.compile(r"(选择\s*U?\d+|选\s*U?\d+|^U\d+$)", re.IGNORECASE)
@@ -634,7 +635,13 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         turn_options = dict(turn_options)
         turn_options["route_mode"] = decision.mode
-        auto_skill = "hardware/pcb-intelligence" if decision.mode == _ROUTE_MODE_PCB else None
+        auto_skill = None
+        if decision.mode == _ROUTE_MODE_PCB:
+            auto_skill = (
+                "hardware/pcb-reroute"
+                if decision.intent == _INTENT_PCB_REROUTE_SELECTED
+                else "hardware/pcb-intelligence"
+            )
         if decision.mode == _ROUTE_MODE_PCB:
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         else:
@@ -879,7 +886,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         处理：
         1. 提取 ##THINKING## 块 → thinking 字段
-        2. 提取 ##PCB_FIELDS## 块 → selection/fanoutParams/routingResult 字段
+        2. 提取 ##PCB_FIELDS## 块 → selection/fanoutParams/routingResult/rerouteResult 字段
         3. 剩余文本 → content 字段
         """
         ws_info = self._connections.get(chat_id)
@@ -924,7 +931,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             body["thinking"] = thinking
 
         # 注入 PCB 结构化字段
-        for key in ("selection", "fanoutParams", "routingResult"):
+        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "checkReport", "explanation"):
             if key in pcb_fields:
                 body[key] = pcb_fields[key]
 
@@ -1011,7 +1018,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if thinking:
             body["thinking"] = thinking
 
-        for key in ("selection", "fanoutParams", "routingResult"):
+        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "checkReport", "explanation"):
             if key in emitted_fields:
                 body[key] = emitted_fields[key]
 
@@ -1400,6 +1407,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "判断原则：\n"
             "- 概念咨询、原理解释、区别比较且没有执行要求，判 chat。\n"
             "- 明确要求开始 PCB/BGA/逃逸/扇出/布线/获取版图/识别 BGA，判 pcb_entry。\n"
+            "- 明确要求对文本中指定 net 做拆线重布、删除后重走、reroute，判 pcb_reroute_selected。\n"
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
             "- 如果用户既要求解释又要求执行，以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
@@ -1420,6 +1428,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 不要布线，只解释一下逃逸布线原理 => chat, route_mode=chat\n"
             "- 选择 FPGA1（wait_selection）=> pcb_select_target, route_mode=pcb\n"
             "- 确认，开始布线（wait_confirm）=> pcb_confirm_route, route_mode=pcb\n"
+            "- 请把 BGA U2 的 net13、net17 拆线后重新布线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
             f"user_text=<user_text>{user_text}</user_text>"
         )
         return [
@@ -1494,9 +1503,14 @@ class WebSocketAdapter(BasePlatformAdapter):
             if (
                 route_intent.intent == _INTENT_CHAT
                 and route_intent.confidence >= 0.70
-                and not self._is_strong_pcb_intent(text)
             ):
-                return _INTENT_CHAT
+                if _REROUTE_RE.search(text) and _PCB_DOMAIN_RE.search(text):
+                    return _INTENT_CHAT
+                if not self._is_strong_pcb_intent(text):
+                    return _INTENT_CHAT
+            if route_intent.intent == _INTENT_PCB_REROUTE_SELECTED:
+                if route_intent.confidence >= 0.70:
+                    return _INTENT_PCB_REROUTE_SELECTED
             if route_intent.intent == _INTENT_PCB_ENTRY:
                 if route_intent.confidence >= 0.70 or self._is_strong_pcb_intent(text):
                     return _INTENT_PCB_ENTRY
@@ -1509,6 +1523,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             } and in_pcb_context:
                 return _INTENT_PCB_FOLLOWUP
 
+        if _REROUTE_RE.search(text) and _PCB_DOMAIN_RE.search(text):
+            return _INTENT_PCB_REROUTE_SELECTED
         if self._is_strong_pcb_intent(text):
             return _INTENT_PCB_ENTRY
         if _CHAT_ONLY_RE.search(text):
@@ -1635,6 +1651,14 @@ class WebSocketAdapter(BasePlatformAdapter):
                 bootstrap_get_project=should_bootstrap,
             )
 
+        if validated_intent == _INTENT_PCB_REROUTE_SELECTED:
+            return _RouteDecision(
+                mode=_ROUTE_MODE_PCB,
+                reason="pcb_reroute_selected",
+                intent=_INTENT_PCB_REROUTE_SELECTED,
+                bootstrap_get_project=False,
+            )
+
         if validated_intent == _INTENT_PCB_FOLLOWUP and mode == _ROUTE_MODE_PCB and self._is_mode_locked(session_id):
             return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="pcb_mode_locked", intent=_INTENT_PCB_FOLLOWUP)
 
@@ -1647,7 +1671,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not pcb_fields:
             return
 
-        if "routingResult" in pcb_fields:
+        if "routingResult" in pcb_fields or "rerouteResult" in pcb_fields:
             self._reset_flow(session_id)
             self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
             return

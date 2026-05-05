@@ -1,0 +1,23 @@
+(pcb_data
+  (version 1)
+  (project "mock-reroute-project")
+  (layers
+    (layer (name "SIG01") (type "signal"))
+    (layer (name "SIG02") (type "signal"))
+    (layer (name "GND03") (type "plane"))
+    (layer (name "SIG04") (type "signal")))
+  (component "U2"
+    (part "BGA-16")
+    (footprint "BGA-16")
+    (pin "A1" (net "net13") (x 1000) (y 1000))
+    (pin "A2" (net "net17") (x 1100) (y 1000))
+    (pin "B1" (net "GND") (x 1000) (y 1100))
+    (pin "B2" (net "VCC") (x 1100) (y 1100)))
+  (net (name "net13") (pins "U2-A1" "R1-1"))
+  (net (name "net17") (pins "U2-A2" "R2-1"))
+  (net (name "GND") (pins "U2-B1"))
+  (net (name "VCC") (pins "U2-B2"))
+  (wire (id "w-net13-1") (net "net13") (layer "SIG01") (start 1000 1000) (end 1400 1000) (width 4))
+  (wire (id "w-net17-1") (net "net17") (layer "SIG01") (start 1100 1000) (end 1500 1000) (width 4))
+  (via (id "v-net13-1") (net "net13") (at 1400 1000) (drill 8))
+  (via (id "v-net17-1") (net "net17") (at 1500 1000) (drill 8)))
