@@ -68,6 +68,7 @@ result
 
 # Local runtime/test scratch files
 .tmp-hermes-agent-home/
+**/.hermes_reroute/
 *.log
 *.err.log
 *.out.log
@@ -88,4 +89,3 @@ source-*.txt
 *_stdout.log
 *-stderr.log
 *-stdout.log
-

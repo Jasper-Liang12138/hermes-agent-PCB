@@ -9,6 +9,7 @@ import pytest
 
 from model_tools import handle_function_call
 from tools import pcb_tools
+from tools import pcb_reroute_drc
 
 
 @pytest.fixture(autouse=True)
@@ -279,7 +280,7 @@ def test_drop_net_reads_returned_board_file_path(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-file"
     transport.set_session_mode("sess-pcb-drop-file", "pcb")
-    board_path = tmp_path / "after_drop.s_expr"
+    board_path = tmp_path / "after_drop.kicad_pcb"
     board_path.write_text("(pcb after drop from file)", encoding="utf-8")
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
@@ -333,7 +334,7 @@ def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, t
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-reroute-file"
     transport.set_session_mode("sess-pcb-reroute-file", "pcb")
-    board_path = tmp_path / "after_drop.s_expr"
+    board_path = tmp_path / "after_drop.kicad_pcb"
     board_path.write_text("(pcb after drop model input)", encoding="utf-8")
     transport.cache_reroute_context(
         {
@@ -360,3 +361,164 @@ def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, t
     assert seen["dropped_board_data"] == "(pcb after drop model input)"
     assert seen["dropped_board_path"] == str(board_path)
     assert payload["rerouteResult"]["source"] == "fake_model"
+
+
+def test_reroute_drc_pass_returns_routed_board_path(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-pass"
+    transport.set_session_mode("sess-pcb-reroute-drc-pass", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    dropped_path = tmp_path / "after_drop.kicad_pcb"
+    dropped_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardDataFilePath": str(dropped_path),
+            "originalBoardDataFilePath": str(original_path),
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-drc-pass",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"drc_feedback", "drc_iteration_history"}
+            }
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-drc-pass")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(tmp_path / "routed.kicad_pcb")
+    assert payload["rerouteResult"]["originalBoardDataFilePath"] == str(original_path)
+    assert payload["checkReport"]["passed"] is True
+
+
+def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-retry"
+    transport.set_session_mode("sess-pcb-reroute-drc-retry", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-drc-retry",
+    )
+    generate_feedback: list[list[str]] = []
+    generate_history: list[list[dict]] = []
+
+    def _fake_generate(**kwargs):
+        generate_feedback.append(list(kwargs.get("drc_feedback") or []))
+        generate_history.append(list(kwargs.get("drc_iteration_history") or []))
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"drc_feedback", "drc_iteration_history"}
+            }
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        if kwargs["iteration"] == 1:
+            return pcb_reroute_drc.RerouteDrcAttempt(
+                iteration=1,
+                passed=False,
+                failure_summary="hard_rule_counts={\"HR_DRC_SEGMENT_CROSSING\":1}",
+            )
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=2,
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed_iter2.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(
+        json.dumps({"maxDrcIterations": 3}, ensure_ascii=False),
+        session_id="sess-pcb-reroute-drc-retry",
+    )
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert payload["rerouteResult"]["drcIterations"] == 2
+    assert generate_feedback[0] == []
+    assert generate_feedback[1] == ['hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}']
+    assert generate_history[0] == []
+    assert generate_history[1][0]["iteration"] == 1
+    assert generate_history[1][0]["kicadPatch"].startswith("(segment")
+    assert generate_history[1][0]["failureSummary"] == 'hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}'
+
+
+def test_reroute_drc_failure_returns_original_board_path(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-fail"
+    transport.set_session_mode("sess-pcb-reroute-drc-fail", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-drc-fail",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"drc_feedback", "drc_iteration_history"}
+            }
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=False,
+            failure_summary=f"iteration {kwargs['iteration']} failed",
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(
+        json.dumps({"maxDrcIterations": 2}, ensure_ascii=False),
+        session_id="sess-pcb-reroute-drc-fail",
+    )
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is False
+    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(original_path)
+    assert payload["rerouteResult"]["drcFailureReasons"] == ["iteration 1 failed", "iteration 2 failed"]
+    assert payload["checkReport"]["passed"] is False

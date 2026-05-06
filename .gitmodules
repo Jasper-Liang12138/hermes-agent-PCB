@@ -1,3 +1,6 @@
 [submodule "tinker-atropos"]
 	path = tinker-atropos
 	url = https://github.com/nousresearch/tinker-atropos
+[submodule "vendor/AI-PCB-Eval"]
+	path = vendor/AI-PCB-Eval
+	url = git@github.com:Mrsun0/AI-PCB-Eval.git

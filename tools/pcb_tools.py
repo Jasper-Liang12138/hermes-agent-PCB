@@ -21,6 +21,7 @@ import shlex
 import uuid
 import logging
 import re
+import tempfile
 from concurrent.futures import Future as ThreadFuture
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -661,6 +662,46 @@ def _resolve_dropped_board_data(drop_result: Dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_board_file_path_from_text(text: str) -> str:
+    """Best-effort extraction of a KiCad board path mentioned by the user."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    match = re.search(r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)", text)
+    return match.group(1) if match else ""
+
+
+def _nested_text_value(data: Dict[str, Any], *keys: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _resolve_original_board_file_path(drop_result: Dict[str, Any], user_text: str, dropped_board_path: str) -> str:
+    """Resolve the pre-rip-up board path without modifying the user's file."""
+    local_context = drop_result.get("localContext") if isinstance(drop_result, dict) else {}
+    direct = _nested_text_value(
+        drop_result,
+        "originalBoardDataFilePath",
+        "originalBoardFilePath",
+        "sourceBoardDataFilePath",
+        "sourceBoardFilePath",
+        "inputBoardDataFilePath",
+    )
+    nested = _nested_text_value(
+        local_context if isinstance(local_context, dict) else {},
+        "originalBoardDataFilePath",
+        "originalBoardFilePath",
+        "sourceBoardDataFilePath",
+        "sourceBoardFilePath",
+        "boardDataFilePath",
+    )
+    return direct or nested or _extract_board_file_path_from_text(user_text) or dropped_board_path
+
+
 def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = None) -> str:
     """
     从用户文本提取需要删除的 net，并通过 WebSocket 请求 EDA 执行 MOCK 拆线。
@@ -693,11 +734,13 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
         )
         drop_result = _json_object(result)
         dropped_board_data, dropped_board_path = _resolve_dropped_board_data(drop_result)
+        original_board_path = _resolve_original_board_file_path(drop_result, userText, dropped_board_path)
         payload = {
             "selectedNets": nets,
             "dropResult": drop_result,
             "droppedBoardData": dropped_board_data,
             "droppedBoardDataFilePath": dropped_board_path,
+            "originalBoardDataFilePath": original_board_path,
             "droppedObjects": drop_result.get("droppedObjects") or drop_result.get("removedObjects") or [],
             "localContext": drop_result.get("localContext") or {},
         }
@@ -752,6 +795,7 @@ def _build_fallback_reroute_payload(
     constraints: Any,
     check_report: Dict[str, Any],
     explanation_suffix: str = "",
+    original_board_path: str = "",
 ) -> Dict[str, Any]:
     reroute_result = {
         "type": "local_reroute",
@@ -769,6 +813,7 @@ def _build_fallback_reroute_payload(
         "constraints": constraints,
         "droppedObjects": dropped_objects,
         "localContext": local_context,
+        "originalBoardDataFilePath": original_board_path,
         "droppedBoardDataFilePath": dropped_board_path,
         "droppedBoardDataChars": len(dropped_board_data or ""),
     }
@@ -802,7 +847,91 @@ def _normalize_reroute_model_payload(
         result["checkReport"] = model_payload["checkReport"]
     if isinstance(model_payload.get("explanation"), str) and model_payload["explanation"].strip():
         result["explanation"] = model_payload["explanation"].strip()
+    if isinstance(model_payload.get("kicadPatch"), str) and model_payload["kicadPatch"].strip():
+        result["kicadPatch"] = model_payload["kicadPatch"].strip()
+    if isinstance(model_payload.get("kicad_patch"), str) and model_payload["kicad_patch"].strip():
+        result["kicadPatch"] = model_payload["kicad_patch"].strip()
+    if isinstance(model_payload.get("rawModelOutput"), str) and model_payload["rawModelOutput"].strip():
+        result["rawModelOutput"] = model_payload["rawModelOutput"].strip()
     return result
+
+
+def _build_reroute_generation_prompts(
+    *,
+    nets: list[str],
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    original_board_path: str,
+    context_text: str,
+    context_stats: Dict[str, Any],
+    drc_feedback: list[str] | None = None,
+    drc_iteration_history: list[Dict[str, Any]] | None = None,
+) -> Dict[str, str]:
+    """Build the real reroute model prompts, including DRC feedback."""
+    system_prompt = (
+        "你是一名 PCB 局部拆线重布助手。只输出 JSON，不要输出 Markdown、解释性段落或代码块。\n"
+        "目标：基于拆线后的版图分块上下文、待重布 net、被拆对象和局部上下文，生成局部重布结果包。\n"
+        "必须同时生成 kicadPatch 字符串，内容只包含可回填到 .kicad_pcb 的 (segment ...) 和 (via ...) 对象。\n"
+        "如果上一轮 DRC 失败，请根据失败原因调整 kicadPatch 后再次尝试。"
+    )
+    feedback_text = "\n".join(f"- {item}" for item in (drc_feedback or []) if item)
+    history_text = _format_drc_iteration_history_for_prompt(drc_iteration_history or [])
+    user_prompt = (
+        "请生成如下 JSON 结构：\n"
+        "{\n"
+        '  "rerouteResult": {"type": "local_reroute", "mode": "selected_nets_after_drop", "selectedNets": [], "operations": []},\n'
+        '  "kicadPatch": "(segment ... )\\n(via ...)",\n'
+        '  "checkReport": {"passed": true, "checks": []},\n'
+        '  "explanation": "简短中文说明"\n'
+        "}\n\n"
+        f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
+        f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
+        f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
+        f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
+        f"originalBoardDataFilePath: {original_board_path or ''}\n\n"
+        f"droppedBoardDataFilePath: {dropped_board_path or ''}\n\n"
+        f"chunkStats:\n{json.dumps(context_stats, ensure_ascii=False, indent=2)}\n\n"
+        f"历史迭代布线产出与 DRC 结果（如有）:\n{history_text}\n\n"
+        f"上一轮 DRC 失败反馈（如有）:\n{feedback_text or '无'}\n\n"
+        f"拆线后版图分块上下文:\n{context_text}\n"
+    )
+    return {"system": system_prompt, "user": user_prompt}
+
+
+def _format_drc_iteration_history_for_prompt(history: list[Dict[str, Any]]) -> str:
+    if not history:
+        return "无"
+    blocks: list[str] = []
+    for item in history:
+        iteration = item.get("iteration")
+        patch = str(item.get("kicadPatch") or "").strip()
+        summary = str(item.get("failureSummary") or "").strip()
+        drc_result = item.get("drcResult") if isinstance(item.get("drcResult"), dict) else {}
+        details = drc_result.get("details") if isinstance(drc_result, dict) else {}
+        issues = ((drc_result.get("artifacts") or {}).get("issues") or []) if isinstance(drc_result, dict) else []
+        compact = {
+            "passed": item.get("passed"),
+            "filledBoardDataFilePath": item.get("filledBoardDataFilePath") or "",
+            "details": details or {},
+            "issues": issues[:5],
+        }
+        blocks.append(
+            "\n".join(
+                [
+                    f"### Iteration {iteration}",
+                    "kicadPatch:",
+                    "```kicad_pcb",
+                    patch or "(empty)",
+                    "```",
+                    f"failureSummary: {summary or '无'}",
+                    "drcResultSummary:",
+                    json.dumps(compact, ensure_ascii=False, indent=2),
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
 
 
 def _generate_reroute_with_model(
@@ -814,6 +943,9 @@ def _generate_reroute_with_model(
     local_context: Any,
     constraints: Any,
     check_report: Dict[str, Any],
+    original_board_path: str = "",
+    drc_feedback: list[str] | None = None,
+    drc_iteration_history: list[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Use the PCB chunking service and configured LLM to generate reroute output."""
     fallback_payload = _build_fallback_reroute_payload(
@@ -824,6 +956,7 @@ def _generate_reroute_with_model(
         local_context=local_context,
         constraints=constraints,
         check_report=check_report,
+        original_board_path=original_board_path,
     )
     if not dropped_board_data:
         return fallback_payload
@@ -842,16 +975,31 @@ def _generate_reroute_with_model(
         context_result = chunking._build_board_context(dropped_board_data, token_counter=token_counter)
         context_text = context_result["contextText"]
         context_stats = context_result.get("stats") or {}
+        prompts = _build_reroute_generation_prompts(
+            nets=nets,
+            dropped_board_path=dropped_board_path,
+            dropped_objects=dropped_objects,
+            local_context=local_context,
+            constraints=constraints,
+            original_board_path=original_board_path,
+            context_text=context_text,
+            context_stats=context_stats,
+            drc_feedback=drc_feedback,
+            drc_iteration_history=drc_iteration_history,
+        )
 
         system_prompt = (
             "你是一名 PCB 局部拆线重布助手。只输出 JSON，不要输出 Markdown、解释性段落或代码块。\n"
             "目标：基于拆线后的版图分块上下文、待重布 net、被拆对象和局部上下文，生成局部重布结果包。\n"
-            "不要编造不可确认的几何细节；如果无法给出真实线段，输出可执行意图级 operations。"
+            "必须同时生成 kicadPatch 字符串，内容只包含可回填到 .kicad_pcb 的 (segment ...) 和 (via ...) 对象。\n"
+            "如果上一轮 DRC 失败，请根据失败原因调整 kicadPatch 后再次尝试。"
         )
+        feedback_text = "\n".join(f"- {item}" for item in (drc_feedback or []) if item)
         user_prompt = (
             "请生成如下 JSON 结构：\n"
             "{\n"
             '  "rerouteResult": {"type": "local_reroute", "mode": "selected_nets_after_drop", "selectedNets": [], "operations": []},\n'
+            '  "kicadPatch": "(segment ... )\\n(via ...)",\n'
             '  "checkReport": {"passed": true, "checks": []},\n'
             '  "explanation": "简短中文说明"\n'
             "}\n\n"
@@ -859,14 +1007,17 @@ def _generate_reroute_with_model(
             f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
             f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
             f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
+            f"originalBoardDataFilePath: {original_board_path or ''}\n\n"
             f"droppedBoardDataFilePath: {dropped_board_path or ''}\n\n"
             f"chunkStats:\n{json.dumps(context_stats, ensure_ascii=False, indent=2)}\n\n"
+            f"上一轮 DRC 失败反馈（如有）:\n{feedback_text or '无'}\n\n"
             f"拆线后版图分块上下文:\n{context_text}\n"
         )
-        prompt_bundle = chunking._PromptBundle(system=system_prompt, user=user_prompt)
+        prompt_bundle = chunking._PromptBundle(system=prompts["system"], user=prompts["user"])
         generation_config = chunking._GenerationConfig(max_new_tokens=1600, temperature=0.1)
         raw_text, _model_meta = adapter.generate(prompt_bundle, generation_config)
         model_payload = chunking._extract_first_json_object(raw_text)
+        model_payload.setdefault("rawModelOutput", raw_text)
         return _normalize_reroute_model_payload(
             model_payload,
             fallback_payload=fallback_payload,
@@ -882,8 +1033,161 @@ def _generate_reroute_with_model(
             local_context=local_context,
             constraints=constraints,
             check_report=check_report,
+            original_board_path=original_board_path,
             explanation_suffix=f"（模型重布生成不可用，已回退到结构化结果包：{exc}）",
         )
+
+
+def _get_max_drc_iterations(user_data_obj: Dict[str, Any]) -> int:
+    raw = (
+        user_data_obj.get("maxDrcIterations")
+        or user_data_obj.get("max_drc_iterations")
+        or os.getenv("PCB_REROUTE_MAX_DRC_ITERATIONS")
+        or 5
+    )
+    try:
+        return max(0, min(20, int(raw)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _resolve_reroute_output_dir(user_data_obj: Dict[str, Any], original_board_path: str, session_id: str) -> str:
+    explicit = user_data_obj.get("routedBoardOutputDir") or user_data_obj.get("outputDir")
+    if explicit:
+        return str(Path(str(explicit)).expanduser())
+    if original_board_path:
+        return str(Path(original_board_path).expanduser().parent / ".hermes_reroute")
+    return str(Path(tempfile.gettempdir()) / "hermes_pcb_reroute" / (session_id or "session"))
+
+
+def _model_patch_text(payload: Dict[str, Any]) -> str:
+    for key in ("kicadPatch", "kicad_patch", "patchText"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _apply_drc_validation_to_payload(
+    payload: Dict[str, Any],
+    *,
+    validation: Any,
+    original_board_path: str,
+) -> Dict[str, Any]:
+    result = dict(payload)
+    reroute_result = dict(result.get("rerouteResult") or {})
+    attempts = [
+        {
+            "iteration": attempt.iteration,
+            "passed": attempt.passed,
+            "filledBoardDataFilePath": attempt.filled_board_data_file_path,
+            "fillDetail": attempt.fill_detail,
+            "drcResult": attempt.drc_result,
+            "failureSummary": attempt.failure_summary,
+        }
+        for attempt in validation.attempts
+    ]
+    reroute_result["drcPassed"] = validation.passed
+    reroute_result["drcIterations"] = len(validation.attempts)
+    reroute_result["drcAttempts"] = attempts
+    reroute_result["originalBoardDataFilePath"] = original_board_path
+    if validation.passed:
+        reroute_result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
+        result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
+    else:
+        reroute_result["routedBoardDataFilePath"] = original_board_path
+        result["routedBoardDataFilePath"] = original_board_path
+        reroute_result["drcFailureReasons"] = [
+            attempt.failure_summary for attempt in validation.attempts if attempt.failure_summary
+        ]
+    result["rerouteResult"] = reroute_result
+
+    check_report = dict(result.get("checkReport") or {})
+    checks = list(check_report.get("checks") or [])
+    checks.append(
+        {
+            "name": "drc_validation",
+            "passed": validation.passed,
+            "detail": "DRC passed" if validation.passed else validation.last_failure_summary,
+        }
+    )
+    check_report["checks"] = checks
+    check_report["passed"] = bool(check_report.get("passed", True)) and validation.passed
+    result["checkReport"] = check_report
+    if not validation.passed:
+        result["explanation"] = (
+            f"{result.get('explanation', '')} DRC 未通过，已返回原始版图文件地址：{original_board_path}。"
+            f"最后失败原因：{validation.last_failure_summary}"
+        ).strip()
+    return result
+
+
+def _run_reroute_drc_iterations(
+    *,
+    base_payload: Dict[str, Any],
+    original_board_data: str,
+    original_board_path: str,
+    output_dir: str,
+    sample_id: str,
+    max_iterations: int,
+    regenerate,
+) -> Dict[str, Any]:
+    from tools.pcb_reroute_drc import RerouteDrcValidation, validate_kicad_patch_with_drc
+
+    attempts = []
+    feedback: list[str] = []
+    iteration_history: list[Dict[str, Any]] = []
+    payload = base_payload
+    for iteration in range(1, max_iterations + 1):
+        if iteration > 1:
+            payload = regenerate(feedback, iteration_history)
+        patch_text = _model_patch_text(payload)
+        if not patch_text:
+            attempt = validate_kicad_patch_with_drc(
+                original_board_data=original_board_data,
+                model_output_text="",
+                output_dir=output_dir,
+                sample_id=sample_id,
+                iteration=iteration,
+            )
+        else:
+            attempt = validate_kicad_patch_with_drc(
+                original_board_data=original_board_data,
+                model_output_text=patch_text,
+                output_dir=output_dir,
+                sample_id=sample_id,
+                iteration=iteration,
+            )
+        attempts.append(attempt)
+        if attempt.passed:
+            validation = RerouteDrcValidation(
+                passed=True,
+                routed_board_data_file_path=attempt.filled_board_data_file_path,
+                original_board_data_file_path=original_board_path,
+                attempts=attempts,
+            )
+            return _apply_drc_validation_to_payload(payload, validation=validation, original_board_path=original_board_path)
+        feedback.append(attempt.failure_summary)
+        iteration_history.append(
+            {
+                "iteration": iteration,
+                "passed": False,
+                "kicadPatch": patch_text,
+                "filledBoardDataFilePath": attempt.filled_board_data_file_path,
+                "fillDetail": attempt.fill_detail,
+                "drcResult": attempt.drc_result,
+                "failureSummary": attempt.failure_summary,
+            }
+        )
+
+    validation = RerouteDrcValidation(
+        passed=False,
+        routed_board_data_file_path=original_board_path,
+        original_board_data_file_path=original_board_path,
+        attempts=attempts,
+        last_failure_summary=feedback[-1] if feedback else "DRC validation did not run.",
+    )
+    return _apply_drc_validation_to_payload(payload, validation=validation, original_board_path=original_board_path)
 
 
 def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
@@ -942,9 +1246,22 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
     )
     if not dropped_board_data and dropped_board_path:
         dropped_board_data, dropped_board_path = _read_board_file(str(dropped_board_path))
+    original_board_path = (
+        user_data_obj.get("originalBoardDataFilePath")
+        or cached.get("originalBoardDataFilePath")
+        or _nested_text_value(cached.get("localContext") or {}, "originalBoardDataFilePath", "boardDataFilePath")
+        or str(dropped_board_path or "")
+    )
+    original_board_data = user_data_obj.get("originalBoardData") or cached.get("originalBoardData") or ""
+    if not original_board_data and original_board_path:
+        original_board_data, original_board_path = _read_board_file(str(original_board_path))
+    if not original_board_data:
+        original_board_data = dropped_board_data
     dropped_objects = user_data_obj.get("droppedObjects") or cached.get("droppedObjects") or []
     local_context = user_data_obj.get("localContext") or cached.get("localContext") or {}
     constraints = user_data_obj.get("constraints") or {}
+    max_drc_iterations = _get_max_drc_iterations(user_data_obj)
+    output_dir = _resolve_reroute_output_dir(user_data_obj, str(original_board_path or ""), session_id or "")
 
     check_report = {
         "passed": True,
@@ -965,7 +1282,32 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         local_context=local_context,
         constraints=constraints,
         check_report=check_report,
+        original_board_path=str(original_board_path or ""),
     )
+    if max_drc_iterations > 0 and original_board_data and _model_patch_text(payload):
+        def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
+            return _generate_reroute_with_model(
+                nets=nets,
+                dropped_board_data=dropped_board_data,
+                dropped_board_path=str(dropped_board_path or ""),
+                dropped_objects=dropped_objects,
+                local_context=local_context,
+                constraints=constraints,
+                check_report=check_report,
+                original_board_path=str(original_board_path or ""),
+                drc_feedback=feedback,
+                drc_iteration_history=iteration_history,
+            )
+
+        payload = _run_reroute_drc_iterations(
+            base_payload=payload,
+            original_board_data=original_board_data,
+            original_board_path=str(original_board_path or ""),
+            output_dir=output_dir,
+            sample_id=f"{session_id or 'reroute'}_{'_'.join(nets)}",
+            max_iterations=max_drc_iterations,
+            regenerate=_regenerate,
+        )
     return json.dumps(payload, ensure_ascii=False)
 
 

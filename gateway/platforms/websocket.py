@@ -4,7 +4,7 @@
   用户消息:   {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"user",  "content":"..."}}
   工具调用:   {"type":"tool-calls",   "body":{"role":"agent", "content":{"id":"...", "name":"...", "arguments":{...}}}}
   工具结果:   {"type":"tool-results", "body":{"role":"tool",  "content":{"id":"...", "result":"..."}}}
-  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult/rerouteResult/checkReport/explanation]}}
+  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult/rerouteResult/routedBoardDataFilePath/checkReport/explanation]}}
   错误:       {"sessionId":"...", "projectid":"...", "type":"error",        "body":{"role":"agent", "code":50001, "message":"..."}}
 
 结构化字段传递机制：
@@ -931,7 +931,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             body["thinking"] = thinking
 
         # 注入 PCB 结构化字段
-        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "checkReport", "explanation"):
+        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "routedBoardDataFilePath", "checkReport", "explanation"):
             if key in pcb_fields:
                 body[key] = pcb_fields[key]
 
@@ -1018,7 +1018,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if thinking:
             body["thinking"] = thinking
 
-        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "checkReport", "explanation"):
+        for key in ("selection", "fanoutParams", "routingResult", "rerouteResult", "routedBoardDataFilePath", "checkReport", "explanation"):
             if key in emitted_fields:
                 body[key] = emitted_fields[key]
 
