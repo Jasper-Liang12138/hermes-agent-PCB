@@ -63,6 +63,7 @@ def _fake_generate_factory(log_file: Path):
                 context_stats=context_result.get("stats") or {},
                 drc_feedback=feedback,
                 drc_iteration_history=iteration_history,
+                selected_trace_ids=kwargs.get("selected_trace_ids") or [],
             )
             _append_jsonl(
                 log_file,

@@ -236,69 +236,85 @@ def test_drop_net_blocked_in_chat_mode():
     payload = json.loads(result)
 
     assert payload["selectedNets"] == []
-    assert "被拒绝" in payload["error"]
+    assert "chat" in payload["error"]
 
 
 def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop"
     transport.set_session_mode("sess-pcb-drop", "pcb")
-    seen = {}
+    calls = []
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
-        seen["tool_name"] = tool_name
-        seen["arguments"] = arguments
-        seen["timeout"] = timeout
-        seen["session_id"] = session_id
-        return {
-            "droppedBoardData": "(pcb after drop)",
-            "droppedObjects": [{"net": "net13", "id": "w1"}],
-            "localContext": {"bbox": [0, 0, 10, 10]},
-        }
+        calls.append((tool_name, arguments, timeout, session_id))
+        if tool_name == "getSelectedElements":
+            return {"ids": ["2386476278", "3424247826"]}
+        if tool_name == "deleteTracesById":
+            return "已成功删除"
+        if tool_name == "getProjectData":
+            return "(pcb after delete)"
+        raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
 
-    result = pcb_tools.drop_net("请把 BGA U2 的 net13、net17 拆线后重新布线", projectID="proj1")
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert seen == {
-        "tool_name": "drop_net_mock",
-        "arguments": {
-            "projectID": "proj1",
-            "nets": ["net13", "net17"],
-            "userText": "请把 BGA U2 的 net13、net17 拆线后重新布线",
-        },
-        "timeout": 60.0,
-        "session_id": "sess-pcb-drop",
-    }
-    assert payload["selectedNets"] == ["net13", "net17"]
-    assert payload["droppedBoardData"] == "(pcb after drop)"
-    assert transport.get_cached_reroute_context("sess-pcb-drop")["selectedNets"] == ["net13", "net17"]
+    assert calls == [
+        ("getSelectedElements", {"PFindType": "TRACES"}, 30.0, "sess-pcb-drop"),
+        ("deleteTracesById", {"ids": ["2386476278", "3424247826"]}, 60.0, "sess-pcb-drop"),
+        ("getProjectData", {}, 30.0, "sess-pcb-drop"),
+    ]
+    assert payload["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert payload["droppedBoardData"] == "(pcb after delete)"
+    cached = transport.get_cached_reroute_context("sess-pcb-drop")
+    assert cached["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert cached["localContext"]["source"] == "getSelectedElements/deleteTracesById/getProjectData"
 
 
-def test_drop_net_reads_returned_board_file_path(monkeypatch, tmp_path):
+def test_drop_net_rejects_too_many_selected_traces(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
-    transport.current_session_id = "sess-pcb-drop-file"
-    transport.set_session_mode("sess-pcb-drop-file", "pcb")
-    board_path = tmp_path / "after_drop.kicad_pcb"
-    board_path.write_text("(pcb after drop from file)", encoding="utf-8")
+    transport.current_session_id = "sess-pcb-drop-many"
+    transport.set_session_mode("sess-pcb-drop-many", "pcb")
+    calls = []
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
-        return {
-            "droppedBoardDataFilePath": str(board_path),
-            "droppedObjects": [{"net": "net13", "id": "w-file"}],
-        }
+        calls.append(tool_name)
+        if tool_name == "getSelectedElements":
+            return {"ids": [str(index) for index in range(41)]}
+        raise AssertionError("delete/getProjectData should not be called")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
 
-    result = pcb_tools.drop_net("请把 BGA U2 的 net13 拆线后重新布线", projectID="proj1")
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert payload["droppedBoardData"] == "(pcb after drop from file)"
-    assert payload["droppedBoardDataFilePath"] == str(board_path)
-    cached = transport.get_cached_reroute_context("sess-pcb-drop-file")
-    assert cached["droppedBoardData"] == "(pcb after drop from file)"
-    assert cached["droppedBoardDataFilePath"] == str(board_path)
+    assert calls == ["getSelectedElements"]
+    assert payload["tooManySelectedElements"] is True
+    assert payload["selectionCount"] == 41
+    assert transport.get_cached_reroute_context("sess-pcb-drop-many") is None
+
+
+def test_drop_net_rejects_non_json_selected_trace_string(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-strict"
+    transport.set_session_mode("sess-pcb-drop-strict", "pcb")
+    calls = []
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        calls.append(tool_name)
+        if tool_name == "getSelectedElements":
+            return "['2386476278', '3424247826']"
+        raise AssertionError("strict parsing should reject non-JSON selection strings")
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    payload = json.loads(result)
+
+    assert calls == ["getSelectedElements"]
+    assert payload["selectedTraceIds"] == []
+    assert "No selected traces" in payload["error"]
 
 
 def test_reroute_uses_cached_drop_context(monkeypatch):
@@ -328,6 +344,34 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
     assert payload["checkReport"]["passed"] is True
     assert "局部重布" in payload["explanation"]
+
+
+def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-traces"
+    transport.set_session_mode("sess-pcb-reroute-traces", "pcb")
+    transport.cache_reroute_context(
+        {
+            "selectedTraceIds": ["2386476278", "3424247826"],
+            "droppedBoardData": "(pcb after delete)",
+            "droppedObjects": [{"id": "2386476278", "type": "trace"}],
+            "localContext": {"selectionCount": 2},
+        },
+        session_id="sess-pcb-reroute-traces",
+    )
+    monkeypatch.setattr(
+        pcb_tools,
+        "_generate_reroute_with_model",
+        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    )
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-traces")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["mode"] == "selected_traces_after_delete"
+    assert payload["rerouteResult"]["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_selected_traces"
+    assert payload["checkReport"]["passed"] is True
 
 
 def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):

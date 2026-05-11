@@ -72,31 +72,23 @@ def _tool_result(session_id: str, project_id: str, call_id: str, result: Any) ->
     }
 
 
-def _default_prompt(board_path: str, nets: list[str]) -> str:
-    net_text = "、".join(nets)
-    return f"请帮我重布线 {net_text}，版图数据文件地址为 {board_path}"
+def _default_prompt(board_path: str, selected_trace_ids: list[str]) -> str:
+    trace_text = ", ".join(selected_trace_ids)
+    return f"Please reroute the selected PCB traces ({trace_text}); board file path: {board_path}"
 
 
-def _mock_tool_result(tool_name: str, arguments: dict[str, Any], board_path: str) -> Any:
-    if tool_name == "drop_net_mock":
-        nets = arguments.get("nets") if isinstance(arguments, dict) else None
-        if not isinstance(nets, list):
-            nets = []
-        return {
-            "originalBoardDataFilePath": board_path,
-            "droppedBoardDataFilePath": board_path,
-            "droppedObjects": [
-                {"net": str(net), "mockRemoved": True}
-                for net in nets
-            ],
-            "localContext": {
-                "source": "reroute_mock_client",
-                "boardDataFilePath": board_path,
-                "note": "MOCK 客户端暂时把原始 KiCad 版图文件作为拆线后版图返回",
-            },
-        }
+def _mock_tool_result(tool_name: str, arguments: dict[str, Any], board_path: str, selected_trace_ids: list[str]) -> Any:
+    if tool_name in {"getSelectedElements", "GetSelectedElements"}:
+        if arguments.get("PFindType") != "TRACES":
+            return {"ids": [], "error": f"unexpected PFindType: {arguments.get('PFindType')!r}"}
+        return {"ids": selected_trace_ids}
+    if tool_name == "deleteTracesById":
+        ids = arguments.get("ids") if isinstance(arguments, dict) else None
+        if ids == selected_trace_ids:
+            return "已成功删除"
+        return {"success": False, "message": "delete ids did not match selected trace ids", "ids": ids}
     if tool_name == "getProjectData":
-        return board_path
+        return Path(board_path).read_text(encoding="utf-8")
     if tool_name == "route":
         return {
             "routingResult": "(mock-route-result)",
@@ -123,8 +115,10 @@ async def run_client(
     log_file: Path | None = None,
     expect_drc_iterations: int = 0,
     expect_drc_passed: bool | None = None,
+    selected_trace_ids: list[str] | None = None,
 ) -> int:
     board_path = str(board_file.resolve())
+    selected_trace_ids = selected_trace_ids or ["2386476278", "3424247826"]
     if not board_file.is_file():
         raise FileNotFoundError(f"mock board file not found: {board_file}")
 
@@ -187,7 +181,7 @@ async def run_client(
                         arguments = content.get("arguments") or {}
                         if not isinstance(arguments, dict):
                             arguments = {}
-                        result = _mock_tool_result(tool_name, arguments, board_path)
+                        result = _mock_tool_result(tool_name, arguments, board_path, selected_trace_ids)
                         reply = _tool_result(session_id, project_id, call_id, result)
                         await ws.send_str(_send_json("tool-results", reply, log_file))
                         saw_tool_call = True
@@ -242,7 +236,7 @@ def main() -> None:
     parser.add_argument("--session-id", default=default_session)
     parser.add_argument("--project-id", default="proj-reroute-mock")
     parser.add_argument("--board-file", default=str(default_board))
-    parser.add_argument("--nets", default="net13", help="逗号分隔的 net 列表，例如 net13,net17")
+    parser.add_argument("--selected-trace-ids", default="2386476278,3424247826", help="Comma-separated selected trace ids returned by getSelectedElements")
     parser.add_argument("--prompt", default="", help="覆盖默认首条 prompt")
     parser.add_argument("--timeout", type=float, default=180.0, help="等待最终结果秒数；<=0 表示不超时")
     parser.add_argument("--connect-retries", type=int, default=30)
@@ -253,8 +247,8 @@ def main() -> None:
     args = parser.parse_args()
 
     board_file = Path(args.board_file).expanduser()
-    nets = [item.strip() for item in str(args.nets).split(",") if item.strip()]
-    prompt = args.prompt.strip() or _default_prompt(str(board_file.resolve()), nets)
+    selected_trace_ids = [item.strip() for item in str(args.selected_trace_ids).split(",") if item.strip()]
+    prompt = args.prompt.strip() or _default_prompt(str(board_file.resolve()), selected_trace_ids)
     log_file = Path(args.log_file).expanduser() if args.log_file.strip() else None
     expect_drc_passed = None if args.expect_drc_passed == "any" else args.expect_drc_passed == "true"
 
@@ -273,6 +267,7 @@ def main() -> None:
                 log_file=log_file,
                 expect_drc_iterations=args.expect_drc_iterations,
                 expect_drc_passed=expect_drc_passed,
+                selected_trace_ids=selected_trace_ids,
             )
         )
     )

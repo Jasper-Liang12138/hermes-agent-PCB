@@ -351,10 +351,15 @@ registry.register(
 
 
 # ============================================================================
-# Tool 2: GetSelectedElements
+# Tool 2: getSelectedElements / GetSelectedElements
 # ============================================================================
 
-def get_selected_elements(projectID: str, session_id: Optional[str] = None) -> str:
+def get_selected_elements(
+    projectID: str = "",
+    PFindType: str = "TRACES",
+    session_id: Optional[str] = None,
+    frontend_tool_name: str = "getSelectedElements",
+) -> str:
     """
     获取用户在 PCB 中框选的元素 ID 列表。
 
@@ -369,24 +374,55 @@ def get_selected_elements(projectID: str, session_id: Optional[str] = None) -> s
     """
     session_id = _transport.resolve_session_id(session_id)
     if not _transport.is_pcb_mode(session_id):
-        msg = _session_mode_error("GetSelectedElements", session_id)
+        msg = _session_mode_error(frontend_tool_name, session_id)
         logger.warning(msg)
         return json.dumps({"error": msg}, ensure_ascii=False)
 
     try:
-        logger.info("GetSelectedElements start: projectID=%s", projectID)
+        find_type = str(PFindType or "TRACES").strip() or "TRACES"
+        logger.info("%s start: projectID=%s PFindType=%s", frontend_tool_name, projectID, find_type)
         result = _transport.call_tool_sync(
-            tool_name="GetSelectedElements",
-            arguments={"projectID": projectID},
+            tool_name=frontend_tool_name,
+            arguments={"PFindType": find_type},
             timeout=30.0,
             session_id=session_id,
         )
         data = result if isinstance(result, str) else json.dumps(result)
-        logger.info("GetSelectedElements success: %d chars", len(data))
+        logger.info("%s success: %d chars", frontend_tool_name, len(data))
         return data
     except Exception as e:
-        logger.error(f"GetSelectedElements failed: {e}")
+        logger.error("%s failed: %s", frontend_tool_name, e)
         return json.dumps({"error": str(e)})
+
+
+registry.register(
+    name="getSelectedElements",
+    toolset="pcb",
+    schema={
+        "name": "getSelectedElements",
+        "description": (
+            "Get user-selected PCB element ids from the frontend. "
+            "For local rip-up/reroute this must be called with PFindType='TRACES'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "PFindType": {
+                    "type": "string",
+                    "description": "Selected object type. Local reroute uses TRACES.",
+                    "default": "TRACES",
+                }
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kwargs: get_selected_elements(
+        PFindType=args.get("PFindType", "TRACES"),
+        session_id=kwargs.get("session_id"),
+        frontend_tool_name="getSelectedElements",
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
 
 
 registry.register(
@@ -411,6 +447,61 @@ registry.register(
     },
     handler=lambda args, **kwargs: get_selected_elements(
         args.get("projectID", ""),
+        PFindType=args.get("PFindType", "TRACES"),
+        session_id=kwargs.get("session_id"),
+        frontend_tool_name="GetSelectedElements",
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
+
+
+def delete_traces_by_id(ids: list[str], session_id: Optional[str] = None) -> str:
+    """Delete selected trace ids through the PCB frontend."""
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("deleteTracesById", session_id)
+        logger.warning(msg)
+        return json.dumps({"error": msg}, ensure_ascii=False)
+
+    normalized_ids = [str(item).strip() for item in (ids or []) if str(item).strip()]
+    if not normalized_ids:
+        return json.dumps({"error": "No trace ids were provided.", "ids": []}, ensure_ascii=False)
+
+    try:
+        logger.info("deleteTracesById start: session=%s count=%d", session_id, len(normalized_ids))
+        result = _transport.call_tool_sync(
+            tool_name="deleteTracesById",
+            arguments={"ids": normalized_ids},
+            timeout=60.0,
+            session_id=session_id,
+        )
+        payload = {"ids": normalized_ids, "result": result}
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as e:
+        logger.error("deleteTracesById failed: %s", e)
+        return json.dumps({"ids": normalized_ids, "error": str(e)}, ensure_ascii=False)
+
+
+registry.register(
+    name="deleteTracesById",
+    toolset="pcb",
+    schema={
+        "name": "deleteTracesById",
+        "description": "Delete PCB traces by selected trace ids.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Trace ids returned by getSelectedElements.",
+                }
+            },
+            "required": ["ids"],
+        },
+    },
+    handler=lambda args, **kwargs: delete_traces_by_id(
+        args.get("ids", []),
         session_id=kwargs.get("session_id"),
     ),
     check_fn=lambda: _transport.get_adapter() is not None,
@@ -615,6 +706,66 @@ def _json_object(value: Any) -> Dict[str, Any]:
     return {"result": value}
 
 
+def _parse_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return []
+    try:
+        return json.loads(text)
+    except Exception:
+        return value
+
+
+def _normalize_id_list(value: Any) -> list[str]:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, dict):
+        for key in ("ids", "selectedIds", "selectedTraceIds", "result"):
+            if key in parsed:
+                return _normalize_id_list(parsed[key])
+        return []
+    if isinstance(parsed, (list, tuple, set)):
+        ids: list[str] = []
+        for item in parsed:
+            if isinstance(item, dict):
+                raw = item.get("id") or item.get("ID") or item.get("uid")
+            else:
+                raw = item
+            text = str(raw or "").strip()
+            if text:
+                ids.append(text)
+        return ids
+    if isinstance(parsed, str):
+        text = parsed.strip()
+        if not text:
+            return []
+        return []
+    return []
+
+
+def _delete_traces_succeeded(value: Any) -> bool:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, dict):
+        if parsed.get("success") is True or parsed.get("ok") is True:
+            return True
+        if parsed.get("success") is False or parsed.get("ok") is False:
+            return False
+        for key in ("result", "message", "status"):
+            if key in parsed and _delete_traces_succeeded(parsed[key]):
+                return True
+        return False
+    text = str(parsed or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "已成功删除" in text
+        or "成功" in text
+        or "success" in text
+        or text in {"ok", "true", "deleted"}
+    )
+
+
 def _first_text_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = payload.get(key)
@@ -704,51 +855,94 @@ def _resolve_original_board_file_path(drop_result: Dict[str, Any], user_text: st
 
 def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = None) -> str:
     """
-    从用户文本提取需要删除的 net，并通过 WebSocket 请求 EDA 执行 MOCK 拆线。
+    Rip up currently selected traces and cache the post-delete board for reroute.
 
-    EDA 侧负责真正删除走线，并返回拆线后的版图数据与被拆对象信息。
+    The historical tool name is kept for skill compatibility. The real frontend
+    flow is getSelectedElements(TRACES) -> deleteTracesById -> getProjectData.
     """
     session_id = _transport.resolve_session_id(session_id)
     if not _transport.is_pcb_mode(session_id):
         msg = _session_mode_error("drop_net", session_id)
         logger.warning(msg)
-        return json.dumps({"selectedNets": [], "error": msg}, ensure_ascii=False)
-
-    nets = extract_reroute_nets(userText)
-    if not nets:
-        return json.dumps(
-            {
-                "selectedNets": [],
-                "error": "未从用户文本中识别到需要拆线的 net，请明确写出如 net13、net17。",
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": msg}, ensure_ascii=False)
 
     try:
-        logger.info("drop_net start: session=%s projectID=%s nets=%s", session_id, projectID, nets)
-        result = _transport.call_tool_sync(
-            tool_name="drop_net_mock",
-            arguments={"projectID": projectID, "nets": nets, "userText": userText},
+        logger.info("drop_net selected-traces flow start: session=%s projectID=%s", session_id, projectID)
+        selected_result = _transport.call_tool_sync(
+            tool_name="getSelectedElements",
+            arguments={"PFindType": "TRACES"},
+            timeout=30.0,
+            session_id=session_id,
+        )
+        selected_trace_ids = _normalize_id_list(selected_result)
+        if not selected_trace_ids:
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": [],
+                    "error": "No selected traces were returned. Please box-select the traces to reroute first.",
+                },
+                ensure_ascii=False,
+            )
+        if len(selected_trace_ids) > 40:
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": selected_trace_ids,
+                    "error": "Selected trace count exceeds 40. Please reduce the box selection and rerun this skill.",
+                    "tooManySelectedElements": True,
+                    "selectionCount": len(selected_trace_ids),
+                },
+                ensure_ascii=False,
+            )
+
+        delete_result = _transport.call_tool_sync(
+            tool_name="deleteTracesById",
+            arguments={"ids": selected_trace_ids},
             timeout=60.0,
             session_id=session_id,
         )
-        drop_result = _json_object(result)
-        dropped_board_data, dropped_board_path = _resolve_dropped_board_data(drop_result)
-        original_board_path = _resolve_original_board_file_path(drop_result, userText, dropped_board_path)
+        if not _delete_traces_succeeded(delete_result):
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": selected_trace_ids,
+                    "deleteResult": delete_result,
+                    "error": "deleteTracesById failed.",
+                },
+                ensure_ascii=False,
+            )
+
+        dropped_board_data = get_project_data(session_id=session_id)
+        dropped_board_path = ""
+        original_board_path = _extract_board_file_path_from_text(userText)
         payload = {
-            "selectedNets": nets,
-            "dropResult": drop_result,
+            "selectedNets": [],
+            "selectedTraceIds": selected_trace_ids,
+            "dropResult": {
+                "selectedResult": selected_result,
+                "deleteResult": delete_result,
+            },
+            "deleteResult": delete_result,
             "droppedBoardData": dropped_board_data,
             "droppedBoardDataFilePath": dropped_board_path,
             "originalBoardDataFilePath": original_board_path,
-            "droppedObjects": drop_result.get("droppedObjects") or drop_result.get("removedObjects") or [],
-            "localContext": drop_result.get("localContext") or {},
+            "droppedObjects": [
+                {"id": trace_id, "type": "trace", "deleted": True}
+                for trace_id in selected_trace_ids
+            ],
+            "localContext": {
+                "source": "getSelectedElements/deleteTracesById/getProjectData",
+                "selectionCount": len(selected_trace_ids),
+                "PFindType": "TRACES",
+                "projectID": projectID,
+            },
         }
         _transport.cache_reroute_context(payload, session_id=session_id)
         return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         logger.error("drop_net failed: %s", e)
-        return json.dumps({"selectedNets": nets, "error": str(e)}, ensure_ascii=False)
+        return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": str(e)}, ensure_ascii=False)
 
 
 registry.register(
@@ -757,16 +951,16 @@ registry.register(
     schema={
         "name": "drop_net",
         "description": (
-            "从用户文本中提取要拆除的 net，并请求 EDA 客户端执行 MOCK 局部拆线。"
-            "不要调用 GetSelectedElements；本工具只依赖用户文本中的 net 名称。"
-            "客户端可返回 droppedBoardData 或 droppedBoardDataFilePath；若返回文件路径，本工具会读取文件内容并缓存。"
+            "Use the frontend selection to rip up traces for local reroute. "
+            "The tool calls getSelectedElements with PFindType=TRACES, rejects selections over 40 ids, "
+            "calls deleteTracesById, then refreshes the post-delete board through getProjectData."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "userText": {
                     "type": "string",
-                    "description": "用户原始拆线重布请求，例如：请帮我把 BGA U2 的 net13、net17 拆线后重新布线",
+                    "description": "Original user request. Used only for optional context/path extraction; trace ids come from frontend selection.",
                 },
                 "projectID": {
                     "type": "string",
@@ -796,19 +990,29 @@ def _build_fallback_reroute_payload(
     check_report: Dict[str, Any],
     explanation_suffix: str = "",
     original_board_path: str = "",
+    selected_trace_ids: list[str] | None = None,
 ) -> Dict[str, Any]:
+    selected_trace_ids = selected_trace_ids or []
     reroute_result = {
         "type": "local_reroute",
-        "mode": "selected_nets_after_drop",
+        "mode": "selected_nets_after_drop" if nets else "selected_traces_after_delete",
         "selectedNets": nets,
+        "selectedTraceIds": selected_trace_ids,
         "operations": [
             {
-                "action": "reroute_net",
+                "action": "reroute_net" if net else "reroute_selected_traces",
                 "net": net,
                 "scope": "local",
                 "preserveOtherNets": True,
             }
             for net in nets
+        ] or [
+            {
+                "action": "reroute_selected_traces",
+                "traceIds": selected_trace_ids,
+                "scope": "local",
+                "preserveOtherNets": True,
+            }
         ],
         "constraints": constraints,
         "droppedObjects": dropped_objects,
@@ -868,6 +1072,7 @@ def _build_reroute_generation_prompts(
     context_stats: Dict[str, Any],
     drc_feedback: list[str] | None = None,
     drc_iteration_history: list[Dict[str, Any]] | None = None,
+    selected_trace_ids: list[str] | None = None,
 ) -> Dict[str, str]:
     """Build the real reroute model prompts, including DRC feedback."""
     system_prompt = (
@@ -878,6 +1083,7 @@ def _build_reroute_generation_prompts(
     )
     feedback_text = "\n".join(f"- {item}" for item in (drc_feedback or []) if item)
     history_text = _format_drc_iteration_history_for_prompt(drc_iteration_history or [])
+    selected_trace_ids = selected_trace_ids or []
     user_prompt = (
         "请生成如下 JSON 结构：\n"
         "{\n"
@@ -887,6 +1093,7 @@ def _build_reroute_generation_prompts(
         '  "explanation": "简短中文说明"\n'
         "}\n\n"
         f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
+        f"selectedTraceIds:\n{json.dumps(selected_trace_ids, ensure_ascii=False, indent=2)}\n\n"
         f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
         f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
         f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
@@ -946,10 +1153,12 @@ def _generate_reroute_with_model(
     original_board_path: str = "",
     drc_feedback: list[str] | None = None,
     drc_iteration_history: list[Dict[str, Any]] | None = None,
+    selected_trace_ids: list[str] | None = None,
 ) -> Dict[str, Any]:
     """Use the PCB chunking service and configured LLM to generate reroute output."""
     fallback_payload = _build_fallback_reroute_payload(
         nets=nets,
+        selected_trace_ids=selected_trace_ids,
         dropped_board_data=dropped_board_data,
         dropped_board_path=dropped_board_path,
         dropped_objects=dropped_objects,
@@ -977,6 +1186,7 @@ def _generate_reroute_with_model(
         context_stats = context_result.get("stats") or {}
         prompts = _build_reroute_generation_prompts(
             nets=nets,
+            selected_trace_ids=selected_trace_ids,
             dropped_board_path=dropped_board_path,
             dropped_objects=dropped_objects,
             local_context=local_context,
@@ -1004,6 +1214,7 @@ def _generate_reroute_with_model(
             '  "explanation": "简短中文说明"\n'
             "}\n\n"
             f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
+            f"selectedTraceIds:\n{json.dumps(selected_trace_ids or [], ensure_ascii=False, indent=2)}\n\n"
             f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
             f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
             f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
@@ -1027,6 +1238,7 @@ def _generate_reroute_with_model(
         logger.warning("reroute model generation failed; using fallback payload: %s", exc)
         return _build_fallback_reroute_payload(
             nets=nets,
+            selected_trace_ids=selected_trace_ids,
             dropped_board_data=dropped_board_data,
             dropped_board_path=dropped_board_path,
             dropped_objects=dropped_objects,
@@ -1223,12 +1435,23 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         or extract_reroute_nets(user_data_obj.get("userText", ""))
     )
     nets = [str(net).strip() for net in nets if str(net).strip()] if isinstance(nets, list) else []
+    selected_trace_ids = (
+        user_data_obj.get("selectedTraceIds")
+        or user_data_obj.get("traceIds")
+        or cached.get("selectedTraceIds")
+        or []
+    )
+    selected_trace_ids = [
+        str(trace_id).strip()
+        for trace_id in selected_trace_ids
+        if str(trace_id).strip()
+    ] if isinstance(selected_trace_ids, list) else []
 
-    if not nets:
+    if not nets and not selected_trace_ids:
         return json.dumps(
             {
                 "rerouteResult": None,
-                "checkReport": {"passed": False, "errors": ["缺少 selectedNets，无法生成局部重布结果。"]},
+                "checkReport": {"passed": False, "errors": ["Missing selectedNets or selectedTraceIds; cannot generate local reroute result."]},
             },
             ensure_ascii=False,
         )
@@ -1266,9 +1489,9 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
     check_report = {
         "passed": True,
         "checks": [
-            {"name": "net_extraction", "passed": bool(nets), "detail": f"识别到 {len(nets)} 个待重布 net"},
+            {"name": "selection", "passed": bool(nets or selected_trace_ids), "detail": f"selectedNets={len(nets)}, selectedTraceIds={len(selected_trace_ids)}"},
             {"name": "dropped_board_data", "passed": bool(dropped_board_data), "detail": "已获得拆线后版图数据" if dropped_board_data else "未获得拆线后版图数据，按上下文请求生成"},
-            {"name": "connectivity_scope", "passed": True, "detail": "仅对 selectedNets 生成局部重布请求，不触碰其他网络"},
+            {"name": "connectivity_scope", "passed": True, "detail": "仅对所选走线或 selectedNets 生成局部重布请求，不触碰其他网络"},
         ],
     }
     if not dropped_board_data:
@@ -1276,6 +1499,7 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
 
     payload = _generate_reroute_with_model(
         nets=nets,
+        selected_trace_ids=selected_trace_ids,
         dropped_board_data=dropped_board_data,
         dropped_board_path=str(dropped_board_path or ""),
         dropped_objects=dropped_objects,
@@ -1288,6 +1512,7 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
             return _generate_reroute_with_model(
                 nets=nets,
+                selected_trace_ids=selected_trace_ids,
                 dropped_board_data=dropped_board_data,
                 dropped_board_path=str(dropped_board_path or ""),
                 dropped_objects=dropped_objects,
@@ -1304,7 +1529,7 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
             original_board_data=original_board_data,
             original_board_path=str(original_board_path or ""),
             output_dir=output_dir,
-            sample_id=f"{session_id or 'reroute'}_{'_'.join(nets)}",
+            sample_id=f"{session_id or 'reroute'}_{'_'.join(nets or selected_trace_ids)}",
             max_iterations=max_drc_iterations,
             regenerate=_regenerate,
         )
@@ -1343,4 +1568,4 @@ registry.register(
 )
 
 
-logger.info("PCB tools registered: getProjectData, GetSelectedElements, route, drop_net, reroute")
+logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, route, drop_net, reroute")
