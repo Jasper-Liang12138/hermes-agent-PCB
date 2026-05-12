@@ -60,10 +60,7 @@ MOCK_PROJECT_DATA = """(pcb_data (version 20221018) (project "proj-autotest-001"
   (net (name "DDR_D0") (pins "U27-C1" "U35-A1")))"""
 
 MOCK_ROUTE_RESULT = {
-    "routingResult": (
-        "(routes (route (net \"GND\") (layer \"SIG03\")"
-        " (path (line (start 4008.9 13888.9) (end 3999.18 13883.3) (width 3)))))"
-    ),
+    "routingResult": r"F:\router_work\routing_input.txt",
     "report": "布线连通率: 100%\n总线长: 1234.5 mil\n通孔数量: 42",
 }
 

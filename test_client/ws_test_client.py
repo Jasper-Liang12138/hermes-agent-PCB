@@ -48,7 +48,7 @@ def _default_tool_result(tool_name: str) -> Any:
         return "(pcb_data (component (name U27) (package BGA256)))"
     if tool_name == "route":
         return {
-            "routingResult": "(routes (net N1) (status ok))",
+            "routingResult": r"F:\router_work\routing_input.txt",
             "report": "mock route finished",
         }
     if tool_name == "GetSelectedElements":

@@ -90,6 +90,10 @@ if _cfg.has_section("router"):
         _os.environ["ROUTER_CMD"] = _r["cmd"].strip()
     if _r.get("work_dir", "").strip():
         _os.environ["ROUTER_WORK_DIR"] = _r["work_dir"].strip()
+    if _r.get("arc_dir", "").strip():
+        _os.environ["ROUTER_ARC_DIR"] = _r["arc_dir"].strip()
+    if _r.get("135_dir", "").strip():
+        _os.environ["ROUTER_135_DIR"] = _r["135_dir"].strip()
 
 if _cfg.has_section("model") and _cfg["model"].get("board_data_use_file_path", "").strip():
     _os.environ["BOARD_DATA_USE_FILE_PATH"] = _cfg["model"]["board_data_use_file_path"].strip()

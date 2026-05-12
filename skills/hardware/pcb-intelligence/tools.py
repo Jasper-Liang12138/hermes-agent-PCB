@@ -1,7 +1,6 @@
 """PCB Intelligence Tools - BGA Fanout Routing"""
 import json
 import asyncio
-import subprocess
 import os
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -129,20 +128,21 @@ async def GetSelectedElements(projectID: str) -> Dict[str, Any]:
 
 
 # ============================================================================
-# Tool 3: route (CLI Tool - Router.exe)
+# Tool 3: route (historical local tool wrapper)
 # ============================================================================
 
 def route(projectData: str, userData: Dict[str, Any]) -> Dict[str, Any]:
     """
     执行 BGA 扇出布线算法。
 
-    调用北科大提供的规则布线器（router.exe），完成 BGA 逃逸布线计算。
+    当前运行时主实现位于 tools/pcb_tools.py，并通过 routerType 选择 arc 或 135 adapter。
+    本文件保留为 skill 内历史工具定义参考，不作为当前 Windows 联调主入口。
 
     工作流程：
-    1. 写入输入文件：版图信息.txt, order_input.txt, constraint.txt
-    2. 执行 router.exe
+    1. 写入输入文件：版图信息.txt, order_input.txt, component_input.txt, constrain.txt（arc）
+    2. 根据 routerType 执行 arc 或 135 Windows 布线器
     3. 读取输出文件：routing_input.txt, data.txt
-    4. 返回布线结果和报告
+    4. 返回布线结果文件路径和报告
 
     Args:
         projectData: PCB 数据（S 表达式字符串）
@@ -152,12 +152,17 @@ def route(projectData: str, userData: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         {
-            "routingResult": "...",  # 布线结果（S 表达式）
+            "routingResult": "...",  # 布线结果文件路径
             "report": "..."          # 布线报告
         }
     """
-    # 获取环境变量配置
-    router_cmd = os.getenv("ROUTER_CMD", "router.exe")
+    # 兼容旧 skill 工具定义；当前主链路使用 tools/pcb_tools.py 的 route_bga。
+    router_type = str(userData.get("routerType") or userData.get("fanoutParams", {}).get("routerType") or "").strip()
+    if router_type not in {"arc", "135"}:
+        return {
+            "routingResult": "",
+            "report": "缺少 routerType，请选择布线器：arc 或 135"
+        }
     work_dir = Path(os.getenv("ROUTER_WORK_DIR", "."))
 
     # 确保工作目录存在
@@ -181,48 +186,9 @@ def route(projectData: str, userData: Dict[str, Any]) -> Dict[str, Any]:
             constraint_file = work_dir / "constraint.txt"
             constraint_file.write_text(json.dumps(constraints, ensure_ascii=False), encoding="utf-8")
 
-        # Step 2: 执行布线器
-        result = subprocess.run(
-            [router_cmd],
-            cwd=work_dir,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 分钟超时
-        )
-
-        if result.returncode != 0:
-            return {
-                "routingResult": "",
-                "report": f"布线器执行失败: {result.stderr}"
-            }
-
-        # Step 3: 读取输出文件
-
-        # routing_input.txt - 布线结果
-        routing_result_file = work_dir / "routing_input.txt"
-        if not routing_result_file.exists():
-            return {
-                "routingResult": "",
-                "report": "布线器未生成结果文件 routing_input.txt"
-            }
-        routing_result = routing_result_file.read_text(encoding="utf-8")
-
-        # data.txt - 布线报告
-        report_file = work_dir / "data.txt"
-        if report_file.exists():
-            report = report_file.read_text(encoding="utf-8")
-        else:
-            report = "布线完成（无详细报告）"
-
-        return {
-            "routingResult": routing_result,
-            "report": report
-        }
-
-    except subprocess.TimeoutExpired:
         return {
             "routingResult": "",
-            "report": "布线器执行超时（超过 5 分钟）"
+            "report": "该 skill 内 tools.py 为历史实现；请使用 tools/pcb_tools.py 注册的 route 工具执行 arc/135 adapter。"
         }
     except Exception as e:
         return {
@@ -266,7 +232,7 @@ TOOLS = [
     },
     {
         "name": "route",
-        "description": "执行 BGA 扇出布线算法，生成布线结果和报告",
+        "description": "执行 BGA 扇出布线算法，生成布线结果文件路径和报告",
         "parameters": {
             "type": "object",
             "properties": {
@@ -280,7 +246,11 @@ TOOLS = [
                     "properties": {
                         "fanoutParams": {
                             "type": "object",
-                            "description": "扇出参数：逃逸层分配、逃逸顺序等"
+                            "description": "扇出参数：必须包含 routerType（arc 或 135）、逃逸层分配、逃逸顺序等"
+                        },
+                        "routerType": {
+                            "type": "string",
+                            "description": "布线器选择，只允许 arc 或 135"
                         },
                         "selectedBGA": {
                             "type": "string",
@@ -291,7 +261,7 @@ TOOLS = [
                             "description": "用户自定义约束（可选）"
                         }
                     },
-                    "required": ["fanoutParams", "selectedBGA"]
+                    "required": ["fanoutParams", "selectedBGA", "routerType"]
                 }
             },
             "required": ["projectData", "userData"]

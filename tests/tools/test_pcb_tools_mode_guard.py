@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from model_tools import handle_function_call
 from tools import pcb_tools
+
+
+def _pin_csv(component: str) -> str:
+    return f"PinNumber,Net\n1,{component}.NET1\n"
+
+
+def _assert_route_summary(result: str, report: str, routing_path: Path, session_id: str) -> None:
+    assert result.startswith("布线完成")
+    assert report in result
+    assert str(routing_path) in result
+    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == {"routingResult": str(routing_path)}
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +100,7 @@ def test_route_blocked_in_chat_mode():
     assert "被拒绝" in payload["report"]
 
 
-def test_route_runs_local_router_even_with_active_websocket_adapter(monkeypatch, tmp_path):
+def test_route_requires_router_type_even_with_active_websocket_adapter(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-route-local"
     transport.set_session_mode("sess-pcb-route-local", "pcb")
@@ -98,30 +110,20 @@ def test_route_runs_local_router_even_with_active_websocket_adapter(monkeypatch,
     def _should_not_proxy(*args, **kwargs):
         raise AssertionError("route must not be proxied to frontend")
 
-    def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
-        assert cmd == ["router.exe", "--component", "U27"]
-        assert cwd == tmp_path
-        assert capture_output is True
-        assert text is True
-        assert encoding == "utf-8"
-        assert errors == "replace"
-        assert timeout == 300
-        (tmp_path / "routing_input.txt").write_text("(routes (done))", encoding="utf-8")
-        (tmp_path / "data.txt").write_text("布线成功", encoding="utf-8")
-        return SimpleNamespace(returncode=0, stderr="")
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("route must require explicit routerType before running")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _should_not_proxy)
-    monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
-    monkeypatch.setenv("ROUTER_CMD", "router.exe")
+    monkeypatch.setattr(pcb_tools.subprocess, "run", _should_not_run)
     monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
 
     result = pcb_tools.route_bga('{"orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"U27","constraints":{"LineWidth":4,"LineSpacing":3}}')
     payload = json.loads(result)
 
-    assert payload == {"routingResult": "(routes (done))", "report": "布线成功"}
-    assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "U27")))'
-    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU27"
-    assert (tmp_path / "constraint.txt").read_text(encoding="utf-8") == "LineWidth 4\nLineSpacing 3"
+    assert payload["routingResult"] == ""
+    assert "缺少 routerType" in payload["report"]
+    assert not (tmp_path / "版图信息.txt").exists()
+    assert not (tmp_path / "order_input.txt").exists()
 
 
 def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
@@ -134,20 +136,41 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
     )
     transport._websocket_adapter = SimpleNamespace(_session_selected_targets={"sess-route-selected": "U35"})
 
+    router_dir = tmp_path / "arc_runtime"
+    router_dir.mkdir()
+    for name in ("a.out", "b.out", "c.out"):
+        (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "Turn_QYF.py").write_text(
+        "from pathlib import Path\n"
+        "Path('routing_input.txt').write_text('(routes (u35))', encoding='utf-8')\n"
+        "Path('data.txt').write_text('布线成功', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
     def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
-        assert cmd == ["router.exe", "--component", "U35"]
-        (tmp_path / "routing_input.txt").write_text("(routes (u35))", encoding="utf-8")
-        (tmp_path / "data.txt").write_text("布线成功", encoding="utf-8")
-        return SimpleNamespace(returncode=0, stderr="")
+        executable = Path(cmd[1]).name if Path(cmd[0]).name.startswith("python") else Path(cmd[0]).name
+        if executable == "a.out":
+            assert cmd[-2:] == ["layout_input.txt", "component_input.txt"]
+            (tmp_path / "U35_pins.csv").write_text(_pin_csv("U35"), encoding="utf-8")
+            (tmp_path / "layer_input.txt").write_text("layers", encoding="utf-8")
+        elif executable == "b.out":
+            assert cmd[-2:] == ["layer_input.txt", "layout_input.txt"]
+        elif executable == "c.out":
+            assert cmd[-3:] == ["order_input.txt", "layout_input.txt", "constrain.txt"]
+            (tmp_path / "ARC_output.txt").write_text("arc", encoding="utf-8")
+        elif executable == "Turn_QYF.py":
+            assert cmd[-3:] == ["layout_input.txt", "ARC_output.txt", "routing_input.txt"]
+        else:
+            raise AssertionError(f"unexpected command: {cmd}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
-    monkeypatch.setenv("ROUTER_CMD", "router.exe")
     monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("ROUTER_ARC_DIR", str(router_dir))
 
-    result = pcb_tools.route_bga('{"orderLines":[{"net":"GND","layer":"SIG03","order":1}]}')
-    payload = json.loads(result)
+    result = pcb_tools.route_bga('{"routerType":"arc","orderLines":[{"net":"GND","layer":"SIG03","order":1}]}')
 
-    assert payload == {"routingResult": "(routes (u35))", "report": "布线成功"}
+    _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-route-selected")
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU35"
 
 
@@ -195,24 +218,176 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
     transport.set_session_mode("sess-explicit-route", "pcb")
     transport._cached_project_data["sess-explicit-route"] = '(pcb_data (component (name "FPGA1")))'
 
+    router_dir = tmp_path / "arc_runtime"
+    router_dir.mkdir()
+    for name in ("a.out", "b.out", "c.out"):
+        (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "Turn_QYF.py").write_text(
+        "from pathlib import Path\n"
+        "Path('routing_input.txt').write_text('(routes (fpga1))', encoding='utf-8')\n"
+        "Path('data.txt').write_text('布线成功', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
     def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
-        assert cmd == ["router.exe", "--component", "FPGA1"]
-        assert cwd == tmp_path
-        (tmp_path / "routing_input.txt").write_text("(routes (fpga1))", encoding="utf-8")
-        (tmp_path / "data.txt").write_text("布线成功", encoding="utf-8")
-        return SimpleNamespace(returncode=0, stderr="")
+        executable = Path(cmd[1]).name if Path(cmd[0]).name.startswith("python") else Path(cmd[0]).name
+        if executable == "a.out":
+            assert cwd == tmp_path
+            (tmp_path / "FPGA1_pins.csv").write_text(_pin_csv("FPGA1"), encoding="utf-8")
+            (tmp_path / "layer_input.txt").write_text("layers", encoding="utf-8")
+        elif executable == "b.out":
+            pass
+        elif executable == "c.out":
+            (tmp_path / "ARC_output.txt").write_text("arc", encoding="utf-8")
+        elif executable == "Turn_QYF.py":
+            pass
+        else:
+            raise AssertionError(f"unexpected command: {cmd}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
-    monkeypatch.setenv("ROUTER_CMD", "router.exe")
     monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("ROUTER_ARC_DIR", str(router_dir))
 
     result = handle_function_call(
         "route",
-        {"userData": '{"orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"FPGA1"}'},
+        {"userData": '{"routerType":"arc","orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"FPGA1"}'},
         session_id="sess-explicit-route",
     )
-    payload = json.loads(result)
 
-    assert payload == {"routingResult": "(routes (fpga1))", "report": "布线成功"}
+    _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-explicit-route")
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "FPGA1")))'
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nFPGA1"
+
+
+def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-arc-route"
+    transport.set_session_mode("sess-arc-route", "pcb")
+    transport._cached_project_data["sess-arc-route"] = '(pcb_data (component (name "U27") (package "BGA")))'
+
+    router_dir = tmp_path / "arc_runtime"
+    work_dir = tmp_path / "arc_work"
+    router_dir.mkdir()
+    work_dir.mkdir()
+    for name in ("a.out", "b.out", "c.out"):
+        (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "Turn_QYF.py").write_text(
+        "from pathlib import Path\n"
+        "Path('routing_input.txt').write_text('(arc routed)', encoding='utf-8')\n"
+        "Path('data.txt').write_text('arc ok', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
+        calls.append([str(part) for part in cmd])
+        assert cwd == work_dir
+        executable = Path(cmd[1]).name if Path(cmd[0]).name.startswith("python") else Path(cmd[0]).name
+        args = cmd[2:] if Path(cmd[0]).name.startswith("python") else cmd[1:]
+        if executable == "a.out":
+            assert args == ["layout_input.txt", "component_input.txt"]
+            (work_dir / "U27_pins.csv").write_text(_pin_csv("U27"), encoding="utf-8")
+            (work_dir / "layer_input.txt").write_text("layers", encoding="utf-8")
+        elif executable == "b.out":
+            assert args == ["layer_input.txt", "layout_input.txt"]
+            (work_dir / "order_input.txt").write_text((work_dir / "order_input.txt").read_text(encoding="utf-8"), encoding="utf-8")
+        elif executable == "c.out":
+            assert args == ["order_input.txt", "layout_input.txt", "constrain.txt"]
+            (work_dir / "ARC_output.txt").write_text("arc-lines", encoding="utf-8")
+        elif str(cmd[1]).endswith("Turn_QYF.py"):
+            assert cmd[2:] == ["layout_input.txt", "ARC_output.txt", "routing_input.txt"]
+        else:
+            raise AssertionError(f"unexpected command: {cmd}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("ROUTER_ARC_DIR", str(router_dir))
+
+    result = pcb_tools.route_bga(
+        json.dumps({
+            "routerType": "arc",
+            "selectedBGA": "U27",
+            "orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}],
+            "constraints": {"LineWidth": 3, "LineSpacing": 4.5},
+        })
+    )
+
+    _assert_route_summary(result, "arc ok", work_dir / "routing_input.txt", "sess-arc-route")
+    assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-arc-route"]
+    assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U27\n"
+    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU27"
+    assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "LineWidth:3\nLineSpacing:4.5\n"
+    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == [
+        "a.out",
+        "b.out",
+        "c.out",
+    ]
+
+
+def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-135-route"
+    transport.set_session_mode("sess-135-route", "pcb")
+    transport._cached_project_data["sess-135-route"] = '(pcb_data (component (name "U22") (package "BGA")))'
+
+    router_dir = tmp_path / "runtime135"
+    work_dir = tmp_path / "work135"
+    router_dir.mkdir()
+    work_dir.mkdir()
+    for name in ("d.out", "e.out", "f.out"):
+        (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "Turn_135_QYF.py").write_text(
+        "from pathlib import Path\n"
+        "Path('routing_input.txt').write_text('(135 routed)', encoding='utf-8')\n"
+        "Path('data.txt').write_text('135 ok', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
+        calls.append([str(part) for part in cmd])
+        assert cwd == work_dir
+        executable = Path(cmd[1]).name if Path(cmd[0]).name.startswith("python") else Path(cmd[0]).name
+        args = cmd[2:] if Path(cmd[0]).name.startswith("python") else cmd[1:]
+        if executable == "d.out":
+            assert args == ["layout_input.txt", "component_input.txt"]
+            (work_dir / "U22_pins.csv").write_text(_pin_csv("U22"), encoding="utf-8")
+            (work_dir / "net_list.txt").write_text("U22.NET1; layer; 4\n", encoding="utf-8")
+        elif executable == "e.out":
+            assert args == ["net_list.txt", "layout_input.txt"]
+            (work_dir / "order_out.txt").write_text("order", encoding="utf-8")
+        elif executable == "f.out":
+            assert args == ["order_out.txt", "layout_input.txt"]
+            (work_dir / "line.in").write_text("line in", encoding="utf-8")
+            (work_dir / "line.out").write_text("TOP!LINE!0!NET1!1!2!3!4!4\n", encoding="utf-8")
+        elif str(cmd[1]).endswith("Turn_135_QYF.py"):
+            assert cmd[2:] == ["layout_input.txt", "line.out", "routing_input.txt"]
+        else:
+            raise AssertionError(f"unexpected command: {cmd}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pcb_tools.subprocess, "run", _fake_run)
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("ROUTER_135_DIR", str(router_dir))
+
+    result = pcb_tools.route_bga(
+        json.dumps({
+            "routerType": "135",
+            "selectedBGA": "U22",
+            "orderLines": [{"net": "VCC", "layer": "SIG04", "order": 2}],
+        })
+    )
+
+    _assert_route_summary(result, "135 ok", work_dir / "routing_input.txt", "sess-135-route")
+    assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-135-route"]
+    assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U22\n"
+    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "VCC SIG04 2\n\nU22"
+    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == [
+        "d.out",
+        "e.out",
+        "f.out",
+    ]

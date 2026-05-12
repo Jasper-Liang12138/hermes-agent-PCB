@@ -26,7 +26,7 @@ metadata:
 | 工具名 | 类型 | 功能 |
 |--------|------|------|
 | `getProjectData` | WebSocket 代理 | 获取 PCB 项目 S 表达式数据 |
-| `route` | 本地 CLI 调用 | 执行 BGA 扇出布线（router.exe），不向前端发送 `route` 工具调用 |
+| `route` | 本地 adapter 调用 | 执行 BGA 扇出布线，根据 `routerType` 选择 `arc` 或 `135`，返回 `routingResult` 文件路径和报告，不向前端发送 `route` 工具调用 |
 
 ## Agent 工作流程（系统提示词控制，方案 A）
 
@@ -39,7 +39,7 @@ Step 3: 如果存在多个 BGA，返回 selection 列表让用户选择
 Step 4: 用户选择后，生成扇出参数（逃逸层分配 + 逃逸顺序）
 Step 5: 返回 fanoutParams 给用户确认（可修改）
 Step 6: 用户确认后，调用 route 工具执行布线
-Step 7: 布线完成，返回 routingResult + 报告
+Step 7: 布线完成，返回 routingResult 文件路径 + 报告
 ```
 
 ## 系统提示词
@@ -69,11 +69,12 @@ Step 7: 布线完成，返回 routingResult + 报告
 当用户请求 BGA 逃逸布线时，严格按以下步骤操作：
 1. 调用 getProjectData() 获取版图数据
 2. 调用 `pcb_extract_bga(board_text)` 作为主链路，获取 `selection`、`boardSummary`、`fanoutContext`
-3. 若存在多个 BGA，返回选择列表（见输出格式）；若只有一个 BGA，可直接沿用该工具返回的板级摘要与 fanout 上下文进入下一步
-4. 用户选择后，根据 `boardSummary` 与 `fanoutContext` 生成扇出参数
-5. 返回扇出参数供用户确认（用户可修改）
-6. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入；`route` 在 Agent 本地直接调用 `router.exe`，不经前端）
-7. 返回布线结果和报告
+3. 若存在多个 BGA，返回选择列表（见输出格式）；若只有一个 BGA，可直接沿用该工具返回的板级摘要与 fanout 上下文进入算法选择步骤
+4. 目标 BGA 确定后，先询问走线算法类型（`arc` 或 `135`）；如果用户已经明确指定算法，可跳过此步。禁止在算法未确定时询问是否执行布线
+5. 只有在 `routerType` 已确定为 `"arc"` 或 `"135"` 后，才根据 `boardSummary` 与 `fanoutContext` 生成扇出参数
+6. 返回扇出参数供用户确认（用户可修改）；此时 `fanoutParams.routerType` 必须是 `"arc"` 或 `"135"`，禁止为 `null`
+7. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入；`route` 在 Agent 本地通过 adapter 调用 `arc` 或 `135` Windows 布线器，不经前端）
+8. 返回布线结果和报告
 
 ## 输出格式（关键）
 
@@ -93,16 +94,31 @@ Step 7: 布线完成，返回 routingResult + 报告
 ##PCB_FIELDS_END##
 ```
 
-**扇出参数：**
+**算法选择（routerType 未确定时）：**
+```
+已识别到目标 BGA：U27。
+
+请选择走线算法类型：
+1. arc：圆弧走线，更平滑，适合常规布局
+2. 135：135 度折角走线，更紧凑，适合密集区域
+
+请回复 `arc` 或 `135`。
+```
+
+注意：此阶段禁止输出 `fanoutParams`，因为 `routerType` 尚未确定。
+
+**扇出参数（仅在 routerType 已确定后输出）：**
 ```
 已生成扇出参数，请确认：
 - 逃逸层：SIG03（第1层）、SIG04（第2层）
 - 线宽：4 mil，间距：3 mil
+- 走线算法：arc
 
 ##PCB_FIELDS##
 {
   "fanoutParams": {
     "selectedBGA": "U27",
+    "routerType": "arc",
     "orderLines": [
       {"net": "GND", "layer": "SIG03", "order": 1},
       {"net": "VCC", "layer": "SIG03", "order": 2},
@@ -122,7 +138,7 @@ Step 7: 布线完成，返回 routingResult + 报告
 
 ##PCB_FIELDS##
 {
-  "routingResult": "(pcb (version 1) (nets ...))"
+  "routingResult": "F:\\router_work\\routing_input.txt"
 }
 ##PCB_FIELDS_END##
 ```
@@ -136,10 +152,15 @@ Step 7: 布线完成，返回 routingResult + 报告
 - 布线失败时，提供清晰的错误分析和建议
 - ##PCB_FIELDS## 标记内必须是合法的 JSON
 - 标记外的文本是给用户看的说明，标记内的数据会被提取到协议字段
+- 禁止在普通正文或 Markdown 代码块中输出裸 JSON；结构化数据只能放在 `##PCB_FIELDS##` 与 `##PCB_FIELDS_END##` 之间
+- `##PCB_FIELDS##` 内的 JSON 必须完整、闭合、不可截断；不要在该区域内写解释文字或 Markdown
+- 不要重复输出同一段说明；流式回复时只输出一次最终说明
+- `routingResult` 必须是绝对文件路径字符串，指向 `routing_input.txt`，不是 S 表达式正文；正文只写简短总结
 
 ## fanoutParams 格式规范（重要）
 
 fanoutParams 必须包含：
+- `routerType`：必填，布线器选择，只允许 `"arc"` 或 `"135"`；用户未明确选择时，先询问算法，不要输出 `fanoutParams`，禁止使用 `null`
 - `selectedBGA`：用户选择/当前要布线的 BGA 器件位号（如 `U27`）；route 会把它写入 `order_input.txt` 最后一行
 - `orderLines`：数组，每项为 `{"net": "线网名", "layer": "层名", "order": 布线顺序整数}`
   - net：线网名称（如 GND、VCC、DDR_D0）
@@ -149,7 +170,7 @@ fanoutParams 必须包含：
 
 调用 route 工具时只传 userData，不传 projectData：
 ```json
-{"userData": "{\"selectedBGA\":\"U27\",\"orderLines\":[{\"net\":\"GND\",\"layer\":\"SIG03\",\"order\":1}],\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}"}
+{"userData": "{\"routerType\":\"arc\",\"selectedBGA\":\"U27\",\"orderLines\":[{\"net\":\"GND\",\"layer\":\"SIG03\",\"order\":1}],\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}"}
 ```
 ```
 
@@ -168,6 +189,7 @@ long_term:
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `ROUTER_CMD` | `router.exe` | 布线器可执行文件路径 |
 | `ROUTER_WORK_DIR` | `.` | 布线器工作目录 |
+| `ROUTER_ARC_DIR` | `ROUTER_WORK_DIR` | 弧形走线 Windows 布线器目录，包含 `a.exe/b.exe/c.exe/Turn_QYF.py` |
+| `ROUTER_135_DIR` | `ROUTER_WORK_DIR` | 135 走线 Windows 布线器目录，包含 `d.exe/e.exe/f.exe/Turn_135_QYF.py` |
 

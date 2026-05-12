@@ -277,7 +277,7 @@ BGA 和 QFP 有什么区别？
 
 ```json
 {
-  "routingResult": "(routes (route (net \"GND\") (layer \"SIG03\") (status ok)))",
+  "routingResult": "F:\\router_work\\routing_input.txt",
   "report": "布线连通率: 100%"
 }
 ```
@@ -319,4 +319,3 @@ BGA 和 QFP 有什么区别？
 3. PCB prompt 未触发 `getProjectData`，Agent 返回了说明性文本。
 4. 因未出现 `tool-calls`，完整链路未进入 `selection -> fanoutParams -> route -> routingResult`。
 5. 后续应优先修正“PCB 操作 prompt 必须触发工具调用”的问题，再跑完整链路。
-

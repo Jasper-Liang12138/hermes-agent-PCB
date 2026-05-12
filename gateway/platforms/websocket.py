@@ -48,6 +48,40 @@ _PCB_FIELDS_PATTERN = re.compile(
     r"\s*##PCB_FIELDS##\s*([\s\S]*?)\s*##PCB_FIELDS_END##\s*",
     re.MULTILINE,
 )
+_PCB_BODY_FIELD_KEYS = (
+    "selection",
+    "fanoutParams",
+    "routingResult",
+    "boardSummary",
+    "fanoutContext",
+)
+_PCB_STRUCTURED_KEYS = frozenset(
+    _PCB_BODY_FIELD_KEYS
+    + (
+        "contextStats",
+        "model",
+        "source",
+        "fallbackUsed",
+        "packageHints",
+        "netSummary",
+        "stackupSummary",
+        "recommendedEscapeLayers",
+        "recommendedLineWidth",
+        "recommendedLineSpacing",
+        "prioritySuggestion",
+        "orderLines",
+        "selectedBGA",
+        "routerType",
+        "constraints",
+    )
+)
+_PCB_STRUCTURED_KEY_RE = re.compile(
+    r'"(?:' + "|".join(re.escape(key) for key in sorted(_PCB_STRUCTURED_KEYS)) + r')"\s*:',
+    re.IGNORECASE,
+)
+_PCB_RAW_LAYOUT_RE = re.compile(
+    r"(?is)(?:```[a-zA-Z0-9_-]*\s*)?\(\s*layout\b[\s\S]*$|Pcb-Design_Version[\s\S]*$"
+)
 
 # 思考内容标记（框架 show_reasoning 开启时嵌入文本的前缀格式）
 _REASONING_PATTERN = re.compile(
@@ -83,6 +117,7 @@ _VALID_ROUTE_INTENTS = {
 _FLOW_IDLE = "idle"
 _FLOW_BOOTSTRAP_GET_PROJECT = "bootstrap_get_project"
 _FLOW_WAIT_SELECTION = "wait_selection"
+_FLOW_WAIT_ROUTER_TYPE = "wait_router_type"
 _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
 
@@ -97,6 +132,7 @@ _PCB_DOMAIN_RE = re.compile(
 )
 _SELECTION_RE = re.compile(r"(选择\s*U?\d+|选\s*U?\d+|^U\d+$)", re.IGNORECASE)
 _SELECTION_PREFIX_RE = re.compile(r"^\s*(?:我\s*)?(?:选择|选)\s*(.+?)\s*$", re.IGNORECASE)
+_ROUTER_TYPE_RE = re.compile(r"^\s*(?:选择|选|用|使用)?\s*(arc|135|1|2|圆弧|弧形|折角|135\s*度)\s*$", re.IGNORECASE)
 _CONFIRM_RE = re.compile(r"(确认|继续|执行|开始布线|开始|go|yes|ok)", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"(取消|退出|中止|停止|cancel|abort|exit)", re.IGNORECASE)
 _CHAT_ONLY_RE = re.compile(
@@ -206,6 +242,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._stream_msg_ids: Dict[str, str] = {}
         self._stream_content_buffers: Dict[str, str] = {}
         self._stream_thinking_buffers: Dict[str, str] = {}
+        self._stream_pcb_protocol_buffers: Dict[str, str] = {}
+        self._stream_pending_pcb_fields: Dict[str, Dict[str, Any]] = {}
         self._session_queues: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
         self._session_workers: Dict[str, asyncio.Task] = {}
         self._stream_fields_fingerprint: Dict[str, str] = {}
@@ -216,6 +254,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_flow_states: Dict[str, str] = {}
         self._session_selection_labels: Dict[str, Tuple[str, ...]] = {}
         self._session_selected_targets: Dict[str, str] = {}
+        self._session_router_types: Dict[str, str] = {}
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
@@ -286,6 +325,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._stream_msg_ids.clear()
         self._stream_content_buffers.clear()
         self._stream_thinking_buffers.clear()
+        self._stream_pcb_protocol_buffers.clear()
+        self._stream_pending_pcb_fields.clear()
         self._stream_fields_fingerprint.clear()
         self._session_modes.clear()
         self._session_mode_lock_until.clear()
@@ -314,6 +355,10 @@ class WebSocketAdapter(BasePlatformAdapter):
     async def _start_websocket_server(self) -> None:
         self._app = web.Application()
         self._app.router.add_get("/", self._websocket_handler)
+        self._app.router.add_get("/ws", self._websocket_handler)
+        self._app.router.add_get("/websocket", self._websocket_handler)
+        self._app.router.add_get("/agent", self._websocket_handler)
+        self._app.router.add_get("/api/ws", self._websocket_handler)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self._host, self._port)
@@ -535,6 +580,8 @@ class WebSocketAdapter(BasePlatformAdapter):
                 self._stream_msg_ids[session_id] = item["msg_id"]
                 self._stream_content_buffers.pop(session_id, None)
                 self._stream_thinking_buffers.pop(session_id, None)
+                self._stream_pcb_protocol_buffers.pop(session_id, None)
+                self._stream_pending_pcb_fields.pop(session_id, None)
                 self._stream_fields_fingerprint.pop(session_id, None)
                 await self._handle_user_message(
                     item["data"],
@@ -654,6 +701,19 @@ class WebSocketAdapter(BasePlatformAdapter):
             if bootstrap_context is None:
                 return
 
+        if decision.reason == "router_type_step":
+            router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
+            selected = self._session_selected_targets.get(session_id)
+            target_line = f"目标 BGA 已确定为 {selected}。\n" if selected else ""
+            user_text = (
+                "[SYSTEM: 用户已选择 PCB BGA 逃逸布线器。\n"
+                f"{target_line}"
+                f"routerType 已确定为 {router_type}。\n"
+                "下一步必须基于已缓存的 boardSummary/fanoutContext 或当前上下文生成 fanoutParams；"
+                "fanoutParams.routerType 必须等于该 routerType，禁止为 null，禁止使用 pcb_fanout。]\n\n"
+                f"用户原始回复：\n{user_text}"
+            )
+
         # 仅在 PCB 流程里注入 projectid，避免普通聊天因看到项目上下文而主动去拿版图数据。
         if decision.mode == _ROUTE_MODE_PCB and project_id and user_text:
             user_text = f"[projectid: {project_id}]\n{user_text}"
@@ -766,7 +826,10 @@ class WebSocketAdapter(BasePlatformAdapter):
             "请下一步调用 pcb_extract_bga，board_text 参数传 __CACHED_PROJECT_DATA__ 或留空，"
             "工具会从 session 缓存读取完整版图并分析，"
             "提取 BGA selection、boardSummary 和 fanoutContext。\n"
-            "如存在多个 BGA，请通过 ##PCB_FIELDS## 返回 selection。]\n\n"
+            "布线器只有两个可选值：arc（圆弧走线）和 135（135 度折角走线）。禁止使用或声称存在 pcb_fanout 等其他布线器名称。\n"
+            "如果提取到多个 BGA，请通过 ##PCB_FIELDS## 返回 selection，让用户先选 BGA。\n"
+            "如果只提取到一个 BGA，也不要直接询问是否执行布线；必须先让用户选择走线算法类型 arc 或 135。\n"
+            "在用户明确选择 arc 或 135 之前，禁止输出 fanoutParams，禁止调用 route，禁止询问“是否现在执行”。]\n\n"
             f"用户原始请求：\n{user_text}"
         )
 
@@ -888,12 +951,28 @@ class WebSocketAdapter(BasePlatformAdapter):
         # 1. 提取思考内容（框架 show_reasoning 注入的前缀格式）
         thinking, content_no_thinking = self._extract_thinking(content)
 
-        # 2. 提取 PCB 结构化字段
-        clean_content, pcb_fields = self._extract_pcb_fields(content_no_thinking)
-
         stream_is_final = None
         if isinstance(metadata, dict):
             stream_is_final = metadata.get("stream_is_final")
+
+        if stream_is_final is not None:
+            content_no_thinking, stream_fields = self._peel_stream_pcb_protocol(
+                chat_id,
+                content_no_thinking,
+                bool(stream_is_final),
+            )
+        else:
+            stream_fields = {}
+
+        # 2. 提取 PCB 结构化字段
+        clean_content, pcb_fields = self._extract_pcb_fields(content_no_thinking)
+        pcb_fields.update(stream_fields)
+        if stream_is_final is not None and not stream_is_final and pcb_fields:
+            self._remember_stream_pcb_fields(chat_id, pcb_fields)
+            pcb_fields = {}
+        if stream_is_final is None or stream_is_final:
+            pcb_fields.update(self._stream_pending_pcb_fields.pop(chat_id, {}))
+            pcb_fields.update(self._pop_pending_pcb_fields(chat_id))
 
         if stream_is_final is not None:
             msg_id = self._stream_msg_ids.get(chat_id, uuid.uuid4().hex[:12])
@@ -902,6 +981,11 @@ class WebSocketAdapter(BasePlatformAdapter):
                 chat_id,
                 clean_content,
             )
+            clean_content = self._strip_incomplete_pcb_protocol_tail(clean_content)
+            clean_content = self._strip_stream_cursor(clean_content)
+            clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
+            pcb_fields.update(extra_fields)
+            clean_content = self._strip_stream_protocol_leak(clean_content)
             if thinking:
                 thinking = self._coalesce_stream_fragment(
                     self._stream_thinking_buffers,
@@ -912,6 +996,18 @@ class WebSocketAdapter(BasePlatformAdapter):
             msg_id = self._stream_msg_ids.get(chat_id, uuid.uuid4().hex[:12])
             self._stream_content_buffers.pop(chat_id, None)
             self._stream_thinking_buffers.pop(chat_id, None)
+
+        if stream_is_final is None or stream_is_final:
+            clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
+            clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
+            clean_content = self._dedupe_stream_restart_content(clean_content)
+        clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
+        pcb_fields.update(extra_fields)
+        clean_content = self._strip_stream_protocol_leak(clean_content)
+        if stream_is_final is not None and not stream_is_final and pcb_fields:
+            self._remember_stream_pcb_fields(chat_id, pcb_fields)
+            pcb_fields = {}
+        clean_content = self._fallback_visible_content_for_fields(clean_content, pcb_fields)
 
         body: Dict[str, Any] = {
             "msgId": msg_id,
@@ -924,7 +1020,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             body["thinking"] = thinking
 
         # 注入 PCB 结构化字段
-        for key in ("selection", "fanoutParams", "routingResult"):
+        for key in _PCB_BODY_FIELD_KEYS:
             if key in pcb_fields:
                 body[key] = pcb_fields[key]
 
@@ -932,6 +1028,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         if stream_is_final:
             self._stream_content_buffers.pop(chat_id, None)
             self._stream_thinking_buffers.pop(chat_id, None)
+            self._stream_pcb_protocol_buffers.pop(chat_id, None)
+            self._stream_pending_pcb_fields.pop(chat_id, None)
             self._stream_fields_fingerprint.pop(chat_id, None)
 
         message = {
@@ -967,19 +1065,40 @@ class WebSocketAdapter(BasePlatformAdapter):
         流式输出接口，框架在 streaming 模式下逐帧调用此方法。
 
         isFinal=false 表示中间帧（还在生成），isFinal=true 表示最终帧。
-        同一次回复共用同一个 msgId，客户端靠 msgId 识别是否为追加内容。
+        同一次回复共用同一个 msgId，客户端靠 msgId 覆盖更新同一条消息。
         """
         ws_info = self._connections.get(chat_id)
         project_id = ws_info[1] if ws_info else ""
 
         thinking, content_no_thinking = self._extract_thinking(content)
+        content_no_thinking, stream_fields = self._peel_stream_pcb_protocol(
+            chat_id,
+            content_no_thinking,
+            is_final,
+        )
         clean_content, pcb_fields = self._extract_pcb_fields(content_no_thinking)
+        pcb_fields.update(stream_fields)
+        if not is_final and pcb_fields:
+            self._remember_stream_pcb_fields(chat_id, pcb_fields)
+            pcb_fields = {}
+        if is_final:
+            pcb_fields.update(self._stream_pending_pcb_fields.pop(chat_id, {}))
+            pcb_fields.update(self._pop_pending_pcb_fields(chat_id))
 
         clean_content = self._coalesce_stream_fragment(
             self._stream_content_buffers,
             chat_id,
             clean_content,
         )
+        clean_content = self._strip_incomplete_pcb_protocol_tail(clean_content)
+        clean_content = self._strip_stream_cursor(clean_content)
+        clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
+        pcb_fields.update(extra_fields)
+        clean_content = self._strip_stream_protocol_leak(clean_content)
+        if not is_final and pcb_fields:
+            self._remember_stream_pcb_fields(chat_id, pcb_fields)
+            pcb_fields = {}
+        self._stream_content_buffers[chat_id] = clean_content
         if thinking:
             thinking = self._coalesce_stream_fragment(
                 self._stream_thinking_buffers,
@@ -987,17 +1106,31 @@ class WebSocketAdapter(BasePlatformAdapter):
                 thinking,
             )
 
-        # 流式场景里字段块常常先于 true 终帧出现；检测到完整字段后立即下发。
+        # 结构化字段只在终帧下发；中间帧只负责更新同一条可见文本。
         outbound_is_final: Optional[bool] = is_final
-        emitted_fields = pcb_fields
-        if not is_final and pcb_fields:
-            fp = self._pcb_fields_fingerprint(pcb_fields)
-            if fp == self._stream_fields_fingerprint.get(chat_id):
-                emitted_fields = {}
-            else:
-                self._stream_fields_fingerprint[chat_id] = fp
-                # 兼容依赖“非 false 帧”消费结构化字段的客户端。
-                outbound_is_final = None
+        if not is_final:
+            self._remember_stream_pcb_fields(chat_id, pcb_fields)
+            emitted_fields: Dict[str, Any] = {}
+            pcb_fields = {}
+            outbound_is_final = False
+        else:
+            emitted_fields = pcb_fields
+
+        if is_final:
+            clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
+            clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
+            clean_content = self._dedupe_stream_restart_content(clean_content)
+            clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
+            pcb_fields.update(extra_fields)
+            clean_content = self._strip_stream_protocol_leak(clean_content)
+            self._stream_content_buffers[chat_id] = clean_content
+            emitted_fields = pcb_fields
+
+        if not clean_content.strip() and not emitted_fields and not is_final:
+            return SendResult(success=True, message_id=self._stream_msg_ids.get(chat_id, message_id))
+        clean_content = self._fallback_visible_content_for_fields(clean_content, pcb_fields)
+        if is_final:
+            self._stream_content_buffers[chat_id] = clean_content
 
         msg_id = self._stream_msg_ids.get(chat_id, message_id)
 
@@ -1011,7 +1144,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if thinking:
             body["thinking"] = thinking
 
-        for key in ("selection", "fanoutParams", "routingResult"):
+        for key in _PCB_BODY_FIELD_KEYS:
             if key in emitted_fields:
                 body[key] = emitted_fields[key]
 
@@ -1020,6 +1153,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         if is_final:
             self._stream_content_buffers.pop(chat_id, None)
             self._stream_thinking_buffers.pop(chat_id, None)
+            self._stream_pcb_protocol_buffers.pop(chat_id, None)
+            self._stream_pending_pcb_fields.pop(chat_id, None)
             self._stream_fields_fingerprint.pop(chat_id, None)
 
         message = {
@@ -1142,6 +1277,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._set_flow_state(session_id, _FLOW_IDLE)
         self._session_selection_labels.pop(session_id, None)
         self._session_selected_targets.pop(session_id, None)
+        self._session_router_types.pop(session_id, None)
 
     @staticmethod
     def _as_bool(value: Any) -> bool:
@@ -1196,6 +1332,162 @@ class WebSocketAdapter(BasePlatformAdapter):
                 if re.search(rf"(?<![A-Za-z0-9_]){re.escape(normalized)}(?![A-Za-z0-9_])", candidate, re.IGNORECASE):
                     return original
         return None
+
+    @staticmethod
+    def _extract_router_type(text: str) -> Optional[str]:
+        match = _ROUTER_TYPE_RE.match(text or "")
+        if not match:
+            return None
+        value = re.sub(r"\s+", "", match.group(1).lower())
+        if value in {"arc", "1", "圆弧", "弧形"}:
+            return "arc"
+        if value in {"135", "2", "折角", "135度"}:
+            return "135"
+        return None
+
+    def _router_type_prompt(self, session_id: str) -> str:
+        selected = self._session_selected_targets.get(session_id)
+        prefix = f"已选择目标 BGA：{selected}。\n\n" if selected else ""
+        return (
+            f"{prefix}请选择走线算法类型：\n"
+            "1. `arc`：圆弧走线，更平滑，适合常规布局\n"
+            "2. `135`：135 度折角走线，更紧凑，适合密集区域\n\n"
+            "请回复 `arc` 或 `135`。"
+        )
+
+    @staticmethod
+    def _extract_bga_label_from_content(content: str) -> Optional[str]:
+        if not content or not re.search(r"\bBGA\b|封装|管脚|pin", content, re.IGNORECASE):
+            return None
+        match = re.search(r"(?<![A-Za-z0-9_])(U\d+)(?![A-Za-z0-9_])", content, re.IGNORECASE)
+        return match.group(1).upper() if match else None
+
+    @staticmethod
+    def _content_asks_router_choice(content: str) -> bool:
+        if not content:
+            return False
+        return bool(
+            re.search(r"\barc\b", content, re.IGNORECASE)
+            and re.search(r"(?<!\d)135(?!\d)", content)
+            and re.search(r"算法|布线器|走线|回复|选择|请选择", content)
+        )
+
+    @staticmethod
+    def _strip_premature_execute_question(content: str) -> str:
+        if not content:
+            return content
+        lines = []
+        for line in content.splitlines():
+            if re.search(r"是否.*(执行|开始|布线)|现在.*(执行|开始|布线)|确认.*(执行|开始|布线)", line):
+                continue
+            if re.search(r"pcb_fanout", line, re.IGNORECASE):
+                continue
+            lines.append(line)
+        return "\n".join(lines).rstrip()
+
+    def _guard_router_choice_before_confirm(
+        self,
+        session_id: str,
+        content: str,
+        pcb_fields: Dict[str, Any],
+    ) -> str:
+        if "fanoutParams" in pcb_fields or "routingResult" in pcb_fields:
+            return content
+        if "selection" in pcb_fields:
+            selection = pcb_fields.get("selection")
+            labels: list[str] = []
+            if isinstance(selection, list):
+                for item in selection:
+                    if isinstance(item, dict):
+                        label = str(item.get("label") or "").strip()
+                        if label:
+                            labels.append(label)
+            if len(labels) != 1:
+                return content
+            self._session_selected_targets.setdefault(session_id, labels[0])
+
+        flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        mode = self._session_mode(session_id)
+        in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
+        if not in_pcb_context:
+            return content
+        if self._session_router_types.get(session_id) or self._content_asks_router_choice(content):
+            return content
+
+        label = self._extract_bga_label_from_content(content)
+        if not label and flow_state != _FLOW_WAIT_ROUTER_TYPE:
+            return content
+        if label:
+            self._session_selected_targets.setdefault(session_id, label)
+
+        self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+        self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+        guarded = self._strip_premature_execute_question(content)
+        prompt = self._router_type_prompt(session_id)
+        return f"{guarded}\n\n{prompt}".strip() if guarded else prompt
+
+    @staticmethod
+    def _strip_leaked_fanout_json(content: str, pcb_fields: Dict[str, Any]) -> str:
+        if not content or "fanoutParams" not in pcb_fields:
+            return content
+
+        clean = re.sub(
+            r"```(?:json)?\s*[\s\S]*?(?:fanoutParams|orderLines|selectedBGA|routerType|constraints)[\s\S]*?```\s*",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        anchors = ("已确认", "根据版图", "已生成", "请确认", "下一步")
+        first_anchor = min((idx for anchor in anchors if (idx := clean.find(anchor)) >= 0), default=-1)
+        if first_anchor > 0:
+            prefix = clean[:first_anchor]
+            if re.search(r'"(?:fanoutParams|orderLines|selectedBGA|routerType|constraints|net|layer|order)"|[{}\[\]]', prefix):
+                clean = clean[first_anchor:].lstrip()
+
+        return clean
+
+    @staticmethod
+    def _fallback_visible_content_for_fields(content: str, pcb_fields: Dict[str, Any]) -> str:
+        if content and content.strip():
+            return content
+        if "routingResult" in pcb_fields:
+            return "布线完成，结果已发送到前端。"
+        if "fanoutParams" in pcb_fields:
+            return "已生成扇出参数，请确认。"
+        if "selection" in pcb_fields:
+            selection = pcb_fields.get("selection")
+            if isinstance(selection, list) and len(selection) == 1:
+                item = selection[0]
+                if isinstance(item, dict):
+                    label = str(item.get("label") or "").strip()
+                    if label:
+                        return f"已识别到目标 BGA：{label}。"
+            return "已识别到 BGA 候选，请选择目标器件。"
+        if "boardSummary" in pcb_fields or "fanoutContext" in pcb_fields:
+            return "已完成版图分析。"
+        return content
+
+    @staticmethod
+    def _dedupe_stream_restart_content(content: str) -> str:
+        if not content:
+            return content
+        anchors = (
+            "已收到您的选择",
+            "已确认走线算法",
+            "已确认",
+            "根据 BGA",
+            "已识别到目标 BGA",
+            "请选择走线算法类型",
+        )
+        for anchor in anchors:
+            first = content.find(anchor)
+            last = content.rfind(anchor)
+            if first >= 0 and last > first:
+                prefix = content[:last]
+                if "##" in prefix or "```" in prefix or prefix.count(anchor) >= 1:
+                    return content[last:].lstrip("#` \n\r\t")
+        return content
 
     @staticmethod
     def _normalize_route_intent_label(raw_text: str) -> Optional[str]:
@@ -1403,6 +1695,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
             "- 如果用户既要求解释又要求执行，以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
+            "- flow_state=wait_router_type 时，用户回复 arc/135/1/2 判 pcb_followup。\n"
             "- flow_state=wait_confirm 时，确认/开始/执行/继续判 pcb_confirm_route。\n"
             "- 取消、退出、中止当前流程判 cancel。\n"
             "输出字段：intent, route_mode, confidence, target_refdes, operation, "
@@ -1419,6 +1712,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 不要解释，直接开始PCB BGA逃逸布线 => pcb_entry, route_mode=pcb\n"
             "- 不要布线，只解释一下逃逸布线原理 => chat, route_mode=chat\n"
             "- 选择 FPGA1（wait_selection）=> pcb_select_target, route_mode=pcb\n"
+            "- arc（wait_router_type）=> pcb_followup, route_mode=pcb\n"
+            "- 135（wait_router_type）=> pcb_followup, route_mode=pcb\n"
             "- 确认，开始布线（wait_confirm）=> pcb_confirm_route, route_mode=pcb\n"
             f"user_text=<user_text>{user_text}</user_text>"
         )
@@ -1488,6 +1783,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             return _INTENT_CHAT
 
         in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
+        if flow_state == _FLOW_WAIT_ROUTER_TYPE and self._extract_router_type(text):
+            return _INTENT_PCB_FOLLOWUP
         if route_intent:
             if route_intent.intent == _INTENT_CANCEL:
                 return _INTENT_CANCEL
@@ -1516,6 +1813,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if in_pcb_context:
             if (
                 _CONFIRM_RE.search(text)
+                or self._extract_router_type(text)
                 or self._extract_selected_label(session_id, text)
                 or _SELECTION_RE.search(text)
                 or _PCB_DOMAIN_RE.search(text)
@@ -1555,7 +1853,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 )
             return _RouteDecision(mode=_ROUTE_MODE_CHAT, reason="cancel_chat", intent=_INTENT_CANCEL)
 
-        if route_intent and route_intent.needs_clarification:
+        if route_intent and route_intent.needs_clarification and flow_state == _FLOW_IDLE:
             return _RouteDecision(
                 mode=_ROUTE_MODE_CHAT,
                 immediate_reply=route_intent.clarification_question or "请确认是否要执行 PCB BGA 逃逸布线？",
@@ -1588,7 +1886,15 @@ class WebSocketAdapter(BasePlatformAdapter):
             selected_label = self._extract_selected_label(session_id, text)
             if selected_label:
                 self._session_selected_targets[session_id] = selected_label
-                return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="selection_step", intent=_INTENT_PCB_SELECT_TARGET)
+                self._session_router_types.pop(session_id, None)
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+                return _RouteDecision(
+                    mode=_ROUTE_MODE_PCB,
+                    immediate_reply=self._router_type_prompt(session_id),
+                    reason="selection_step_wait_router_type",
+                    intent=_INTENT_PCB_SELECT_TARGET,
+                )
             if _CONFIRM_RE.search(text):
                 return _RouteDecision(
                     mode=_ROUTE_MODE_PCB,
@@ -1606,6 +1912,26 @@ class WebSocketAdapter(BasePlatformAdapter):
                     "或回复“取消”退出。"
                 ),
                 reason="invalid_selection_turn",
+                intent=_INTENT_UNCLEAR,
+            )
+
+        if flow_state == _FLOW_WAIT_ROUTER_TYPE:
+            router_type = self._extract_router_type(text)
+            if router_type:
+                self._session_router_types[session_id] = router_type
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="router_type_step", intent=_INTENT_PCB_FOLLOWUP)
+            if _CONFIRM_RE.search(text):
+                return _RouteDecision(
+                    mode=_ROUTE_MODE_PCB,
+                    immediate_reply="执行布线前必须先选择布线器。请回复 `arc` 或 `135`。",
+                    reason="confirm_before_router_type",
+                    intent=_INTENT_PCB_CONFIRM_ROUTE,
+                )
+            return _RouteDecision(
+                mode=_ROUTE_MODE_PCB,
+                immediate_reply=self._router_type_prompt(session_id),
+                reason="invalid_router_type_turn",
                 intent=_INTENT_UNCLEAR,
             )
 
@@ -1643,6 +1969,197 @@ class WebSocketAdapter(BasePlatformAdapter):
     async def _send_router_reply(self, session_id: str, message: str) -> None:
         await self.send(chat_id=session_id, content=message)
 
+    @staticmethod
+    def _pop_pending_pcb_fields(session_id: str) -> Dict[str, Any]:
+        try:
+            from tools.pcb_tools import WebSocketTransportSingleton
+            fields = WebSocketTransportSingleton.get_instance().pop_pending_pcb_fields(session_id)
+            return fields if isinstance(fields, dict) else {}
+        except Exception as exc:
+            logger.warning("Failed to pop pending PCB fields for session=%s: %s", session_id, exc)
+            return {}
+
+    def _remember_stream_pcb_fields(self, session_id: str, fields: Dict[str, Any]) -> None:
+        if not fields:
+            return
+        pending = self._stream_pending_pcb_fields.setdefault(session_id, {})
+        pending.update(fields)
+
+    def _peel_stream_pcb_protocol(
+        self,
+        session_id: str,
+        content: str,
+        is_final: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Remove PCB structured payloads before stream coalescing.
+
+        Providers may send either cumulative text or token deltas. PCB_FIELDS is
+        therefore buffered separately from visible markdown so partial markers and
+        JSON never become chat content.
+        """
+        text = content or ""
+        fields: Dict[str, Any] = {}
+
+        buffered = self._stream_pcb_protocol_buffers.get(session_id)
+        if buffered is not None:
+            marker_start = text.find("##PCB_FIELDS##")
+            json_start = self._stream_structured_json_start(text)
+            if marker_start >= 0:
+                visible_prefix = text[:marker_start]
+                protocol_fragment = text[marker_start:]
+                buffered = protocol_fragment
+            elif json_start is not None:
+                visible_prefix = text[:json_start]
+                protocol_fragment = text[json_start:]
+                buffered = protocol_fragment
+            else:
+                visible_prefix = ""
+                protocol_fragment = text
+                buffered = self._merge_stream_text(buffered, protocol_fragment)
+            if self._stream_protocol_buffer_complete(buffered) or is_final:
+                clean_protocol, parsed = self._extract_stream_pcb_buffer(buffered)
+                fields.update(parsed)
+                self._stream_pcb_protocol_buffers.pop(session_id, None)
+                text = visible_prefix + clean_protocol
+            else:
+                self._stream_pcb_protocol_buffers[session_id] = buffered
+                return visible_prefix.strip(), {}
+
+        marker_start = text.find("##PCB_FIELDS##")
+        if marker_start >= 0:
+            marker_end = text.find("##PCB_FIELDS_END##", marker_start)
+            if marker_end < 0 and not is_final:
+                self._stream_pcb_protocol_buffers[session_id] = text[marker_start:]
+                return text[:marker_start].rstrip(), fields
+
+        partial_marker_start = self._partial_pcb_marker_start(text)
+        if partial_marker_start is not None and not is_final:
+            self._stream_pcb_protocol_buffers[session_id] = text[partial_marker_start:]
+            return text[:partial_marker_start].rstrip(), fields
+
+        partial_json_start = self._partial_structured_json_start(text)
+        if partial_json_start is not None and not is_final:
+            self._stream_pcb_protocol_buffers[session_id] = text[partial_json_start:]
+            return text[:partial_json_start].rstrip(), fields
+
+        json_start = self._stream_structured_json_start(text)
+        if json_start is not None:
+            bounds = self._json_payload_bounds(text, json_start)
+            if not is_final:
+                self._stream_pcb_protocol_buffers[session_id] = text[json_start:]
+                return text[:json_start].rstrip(), fields
+            if bounds is not None:
+                clean_json, parsed = self._extract_stream_pcb_buffer(text[json_start:])
+                fields.update(parsed)
+                text = text[:json_start] + clean_json
+
+        clean, parsed = self._extract_pcb_fields(text)
+        fields.update(parsed)
+        return clean, fields
+
+    @staticmethod
+    def _merge_stream_text(current: str, incoming: str) -> str:
+        if not current:
+            return incoming or ""
+        if not incoming:
+            return current
+        if incoming == current:
+            return current
+        if incoming.startswith(current):
+            return incoming
+        if current.startswith(incoming):
+            return current
+        if incoming in current:
+            return current
+
+        max_overlap = min(len(current), len(incoming))
+        for overlap in range(max_overlap, 0, -1):
+            if incoming.startswith(current[-overlap:]):
+                return current + incoming[overlap:]
+        return current + incoming
+
+    @staticmethod
+    def _partial_pcb_marker_start(content: str) -> Optional[int]:
+        if not content:
+            return None
+        marker = "##PCB_FIELDS##"
+        for size in range(len(marker) - 1, 1, -1):
+            prefix = marker[:size]
+            if content.endswith(prefix):
+                return len(content) - size
+        return None
+
+    @staticmethod
+    def _partial_structured_json_start(content: str) -> Optional[int]:
+        if not content:
+            return None
+        match = _PCB_STRUCTURED_KEY_RE.search(content)
+        if not match:
+            return None
+        bounds = WebSocketAdapter._enclosing_json_bounds(content, match.start())
+        if bounds is not None:
+            return None
+        return WebSocketAdapter._find_enclosing_json_start(content, match.start())
+
+    @staticmethod
+    def _stream_protocol_buffer_complete(content: str) -> bool:
+        if not content:
+            return False
+        if "##PCB_FIELDS_END##" in content:
+            return True
+        start = WebSocketAdapter._stream_structured_json_start(content)
+        if start is None:
+            start = 0
+        return WebSocketAdapter._json_payload_bounds(content, start) is not None
+
+    @staticmethod
+    def _extract_stream_pcb_buffer(content: str) -> Tuple[str, Dict[str, Any]]:
+        clean, fields = WebSocketAdapter._extract_pcb_fields(content)
+        if fields:
+            return clean, fields
+        clean, fields = WebSocketAdapter._extract_bare_pcb_fields(content)
+        clean = WebSocketAdapter._strip_stream_protocol_leak(clean)
+        return clean, fields
+
+    @staticmethod
+    def _stream_structured_json_start(content: str) -> Optional[int]:
+        if not content:
+            return None
+
+        match = _PCB_STRUCTURED_KEY_RE.search(content)
+        if match:
+            json_start = WebSocketAdapter._find_enclosing_json_start(content, match.start())
+            if json_start is not None:
+                return json_start
+            fallback = content.rfind("{", 0, match.start())
+            if fallback >= 0:
+                return fallback
+
+        # Catch naked JSON before the full key has streamed. Keep this narrow:
+        # only treat a brace near the tail as protocol if it looks like one of
+        # the PCB structured payloads the agent is allowed to produce.
+        brace_positions = [m.start() for m in re.finditer(r"(?m)(?:^|\n)\s*\{", content)]
+        for brace_pos in reversed(brace_positions):
+            brace_pos = content.find("{", brace_pos)
+            tail = content[brace_pos:]
+            compact_tail = re.sub(r"\s+", "", tail.lower())
+            if (
+                compact_tail in {"{", '{"', '{"f', '{"fa', '{"fan', '{"fano', '{"fanou', '{"fanout'}
+                or compact_tail.startswith('{"fanout')
+                or compact_tail.startswith('{"selection')
+                or compact_tail.startswith('{"routing')
+                or compact_tail.startswith('{"boardsummary')
+                or compact_tail.startswith('{"fanoutcontext')
+                or '"fanoutparams"' in compact_tail
+                or '"selectedbga"' in compact_tail
+                or '"routertype"' in compact_tail
+                or '"orderlines"' in compact_tail
+                or '"routingresult"' in compact_tail
+            ):
+                return brace_pos
+        return None
+
     def _update_route_state_from_fields(self, session_id: str, pcb_fields: Dict[str, Any]) -> None:
         if not pcb_fields:
             return
@@ -1653,6 +2170,12 @@ class WebSocketAdapter(BasePlatformAdapter):
             return
 
         if "fanoutParams" in pcb_fields:
+            fanout_params = pcb_fields.get("fanoutParams")
+            router_type = None
+            if isinstance(fanout_params, dict):
+                router_type = self._extract_router_type(str(fanout_params.get("routerType") or ""))
+            if router_type:
+                self._session_router_types[session_id] = router_type
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
             return
@@ -1669,8 +2192,13 @@ class WebSocketAdapter(BasePlatformAdapter):
                         labels.append(label)
             self._session_selection_labels[session_id] = tuple(labels)
             self._session_selected_targets.pop(session_id, None)
+            self._session_router_types.pop(session_id, None)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-            self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
+            if len(labels) == 1:
+                self._session_selected_targets[session_id] = labels[0]
+                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+            else:
+                self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
 
     @staticmethod
     def _pcb_fields_fingerprint(pcb_fields: Dict[str, Any]) -> str:
@@ -1725,6 +2253,55 @@ class WebSocketAdapter(BasePlatformAdapter):
         combined = current + incoming
         buffers[session_id] = combined
         return combined + cursor
+
+    @staticmethod
+    def _strip_stream_cursor(content: str) -> str:
+        return _STREAM_CURSOR_RE.sub("", content or "")
+
+    @staticmethod
+    def _strip_stream_protocol_leak(content: str) -> str:
+        """
+        Last-resort guard for visible streaming text.
+
+        PCB_FIELDS can arrive as broken chunks. If any protocol marker or
+        structured JSON key survived earlier parsing, truncate from the first
+        unsafe point so the frontend never renders internal payload fragments.
+        """
+        if not content:
+            return content
+
+        clean = content
+        marker_positions = [
+            pos for pos in (
+                clean.find("##PCB_FIELDS##"),
+                clean.find("##PCB_FIELDS"),
+                clean.find("\n##"),
+                clean.find("##"),
+            )
+            if pos >= 0
+        ]
+        if marker_positions:
+            marker_pos = min(marker_positions)
+            tail = clean[marker_pos:]
+            if (
+                "PCB_FIELDS" in tail
+                or _PCB_STRUCTURED_KEY_RE.search(tail)
+                or '"fanoutParams"' in tail
+                or '"routingResult"' in tail
+                or '"selection"' in tail
+                or marker_pos > 0
+            ):
+                clean = clean[:marker_pos]
+
+        match = _PCB_STRUCTURED_KEY_RE.search(clean)
+        if match:
+            json_start = WebSocketAdapter._find_enclosing_json_start(clean, match.start())
+            if json_start is None:
+                json_start = clean.rfind("\n", 0, match.start())
+                json_start = 0 if json_start < 0 else json_start
+            clean = clean[:json_start]
+
+        return clean.rstrip()
 
     @staticmethod
     def _sync_transport_mode(session_id: str, mode: str) -> None:
@@ -1798,7 +2375,169 @@ class WebSocketAdapter(BasePlatformAdapter):
         # 容错：流式/模型偶发漏写 ##PCB_FIELDS_END## 时，只要标记后已有完整 JSON，
         # 仍提取结构字段并从正文剥离，避免前端把 selection 当普通文本展示。
         clean = WebSocketAdapter._extract_unclosed_pcb_fields(clean, fields)
+        clean, bare_fields = WebSocketAdapter._extract_bare_pcb_fields(clean)
+        fields.update(bare_fields)
+        clean = WebSocketAdapter._strip_incomplete_pcb_protocol_tail(clean)
+        clean, leaked_fields = WebSocketAdapter._sanitize_pcb_visible_content(clean)
+        fields.update(leaked_fields)
         return clean.strip(), fields
+
+    @staticmethod
+    def _sanitize_pcb_visible_content(content: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Keep PCB protocol data out of user-visible markdown.
+
+        Models do not always obey the marker protocol, especially during
+        streaming or after tool results containing board analysis. This strips
+        raw PCB JSON/layout payloads from content and returns any recoverable
+        structured fields so callers can attach them to the websocket body.
+        """
+        if not content:
+            return content, {}
+
+        fields: Dict[str, Any] = {}
+        clean, bare_fields = WebSocketAdapter._extract_bare_pcb_fields(content)
+        fields.update(bare_fields)
+
+        clean = re.sub(
+            r"```(?:json|javascript|txt|text)?\s*[\s\S]*?"
+            r"(?:selection|fanoutParams|routingResult|boardSummary|fanoutContext|"
+            r"contextStats|packageHints|netSummary|stackupSummary|orderLines|selectedBGA|routerType)"
+            r"[\s\S]*?```\s*",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        clean = re.sub(r"```(?:json|javascript|txt|text)?\s*```\s*", "", clean, flags=re.IGNORECASE)
+        clean = _PCB_RAW_LAYOUT_RE.sub("", clean)
+        clean = re.sub(r"##PCB_FIELDS(?:_END)?#*", "", clean)
+        return clean.strip(), fields
+
+    @staticmethod
+    def _extract_bare_pcb_fields(content: str) -> Tuple[str, Dict[str, Any]]:
+        if not content or not _PCB_STRUCTURED_KEY_RE.search(content):
+            return content, {}
+
+        fields: Dict[str, Any] = {}
+        clean = content
+        search_pos = 0
+        while True:
+            match = _PCB_STRUCTURED_KEY_RE.search(clean, search_pos)
+            if not match:
+                break
+            bounds = WebSocketAdapter._enclosing_json_bounds(clean, match.start())
+            if bounds is None:
+                search_pos = match.end()
+                continue
+
+            json_start, json_end = bounds
+            raw_payload = clean[json_start:json_end].strip()
+            try:
+                data = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                search_pos = match.end()
+                continue
+
+            extracted = WebSocketAdapter._collect_pcb_fields(data)
+            if not extracted and not WebSocketAdapter._has_pcb_structured_data(data):
+                search_pos = match.end()
+                continue
+
+            fields.update(extracted)
+            clean = clean[:json_start] + clean[json_end:]
+            search_pos = json_start
+
+        return clean.strip(), fields
+
+    @staticmethod
+    def _collect_pcb_fields(data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+
+        fields: Dict[str, Any] = {}
+        for key in _PCB_BODY_FIELD_KEYS:
+            if key in data:
+                fields[key] = data[key]
+
+        nested = data.get("body")
+        if isinstance(nested, dict):
+            for key in _PCB_BODY_FIELD_KEYS:
+                if key in nested and key not in fields:
+                    fields[key] = nested[key]
+
+        return fields
+
+    @staticmethod
+    def _has_pcb_structured_data(data: Any) -> bool:
+        if isinstance(data, dict):
+            return any(key in _PCB_STRUCTURED_KEYS for key in data) or any(
+                WebSocketAdapter._has_pcb_structured_data(value)
+                for value in data.values()
+            )
+        if isinstance(data, list):
+            return any(WebSocketAdapter._has_pcb_structured_data(item) for item in data)
+        return False
+
+    @staticmethod
+    def _enclosing_json_bounds(content: str, key_pos: int) -> Optional[Tuple[int, int]]:
+        start = WebSocketAdapter._find_enclosing_json_start(content, key_pos)
+        if start is None:
+            return None
+        return WebSocketAdapter._json_payload_bounds(content, start)
+
+    @staticmethod
+    def _find_enclosing_json_start(content: str, key_pos: int) -> Optional[int]:
+        in_string = False
+        escaped = False
+        stack: list[int] = []
+        for idx, char in enumerate(content[: key_pos + 1]):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                stack.append(idx)
+            elif char == "}":
+                if stack:
+                    stack.pop()
+        return stack[-1] if stack else None
+
+    @staticmethod
+    def _strip_incomplete_pcb_protocol_tail(content: str) -> str:
+        """
+        Hide partially streamed protocol markers from the user-facing text.
+
+        Models often emit "##PCB_FIELDS##" token-by-token. Before the full marker
+        and JSON payload are available, fragments such as "##PC" must not leak to
+        the frontend as normal chat content.
+        """
+        if not content:
+            return content
+        cursor = ""
+        cursor_match = _STREAM_CURSOR_RE.search(content)
+        if cursor_match:
+            cursor = cursor_match.group(0)
+            content_without_cursor = content[:cursor_match.start()]
+        else:
+            content_without_cursor = content
+
+        marker_index = content.find("##PCB_FIELDS##")
+        if marker_index >= 0 and "##PCB_FIELDS_END##" not in content[marker_index:]:
+            return content[:marker_index].rstrip()
+
+        # Partial prefixes of "##PCB_FIELDS##" at the end of a streaming frame.
+        marker = "##PCB_FIELDS##"
+        max_len = min(len(marker) - 1, len(content_without_cursor))
+        for size in range(max_len, 1, -1):
+            if content_without_cursor.endswith(marker[:size]):
+                return content_without_cursor[:-size].rstrip()
+        return content_without_cursor + cursor
 
     @staticmethod
     def _extract_unclosed_pcb_fields(content: str, fields: Dict[str, Any]) -> str:
