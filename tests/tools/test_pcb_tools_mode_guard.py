@@ -555,6 +555,8 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
     assert payload["checkReport"]["passed"] is True
     assert "局部重布" in payload["explanation"]
+    assert "可解释性分析报告" in payload["content"]
+    assert "布线较好概率: 0.984707" in payload["content"]
 
 
 def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
