@@ -125,7 +125,11 @@ _FLOW_WAIT_SELECTION = "wait_selection"
 _FLOW_WAIT_ROUTER_TYPE = "wait_router_type"
 _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
-_REROUTE_RE = re.compile(r"(拆线|删除.*net|删.*net|重布|重新布|重走|reroute|ripup|rip-up)", re.IGNORECASE)
+_REROUTE_RE = re.compile(
+    r"(拆线|删除.*(?:net|走线|线|trace|traces|框选|选中)|删.*(?:net|走线|线|trace|traces|框选|选中)|"
+    r"重布|重新布|重走|重新走线|reroute|ripup|rip-up)",
+    re.IGNORECASE,
+)
 
 # 高精度触发：必须同时命中动作词 + PCB 领域词，才进入 PCB 主链路。
 _PCB_ACTION_RE = re.compile(
@@ -133,7 +137,7 @@ _PCB_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _PCB_DOMAIN_RE = re.compile(
-    r"(pcb|板子|版图|bga|fpga|芯片|器件|封装|扇出|逃逸|布线|走线|线网|网络|net|选中元件|projectdata|getprojectdata|getselectedelements|route|fanout)",
+    r"(pcb|板子|版图|bga|fpga|芯片|器件|封装|扇出|逃逸|布线|走线|线网|网络|net|框选|选中|选中元件|trace|traces|projectdata|getprojectdata|getselectedelements|route|fanout)",
     re.IGNORECASE,
 )
 _SELECTION_RE = re.compile(r"(选择\s*U?\d+|选\s*U?\d+|^U\d+$)", re.IGNORECASE)
@@ -759,10 +763,13 @@ class WebSocketAdapter(BasePlatformAdapter):
                 if decision.intent == _INTENT_PCB_REROUTE_SELECTED
                 else "hardware/pcb-intelligence"
             )
+        skill_status = self._build_auto_skill_status(auto_skill)
         if decision.mode == _ROUTE_MODE_PCB:
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         else:
             self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+        if skill_status:
+            await self._send_processing_status(session_id, project_id, skill_status)
 
         bootstrap_context: Optional[Dict[str, Any]] = None
         if (
@@ -1015,6 +1022,17 @@ class WebSocketAdapter(BasePlatformAdapter):
                 "isFinal": False,
             },
         })
+
+    @staticmethod
+    def _build_auto_skill_status(auto_skill: Optional[str]) -> Optional[str]:
+        if not auto_skill:
+            return None
+        skill_labels = {
+            "hardware/pcb-reroute": "拆线重布",
+            "hardware/pcb-intelligence": "PCB 智能布线",
+        }
+        label = skill_labels.get(auto_skill, auto_skill)
+        return f"已收到，进入{label} skill，正在处理..."
 
     def _resolve_tool_result(self, data: Dict[str, Any]):
         """收到 tool-results 时，解析 call_id，resolve 对应的 Future。
@@ -1889,6 +1907,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 概念咨询、原理解释、区别比较且没有执行要求，判 chat。\n"
             "- 明确要求开始 PCB/BGA/逃逸/扇出/布线/获取版图/识别 BGA，判 pcb_entry。\n"
             "- 明确要求对文本中指定 net 做拆线重布、删除后重走、reroute，判 pcb_reroute_selected。\n"
+            "- 明确要求对当前框选、选中走线、选中 traces 做删除、拆线、重走、重布，判 pcb_reroute_selected。\n"
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
             "- 如果用户既要求解释又要求执行，以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
@@ -1912,6 +1931,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- arc（wait_router_type）=> pcb_followup, route_mode=pcb\n"
             "- 135（wait_router_type）=> pcb_followup, route_mode=pcb\n"
             "- 确认，开始布线（wait_confirm）=> pcb_confirm_route, route_mode=pcb\n"
+            "- 删除我框选的线重新布线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
+            "- 把我选中的 traces 删除后重新走线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
             "- 请把 BGA U2 的 net13、net17 拆线后重新布线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
             f"user_text=<user_text>{user_text}</user_text>"
         )

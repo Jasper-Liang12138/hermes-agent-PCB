@@ -14,6 +14,13 @@ from gateway.config import PlatformConfig
 from gateway.platforms.websocket import WebSocketAdapter
 
 
+_INTERIM_STATUS_CONTENTS = {
+    "已收到，正在处理...",
+    "已收到，进入拆线重布 skill，正在处理...",
+    "已收到，进入PCB 智能布线 skill，正在处理...",
+}
+
+
 def _free_port() -> int:
     """Reserve a free localhost TCP port for the test server."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -64,7 +71,7 @@ async def _recv_json(ws, timeout: float = 5.0) -> dict:
         body = data.get("body", {})
         if (
             data.get("type") == "message"
-            and body.get("content") == "已收到，正在处理..."
+            and body.get("content") in _INTERIM_STATUS_CONTENTS
             and body.get("isFinal") is False
         ):
             continue
@@ -241,6 +248,23 @@ def test_websocket_reroute_intent_loads_reroute_skill_without_bootstrap():
     assert decision.bootstrap_get_project is False
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "删除我框选的线重新布线",
+        "请对当前框选走线拆线重布",
+        "把我选中的 traces 删除后重新走线",
+    ],
+)
+def test_websocket_selected_trace_reroute_intent_variants(text):
+    adapter = _make_adapter()
+    decision = adapter._decide_route("sess-selected-trace-reroute", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
 def test_websocket_reroute_short_command_works_in_pcb_context():
     adapter = _make_adapter()
     session_id = "sess-reroute-short"
@@ -358,6 +382,59 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
 
 def test_websocket_reroute_fields_round_trip():
     asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip())
+
+
+async def _run_websocket_reroute_sends_skill_status() -> None:
+    port = _free_port()
+    adapter = _make_adapter(port)
+    session_id = "sess-reroute-status"
+    project_id = "proj-reroute-status"
+    observed_auto_skill: list[str | None] = []
+
+    async def handler(event):
+        observed_auto_skill.append(event.auto_skill)
+        return "ok"
+
+    adapter.set_message_handler(handler)
+    await adapter.connect()
+
+    try:
+        uri = f"http://127.0.0.1:{port}"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
+                await ws.send_str(
+                    _user_message(
+                        session_id,
+                        project_id,
+                        "删除我框选的线重新布线",
+                    )
+                )
+
+                received: list[dict[str, Any]] = []
+                for _ in range(4):
+                    msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                    assert msg.type == aiohttp.WSMsgType.TEXT
+                    data = json.loads(msg.data)
+                    received.append(data)
+                    if data.get("body", {}).get("content") == "ok":
+                        break
+
+                status_messages = [
+                    item
+                    for item in received
+                    if item.get("type") == "message"
+                    and item.get("body", {}).get("content") == "已收到，进入拆线重布 skill，正在处理..."
+                    and item.get("body", {}).get("isFinal") is False
+                ]
+                assert status_messages
+    finally:
+        await adapter.disconnect()
+
+    assert observed_auto_skill == ["hardware/pcb-reroute"]
+
+
+def test_websocket_reroute_sends_skill_status():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_sends_skill_status())
 
 
 async def _run_websocket_chat_turn_not_misrouted() -> None:
