@@ -25,6 +25,7 @@ import threading
 import uuid
 import logging
 import re
+import tempfile
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import Future as ThreadFuture
 from typing import Dict, Any, Optional
@@ -156,6 +157,17 @@ def _write_order_input(work_dir: Path, order_lines: list[dict[str, Any]], compon
     order_text = f"{order_text}\n\n{component_refdes}"
     path = work_dir / "order_input.txt"
     path.write_text(order_text, encoding="utf-8")
+    return path
+
+
+def _write_arc_layer_input(work_dir: Path, order_lines: list[dict[str, Any]], component_refdes: str) -> Path:
+    layer_text = "\n".join(
+        f"{item['net']} {item['layer']}"
+        for item in order_lines
+    )
+    layer_text = f"{layer_text}\n\n{component_refdes}"
+    path = work_dir / "layer_input.txt"
+    path.write_text(layer_text, encoding="utf-8")
     return path
 
 
@@ -370,6 +382,30 @@ def _validate_net_list(work_dir: Path, component_refdes: str, step: str) -> None
         raise RuntimeError(f"{step} 生成的 net_list.txt 不包含目标器件 {component_refdes} 的网络")
 
 
+def _arc_diff_pair_key(net_name: str) -> Optional[tuple[str, str]]:
+    if not isinstance(net_name, str):
+        return None
+    match = re.match(r"^(.*)_(P|N)_(.+)$", net_name.strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    return (f"{match.group(1)}__{match.group(3)}".casefold(), match.group(2).upper())
+
+
+def _validate_arc_order_lines(order_lines: list[dict[str, Any]]) -> None:
+    pair_sides: dict[str, set[str]] = {}
+    for item in order_lines:
+        pair = _arc_diff_pair_key(str(item.get("net", "")).strip())
+        if not pair:
+            continue
+        pair_key, side = pair
+        pair_sides.setdefault(pair_key, set()).add(side)
+
+    if not any({"P", "N"}.issubset(sides) for sides in pair_sides.values()):
+        raise RuntimeError(
+            "arc 布线器仅支持差分对网络；当前 orderLines 不包含成对的 *_P_* / *_N_* 网络。"
+        )
+
+
 def _line_width_or_default(constraints: Any) -> float:
     line_width, _ = _constraint_values(constraints)
     try:
@@ -522,7 +558,18 @@ def _router_error_report(exc: Exception, router_type: str, component_refdes: str
             f"{router_type} 布线器输入准备失败：{detail}。"
             "当前 adapter 已强制刷新本次版图与清理旧中间文件；若仍失败，请检查布线器脚本对目标器件命名的匹配规则。"
         )
+    if "差分对网络" in detail or "*_P_* / *_N_*" in detail:
+        return (
+            "arc 布线器当前只支持差分对网络输入。"
+            f"{detail} 请改用包含成对 *_P_* / *_N_* 网络的扇出参数，或切换到 135 布线器。"
+        )
     if "net_list.txt" in detail:
+        if router_type == "arc":
+            return (
+                f"arc 布线器网络提取失败：{detail}。"
+                f"当前 Windows 版 arc 会从版图中提取 {component_refdes} 的差分对网络；"
+                "如果版图本身没有可识别的 *_P_* / *_N_* 网络，ARC_output.txt 会为空。"
+            )
         return f"{router_type} 布线器网络提取失败：{detail}。请检查 adapter 是否能从本次版图中提取 {component_refdes} 的网络。"
     if "order_out.txt" in detail or "line.in" in detail or "line.out" in detail:
         return (
@@ -537,25 +584,47 @@ def _router_error_report(exc: Exception, router_type: str, component_refdes: str
     return f"{router_type} 布线器异常：{detail}"
 
 
-def _run_arc_router(work_dir: Path, router_dir: Path, component_refdes: str, constraints: Any) -> None:
+def _run_arc_router(
+    work_dir: Path,
+    router_dir: Path,
+    component_refdes: str,
+    constraints: Any,
+    order_lines: list[dict[str, Any]],
+    project_data: str,
+) -> None:
     _copy_runtime_support_files(router_dir, work_dir)
     layout_path = work_dir / "layout_input.txt"
     if not layout_path.exists():
         raise FileNotFoundError("缺少版图输入文件 layout_input.txt")
+    source = work_dir / "版图信息.txt"
+    if not source.exists():
+        raise FileNotFoundError("缺少版图输入文件 版图信息.txt")
+    _validate_arc_order_lines(order_lines)
     _remove_file_if_exists(work_dir / f"{component_refdes}_pins.csv")
     _write_component_input(work_dir, component_refdes)
     constrain_path = _write_arc_constraint(work_dir, constraints)
+    _write_arc_layer_input(work_dir, order_lines, component_refdes)
 
-    a_out = _copy_runtime_file(router_dir, work_dir, "a.out")
-    b_out = _copy_runtime_file(router_dir, work_dir, "b.out")
     c_out = _copy_runtime_file(router_dir, work_dir, "c.out")
     turn_script = _copy_runtime_file(router_dir, work_dir, "Turn_QYF.py")
 
-    _require_success(_run_process(_router_binary_args(a_out, layout_path.name, "component_input.txt"), work_dir), "arc a.out")
-    _validate_component_pins(work_dir, component_refdes, (work_dir / "版图信息.txt").read_text(encoding="utf-8"), "arc a.out")
-    _require_success(_run_process(_router_binary_args(b_out, "layer_input.txt", layout_path.name), work_dir), "arc b.out")
-    _ensure_nonempty_file(work_dir, "layer_input.txt", "arc b.out")
-    _require_success(_run_process(_router_binary_args(c_out, "order_input.txt", layout_path.name, constrain_path.name), work_dir), "arc c.out")
+    pins_helper = work_dir / "get_pins.py"
+    if pins_helper.exists():
+        _require_success(
+            _run_python_script_inprocess(pins_helper, work_dir, layout_path.name, component_refdes),
+            "arc get_pins.py",
+        )
+        _validate_component_pins(work_dir, component_refdes, project_data, "arc get_pins.py")
+
+    _require_success(
+        _run_process(
+            _router_binary_args(c_out, "order_input.txt", layout_path.name, constrain_path.name, "component_input.txt"),
+            work_dir,
+        ),
+        "arc c.out",
+    )
+    _validate_component_pins(work_dir, component_refdes, project_data, "arc c.out")
+    _validate_net_list(work_dir, component_refdes, "arc c.out")
     _ensure_nonempty_file(work_dir, "ARC_output.txt", "arc c.out")
     _require_success(
         _run_python_script_inprocess(turn_script, work_dir, layout_path.name, "ARC_output.txt", "routing_input.txt"),
@@ -582,6 +651,12 @@ def _run_135_router(work_dir: Path, router_dir: Path, component_refdes: str, con
     turn_script = _copy_runtime_file(router_dir, work_dir, "Turn_135_QYF.py")
 
     _require_success(_run_process(_router_binary_args(d_out, layout_path.name, "component_input.txt"), work_dir), "135 d.out")
+    pins_helper = work_dir / "get_135_pins.py"
+    if not (work_dir / f"{component_refdes}_pins.csv").exists() and pins_helper.exists():
+        _require_success(
+            _run_python_script_inprocess(pins_helper, work_dir, layout_path.name, component_refdes),
+            "135 get_135_pins.py",
+        )
     _validate_component_pins(work_dir, component_refdes, project_data, "135 d.out")
     _require_success(_run_process(_router_binary_args(e_out, "net_list.txt", layout_path.name), work_dir), "135 e.out")
     _validate_net_list(work_dir, component_refdes, "135 e.out")
@@ -695,6 +770,7 @@ class WebSocketTransportSingleton:
     _main_loop: Optional[asyncio.AbstractEventLoop] = None
     current_session_id: Optional[str] = None
     _cached_project_data: Dict[str, str] = {}  # session_id -> getProjectData 结果缓存
+    _cached_reroute_context: Dict[str, Dict[str, Any]] = {}  # session_id -> drop_net 结果缓存
     _session_modes: Dict[str, str] = {}  # session_id -> chat/pcb
     _pending_pcb_fields: Dict[str, Dict[str, Any]] = {}  # session_id -> fields emitted by tools
 
@@ -719,7 +795,7 @@ class WebSocketTransportSingleton:
     def resolve_session_id(self, session_id: Optional[str] = None) -> Optional[str]:
         candidate = str(session_id or "").strip()
         if candidate:
-            if candidate in self._session_modes or candidate in self._cached_project_data:
+            if candidate in self._session_modes or candidate in self._cached_project_data or candidate in self._cached_reroute_context:
                 return candidate
             try:
                 connections = getattr(self._websocket_adapter, "_connections", {}) or {}
@@ -749,6 +825,7 @@ class WebSocketTransportSingleton:
     def clear_session(self, session_id: str) -> None:
         self._session_modes.pop(session_id, None)
         self._cached_project_data.pop(session_id, None)
+        self._cached_reroute_context.pop(session_id, None)
         self._pending_pcb_fields.pop(session_id, None)
         if self.current_session_id == session_id:
             self.current_session_id = None
@@ -765,6 +842,19 @@ class WebSocketTransportSingleton:
         if not session_id:
             return None
         return self._cached_project_data.get(session_id)
+
+    def cache_reroute_context(self, data: Dict[str, Any], session_id: Optional[str] = None) -> None:
+        """保存 drop_net 的拆线上下文，供 reroute 工具使用。"""
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return
+        self._cached_reroute_context[session_id] = data
+
+    def get_cached_reroute_context(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return None
+        return self._cached_reroute_context.get(session_id)
 
     def set_pending_pcb_fields(self, fields: Dict[str, Any], session_id: Optional[str] = None) -> None:
         session_id = self.resolve_session_id(session_id)
@@ -902,10 +992,15 @@ registry.register(
 
 
 # ============================================================================
-# Tool 2: GetSelectedElements
+# Tool 2: getSelectedElements / GetSelectedElements
 # ============================================================================
 
-def get_selected_elements(projectID: str, session_id: Optional[str] = None) -> str:
+def get_selected_elements(
+    projectID: str = "",
+    PFindType: str = "TRACES",
+    session_id: Optional[str] = None,
+    frontend_tool_name: str = "getSelectedElements",
+) -> str:
     """
     获取用户在 PCB 中框选的元素 ID 列表。
 
@@ -920,24 +1015,55 @@ def get_selected_elements(projectID: str, session_id: Optional[str] = None) -> s
     """
     session_id = _transport.resolve_session_id(session_id)
     if not _transport.is_pcb_mode(session_id):
-        msg = _session_mode_error("GetSelectedElements", session_id)
+        msg = _session_mode_error(frontend_tool_name, session_id)
         logger.warning(msg)
         return json.dumps({"error": msg}, ensure_ascii=False)
 
     try:
-        logger.info("GetSelectedElements start: projectID=%s", projectID)
+        find_type = str(PFindType or "TRACES").strip() or "TRACES"
+        logger.info("%s start: projectID=%s PFindType=%s", frontend_tool_name, projectID, find_type)
         result = _transport.call_tool_sync(
-            tool_name="GetSelectedElements",
-            arguments={"projectID": projectID},
+            tool_name=frontend_tool_name,
+            arguments={"PFindType": find_type},
             timeout=30.0,
             session_id=session_id,
         )
         data = result if isinstance(result, str) else json.dumps(result)
-        logger.info("GetSelectedElements success: %d chars", len(data))
+        logger.info("%s success: %d chars", frontend_tool_name, len(data))
         return data
     except Exception as e:
-        logger.error(f"GetSelectedElements failed: {e}")
+        logger.error("%s failed: %s", frontend_tool_name, e)
         return json.dumps({"error": str(e)})
+
+
+registry.register(
+    name="getSelectedElements",
+    toolset="pcb",
+    schema={
+        "name": "getSelectedElements",
+        "description": (
+            "Get user-selected PCB element ids from the frontend. "
+            "For local rip-up/reroute this must be called with PFindType='TRACES'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "PFindType": {
+                    "type": "string",
+                    "description": "Selected object type. Local reroute uses TRACES.",
+                    "default": "TRACES",
+                }
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kwargs: get_selected_elements(
+        PFindType=args.get("PFindType", "TRACES"),
+        session_id=kwargs.get("session_id"),
+        frontend_tool_name="getSelectedElements",
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
 
 
 registry.register(
@@ -962,6 +1088,60 @@ registry.register(
     },
     handler=lambda args, **kwargs: get_selected_elements(
         args.get("projectID", ""),
+        PFindType=args.get("PFindType", "TRACES"),
+        session_id=kwargs.get("session_id"),
+        frontend_tool_name="GetSelectedElements",
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
+
+
+def delete_traces_by_id(ids: list[str], session_id: Optional[str] = None) -> str:
+    """Delete selected trace ids through the PCB frontend."""
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("deleteTracesById", session_id)
+        logger.warning(msg)
+        return json.dumps({"error": msg}, ensure_ascii=False)
+
+    normalized_ids = [str(item).strip() for item in (ids or []) if str(item).strip()]
+    if not normalized_ids:
+        return json.dumps({"error": "No trace ids were provided.", "ids": []}, ensure_ascii=False)
+
+    try:
+        logger.info("deleteTracesById start: session=%s count=%d", session_id, len(normalized_ids))
+        result = _transport.call_tool_sync(
+            tool_name="deleteTracesById",
+            arguments={"ids": normalized_ids},
+            timeout=60.0,
+            session_id=session_id,
+        )
+        return json.dumps({"ids": normalized_ids, "result": result}, ensure_ascii=False)
+    except Exception as e:
+        logger.error("deleteTracesById failed: %s", e)
+        return json.dumps({"ids": normalized_ids, "error": str(e)}, ensure_ascii=False)
+
+
+registry.register(
+    name="deleteTracesById",
+    toolset="pcb",
+    schema={
+        "name": "deleteTracesById",
+        "description": "Delete PCB traces by selected trace ids.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Trace ids returned by getSelectedElements.",
+                }
+            },
+            "required": ["ids"],
+        },
+    },
+    handler=lambda args, **kwargs: delete_traces_by_id(
+        args.get("ids", []),
         session_id=kwargs.get("session_id"),
     ),
     check_fn=lambda: _transport.get_adapter() is not None,
@@ -1056,7 +1236,14 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         # Step 5: 执行布线器
         logger.info("Resolved router profile: %s", router_type)
         if router_type == "arc":
-            _run_arc_router(work_dir, _router_profile_dir("arc", work_dir), component_refdes, constraints)
+            _run_arc_router(
+                work_dir,
+                _router_profile_dir("arc", work_dir),
+                component_refdes,
+                constraints,
+                order_lines,
+                project_data,
+            )
         else:
             _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
 
@@ -1121,4 +1308,721 @@ registry.register(
 )
 
 
-logger.info("PCB tools registered: getProjectData, GetSelectedElements, route")
+_NET_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]*")
+
+
+def extract_reroute_nets(user_text: str) -> list[str]:
+    """Extract net names from a natural-language reroute request."""
+    found: list[str] = []
+    text = str(user_text or "")
+    found.extend(match.group(0) for match in _NET_TOKEN_RE.finditer(text))
+    for quoted in re.findall(r"[`'\"“”‘’]([^`'\"“”‘’]{1,80})[`'\"“”‘’]", text):
+        candidate = quoted.strip()
+        if _NET_TOKEN_RE.fullmatch(candidate):
+            found.append(candidate)
+
+    seen: set[str] = set()
+    nets: list[str] = []
+    for raw in found:
+        net = raw.strip().strip("，。,.!?！？:：;；、")
+        key = net.casefold()
+        if net and key not in seen:
+            seen.add(key)
+            nets.append(net)
+    return nets
+
+
+def _parse_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return []
+    try:
+        return json.loads(text)
+    except Exception:
+        return value
+
+
+def _normalize_id_list(value: Any) -> list[str]:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, dict):
+        for key in ("ids", "selectedIds", "selectedTraceIds", "result"):
+            if key in parsed:
+                return _normalize_id_list(parsed[key])
+        return []
+    if isinstance(parsed, (list, tuple, set)):
+        ids: list[str] = []
+        for item in parsed:
+            raw = item.get("id") or item.get("ID") or item.get("uid") if isinstance(item, dict) else item
+            text = str(raw or "").strip()
+            if text:
+                ids.append(text)
+        return ids
+    return []
+
+
+def _delete_traces_succeeded(value: Any) -> bool:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, dict):
+        if parsed.get("success") is True or parsed.get("ok") is True:
+            return True
+        if parsed.get("success") is False or parsed.get("ok") is False:
+            return False
+        return any(_delete_traces_succeeded(parsed[key]) for key in ("result", "message", "status") if key in parsed)
+    text = str(parsed or "").strip().lower()
+    return bool(text) and (
+        "已成功删除" in text
+        or "成功" in text
+        or "success" in text
+        or text in {"ok", "true", "deleted"}
+    )
+
+
+def _first_text_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _read_board_file(path_text: str) -> tuple[str, str]:
+    if not path_text:
+        return "", ""
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        logger.warning("Board data path is not a file: %s", path_text)
+        return "", path_text
+    try:
+        return path.read_text(encoding="utf-8"), str(path)
+    except OSError as exc:
+        logger.warning("Failed reading board data file %s: %s", path_text, exc)
+        return "", str(path)
+
+
+def _extract_board_file_path_from_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    match = re.search(r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)", text)
+    return match.group(1) if match else ""
+
+
+def _nested_text_value(data: Dict[str, Any], *keys: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = None) -> str:
+    """
+    Rip up currently selected traces and cache the post-delete board for reroute.
+
+    Flow: getSelectedElements(PFindType=TRACES) -> deleteTracesById -> getProjectData.
+    """
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("drop_net", session_id)
+        logger.warning(msg)
+        return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": msg}, ensure_ascii=False)
+
+    try:
+        selected_result = _transport.call_tool_sync(
+            tool_name="getSelectedElements",
+            arguments={"PFindType": "TRACES"},
+            timeout=30.0,
+            session_id=session_id,
+        )
+        selected_trace_ids = _normalize_id_list(selected_result)
+        if not selected_trace_ids:
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": [],
+                    "error": "No selected traces were returned. Please box-select the traces to reroute first.",
+                },
+                ensure_ascii=False,
+            )
+        if len(selected_trace_ids) > 40:
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": selected_trace_ids,
+                    "error": "Selected trace count exceeds 40. Please reduce the box selection and rerun this skill.",
+                    "tooManySelectedElements": True,
+                    "selectionCount": len(selected_trace_ids),
+                },
+                ensure_ascii=False,
+            )
+
+        delete_result = _transport.call_tool_sync(
+            tool_name="deleteTracesById",
+            arguments={"ids": selected_trace_ids},
+            timeout=60.0,
+            session_id=session_id,
+        )
+        if not _delete_traces_succeeded(delete_result):
+            return json.dumps(
+                {
+                    "selectedNets": [],
+                    "selectedTraceIds": selected_trace_ids,
+                    "deleteResult": delete_result,
+                    "error": "deleteTracesById failed.",
+                },
+                ensure_ascii=False,
+            )
+
+        dropped_board_data = get_project_data(session_id=session_id)
+        original_board_path = _extract_board_file_path_from_text(userText)
+        payload = {
+            "selectedNets": [],
+            "selectedTraceIds": selected_trace_ids,
+            "dropResult": {"selectedResult": selected_result, "deleteResult": delete_result},
+            "deleteResult": delete_result,
+            "droppedBoardData": dropped_board_data,
+            "droppedBoardDataFilePath": "",
+            "originalBoardDataFilePath": original_board_path,
+            "droppedObjects": [{"id": trace_id, "type": "trace", "deleted": True} for trace_id in selected_trace_ids],
+            "localContext": {
+                "source": "getSelectedElements/deleteTracesById/getProjectData",
+                "selectionCount": len(selected_trace_ids),
+                "PFindType": "TRACES",
+                "projectID": projectID,
+            },
+        }
+        _transport.cache_reroute_context(payload, session_id=session_id)
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as e:
+        logger.error("drop_net failed: %s", e)
+        return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": str(e)}, ensure_ascii=False)
+
+
+registry.register(
+    name="drop_net",
+    toolset="pcb",
+    schema={
+        "name": "drop_net",
+        "description": (
+            "Use the frontend selection to rip up traces for local reroute. "
+            "Calls getSelectedElements(PFindType=TRACES), rejects selections over 40 ids, "
+            "then calls deleteTracesById and refreshes getProjectData."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "userText": {"type": "string", "description": "Original user request."},
+                "projectID": {"type": "string", "description": "Optional PCB project id."},
+            },
+            "required": ["userText"],
+        },
+    },
+    handler=lambda args, **kwargs: drop_net(
+        args.get("userText", ""),
+        projectID=args.get("projectID", ""),
+        session_id=kwargs.get("session_id"),
+    ),
+    check_fn=lambda: _transport.get_adapter() is not None,
+)
+
+
+def _build_fallback_reroute_payload(
+    *,
+    nets: list[str],
+    dropped_board_data: str,
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    check_report: Dict[str, Any],
+    explanation_suffix: str = "",
+    original_board_path: str = "",
+    selected_trace_ids: list[str] | None = None,
+) -> Dict[str, Any]:
+    selected_trace_ids = selected_trace_ids or []
+    reroute_result = {
+        "type": "local_reroute",
+        "mode": "selected_nets_after_drop" if nets else "selected_traces_after_delete",
+        "selectedNets": nets,
+        "selectedTraceIds": selected_trace_ids,
+        "operations": [
+            {"action": "reroute_net", "net": net, "scope": "local", "preserveOtherNets": True}
+            for net in nets
+        ] or [
+            {
+                "action": "reroute_selected_traces",
+                "traceIds": selected_trace_ids,
+                "scope": "local",
+                "preserveOtherNets": True,
+            }
+        ],
+        "constraints": constraints,
+        "droppedObjects": dropped_objects,
+        "localContext": local_context,
+        "originalBoardDataFilePath": original_board_path,
+        "droppedBoardDataFilePath": dropped_board_path,
+        "droppedBoardDataChars": len(dropped_board_data or ""),
+    }
+    explanation = "已基于拆线结果生成局部重布结果包；本结果限定在所选走线或 selectedNets 范围内，其他网络默认保护。"
+    if explanation_suffix:
+        explanation = f"{explanation}{explanation_suffix}"
+    return {"rerouteResult": reroute_result, "checkReport": check_report, "explanation": explanation}
+
+
+def _normalize_reroute_model_payload(
+    model_payload: Dict[str, Any],
+    *,
+    fallback_payload: Dict[str, Any],
+    context_stats: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    result = dict(fallback_payload)
+    if isinstance(model_payload.get("rerouteResult"), dict):
+        merged_result = dict(result["rerouteResult"])
+        merged_result.update(model_payload["rerouteResult"])
+        if context_stats:
+            merged_result.setdefault("contextStats", context_stats)
+        result["rerouteResult"] = merged_result
+    if isinstance(model_payload.get("checkReport"), dict):
+        result["checkReport"] = model_payload["checkReport"]
+    if isinstance(model_payload.get("explanation"), str) and model_payload["explanation"].strip():
+        result["explanation"] = model_payload["explanation"].strip()
+    for source_key in ("kicadPatch", "kicad_patch", "rawModelOutput"):
+        target_key = "kicadPatch" if source_key == "kicad_patch" else source_key
+        value = model_payload.get(source_key)
+        if isinstance(value, str) and value.strip():
+            result[target_key] = value.strip()
+    return result
+
+
+def _format_drc_iteration_history_for_prompt(history: list[Dict[str, Any]]) -> str:
+    if not history:
+        return "无"
+    return "\n\n".join(
+        json.dumps(
+            {
+                "iteration": item.get("iteration"),
+                "passed": item.get("passed"),
+                "kicadPatch": item.get("kicadPatch") or "",
+                "failureSummary": item.get("failureSummary") or "",
+                "drcResult": item.get("drcResult") or {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        for item in history
+    )
+
+
+def _build_reroute_generation_prompts(
+    *,
+    nets: list[str],
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    original_board_path: str,
+    context_text: str,
+    context_stats: Dict[str, Any],
+    drc_feedback: list[str] | None = None,
+    drc_iteration_history: list[Dict[str, Any]] | None = None,
+    selected_trace_ids: list[str] | None = None,
+) -> Dict[str, str]:
+    system_prompt = (
+        "你是一名 PCB 局部拆线重布助手。只输出 JSON，不要输出 Markdown、解释性段落或代码块。\n"
+        "必须生成 rerouteResult、checkReport、explanation，并尽量生成可回填 .kicad_pcb 的 kicadPatch。"
+    )
+    user_prompt = (
+        f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
+        f"selectedTraceIds:\n{json.dumps(selected_trace_ids or [], ensure_ascii=False, indent=2)}\n\n"
+        f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
+        f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
+        f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
+        f"originalBoardDataFilePath: {original_board_path or ''}\n\n"
+        f"droppedBoardDataFilePath: {dropped_board_path or ''}\n\n"
+        f"chunkStats:\n{json.dumps(context_stats, ensure_ascii=False, indent=2)}\n\n"
+        f"历史 DRC 迭代:\n{_format_drc_iteration_history_for_prompt(drc_iteration_history or [])}\n\n"
+        f"上一轮 DRC 失败反馈:\n{json.dumps(drc_feedback or [], ensure_ascii=False, indent=2)}\n\n"
+        f"拆线后版图分块上下文:\n{context_text}\n"
+    )
+    return {"system": system_prompt, "user": user_prompt}
+
+
+def _generate_reroute_with_model(
+    *,
+    nets: list[str],
+    dropped_board_data: str,
+    dropped_board_path: str,
+    dropped_objects: Any,
+    local_context: Any,
+    constraints: Any,
+    check_report: Dict[str, Any],
+    original_board_path: str = "",
+    drc_feedback: list[str] | None = None,
+    drc_iteration_history: list[Dict[str, Any]] | None = None,
+    selected_trace_ids: list[str] | None = None,
+) -> Dict[str, Any]:
+    fallback_payload = _build_fallback_reroute_payload(
+        nets=nets,
+        selected_trace_ids=selected_trace_ids,
+        dropped_board_data=dropped_board_data,
+        dropped_board_path=dropped_board_path,
+        dropped_objects=dropped_objects,
+        local_context=local_context,
+        constraints=constraints,
+        check_report=check_report,
+        original_board_path=original_board_path,
+    )
+    if not dropped_board_data:
+        return fallback_payload
+
+    try:
+        from tools import pcb_chunking_tool as chunking
+
+        runtime = chunking._resolve_model_runtime_config()
+        adapter = chunking._OpenAICompatibleChatAdapter(
+            base_url=runtime["base_url"],
+            model=runtime["model"],
+            api_key=runtime["api_key"],
+            timeout_s=300,
+        )
+        context_result = chunking._build_board_context(
+            dropped_board_data,
+            token_counter=adapter.get_token_counter(),
+        )
+        prompts = _build_reroute_generation_prompts(
+            nets=nets,
+            selected_trace_ids=selected_trace_ids,
+            dropped_board_path=dropped_board_path,
+            dropped_objects=dropped_objects,
+            local_context=local_context,
+            constraints=constraints,
+            original_board_path=original_board_path,
+            context_text=context_result["contextText"],
+            context_stats=context_result.get("stats") or {},
+            drc_feedback=drc_feedback,
+            drc_iteration_history=drc_iteration_history,
+        )
+        prompt_bundle = chunking._PromptBundle(system=prompts["system"], user=prompts["user"])
+        raw_text, _model_meta = adapter.generate(
+            prompt_bundle,
+            chunking._GenerationConfig(max_new_tokens=1600, temperature=0.1),
+        )
+        model_payload = chunking._extract_first_json_object(raw_text)
+        model_payload.setdefault("rawModelOutput", raw_text)
+        return _normalize_reroute_model_payload(
+            model_payload,
+            fallback_payload=fallback_payload,
+            context_stats=context_result.get("stats") or {},
+        )
+    except Exception as exc:
+        logger.warning("reroute model generation failed; using fallback payload: %s", exc)
+        return _build_fallback_reroute_payload(
+            nets=nets,
+            selected_trace_ids=selected_trace_ids,
+            dropped_board_data=dropped_board_data,
+            dropped_board_path=dropped_board_path,
+            dropped_objects=dropped_objects,
+            local_context=local_context,
+            constraints=constraints,
+            check_report=check_report,
+            original_board_path=original_board_path,
+            explanation_suffix=f"（模型重布生成不可用，已回退到结构化结果包：{exc}）",
+        )
+
+
+def _get_max_drc_iterations(user_data_obj: Dict[str, Any]) -> int:
+    raw = (
+        user_data_obj.get("maxDrcIterations")
+        or user_data_obj.get("max_drc_iterations")
+        or os.getenv("PCB_REROUTE_MAX_DRC_ITERATIONS")
+        or 5
+    )
+    try:
+        return max(0, min(20, int(raw)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _resolve_reroute_output_dir(user_data_obj: Dict[str, Any], original_board_path: str, session_id: str) -> str:
+    explicit = user_data_obj.get("routedBoardOutputDir") or user_data_obj.get("outputDir")
+    if explicit:
+        return str(Path(str(explicit)).expanduser())
+    if original_board_path:
+        return str(Path(original_board_path).expanduser().parent / ".hermes_reroute")
+    return str(Path(tempfile.gettempdir()) / "hermes_pcb_reroute" / (session_id or "session"))
+
+
+def _model_patch_text(payload: Dict[str, Any]) -> str:
+    for key in ("kicadPatch", "kicad_patch", "patchText"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any, original_board_path: str) -> Dict[str, Any]:
+    result = dict(payload)
+    reroute_result = dict(result.get("rerouteResult") or {})
+    attempts = [
+        {
+            "iteration": attempt.iteration,
+            "passed": attempt.passed,
+            "filledBoardDataFilePath": attempt.filled_board_data_file_path,
+            "fillDetail": attempt.fill_detail,
+            "drcResult": attempt.drc_result,
+            "failureSummary": attempt.failure_summary,
+        }
+        for attempt in validation.attempts
+    ]
+    reroute_result["drcPassed"] = validation.passed
+    reroute_result["drcIterations"] = len(validation.attempts)
+    reroute_result["drcAttempts"] = attempts
+    reroute_result["originalBoardDataFilePath"] = original_board_path
+    if validation.passed:
+        reroute_result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
+        result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
+    else:
+        reroute_result["routedBoardDataFilePath"] = original_board_path
+        result["routedBoardDataFilePath"] = original_board_path
+        reroute_result["drcFailureReasons"] = [
+            attempt.failure_summary for attempt in validation.attempts if attempt.failure_summary
+        ]
+    result["rerouteResult"] = reroute_result
+
+    check_report = dict(result.get("checkReport") or {})
+    checks = list(check_report.get("checks") or [])
+    checks.append(
+        {
+            "name": "drc_validation",
+            "passed": validation.passed,
+            "detail": "DRC passed" if validation.passed else validation.last_failure_summary,
+        }
+    )
+    check_report["checks"] = checks
+    check_report["passed"] = bool(check_report.get("passed", True)) and validation.passed
+    result["checkReport"] = check_report
+    if not validation.passed:
+        result["explanation"] = (
+            f"{result.get('explanation', '')} DRC 未通过，已返回原始版图文件地址：{original_board_path}。"
+            f"最后失败原因：{validation.last_failure_summary}"
+        ).strip()
+    return result
+
+
+def _run_reroute_drc_iterations(
+    *,
+    base_payload: Dict[str, Any],
+    original_board_data: str,
+    original_board_path: str,
+    output_dir: str,
+    sample_id: str,
+    max_iterations: int,
+    regenerate,
+) -> Dict[str, Any]:
+    from tools.pcb_reroute_drc import RerouteDrcValidation, validate_kicad_patch_with_drc
+
+    attempts = []
+    feedback: list[str] = []
+    iteration_history: list[Dict[str, Any]] = []
+    payload = base_payload
+    for iteration in range(1, max_iterations + 1):
+        if iteration > 1:
+            payload = regenerate(feedback, iteration_history)
+        patch_text = _model_patch_text(payload)
+        attempt = validate_kicad_patch_with_drc(
+            original_board_data=original_board_data,
+            model_output_text=patch_text,
+            output_dir=output_dir,
+            sample_id=sample_id,
+            iteration=iteration,
+        )
+        attempts.append(attempt)
+        if attempt.passed:
+            validation = RerouteDrcValidation(
+                passed=True,
+                routed_board_data_file_path=attempt.filled_board_data_file_path,
+                original_board_data_file_path=original_board_path,
+                attempts=attempts,
+            )
+            return _apply_drc_validation_to_payload(payload, validation=validation, original_board_path=original_board_path)
+        feedback.append(attempt.failure_summary)
+        iteration_history.append(
+            {
+                "iteration": iteration,
+                "passed": False,
+                "kicadPatch": patch_text,
+                "filledBoardDataFilePath": attempt.filled_board_data_file_path,
+                "fillDetail": attempt.fill_detail,
+                "drcResult": attempt.drc_result,
+                "failureSummary": attempt.failure_summary,
+            }
+        )
+
+    validation = RerouteDrcValidation(
+        passed=False,
+        routed_board_data_file_path=original_board_path,
+        original_board_data_file_path=original_board_path,
+        attempts=attempts,
+        last_failure_summary=feedback[-1] if feedback else "DRC validation did not run.",
+    )
+    return _apply_drc_validation_to_payload(payload, validation=validation, original_board_path=original_board_path)
+
+
+def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
+    """Generate a local selected-trace reroute payload from drop_net context."""
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("reroute", session_id)
+        logger.warning(msg)
+        return json.dumps({"rerouteResult": None, "checkReport": {"passed": False, "errors": [msg]}}, ensure_ascii=False)
+
+    try:
+        user_data_obj = json.loads(userData) if isinstance(userData, str) and userData.strip() else {}
+        if not isinstance(user_data_obj, dict):
+            user_data_obj = {}
+    except json.JSONDecodeError:
+        return json.dumps(
+            {"rerouteResult": None, "checkReport": {"passed": False, "errors": [f"无效的 userData JSON: {userData[:200]}"]}},
+            ensure_ascii=False,
+        )
+
+    cached = _transport.get_cached_reroute_context(session_id=session_id) or {}
+    nets = (
+        user_data_obj.get("selectedNets")
+        or user_data_obj.get("nets")
+        or cached.get("selectedNets")
+        or extract_reroute_nets(user_data_obj.get("userText", ""))
+    )
+    nets = [str(net).strip() for net in nets if str(net).strip()] if isinstance(nets, list) else []
+    selected_trace_ids = (
+        user_data_obj.get("selectedTraceIds")
+        or user_data_obj.get("traceIds")
+        or cached.get("selectedTraceIds")
+        or []
+    )
+    selected_trace_ids = [
+        str(trace_id).strip()
+        for trace_id in selected_trace_ids
+        if str(trace_id).strip()
+    ] if isinstance(selected_trace_ids, list) else []
+
+    if not nets and not selected_trace_ids:
+        return json.dumps(
+            {
+                "rerouteResult": None,
+                "checkReport": {
+                    "passed": False,
+                    "errors": ["Missing selectedNets or selectedTraceIds; cannot generate local reroute result."],
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    dropped_board_data = (
+        user_data_obj.get("droppedBoardData")
+        or cached.get("droppedBoardData")
+        or _transport.get_cached_project_data(session_id=session_id)
+        or ""
+    )
+    dropped_board_path = user_data_obj.get("droppedBoardDataFilePath") or cached.get("droppedBoardDataFilePath") or ""
+    if not dropped_board_data and dropped_board_path:
+        dropped_board_data, dropped_board_path = _read_board_file(str(dropped_board_path))
+
+    original_board_path = (
+        user_data_obj.get("originalBoardDataFilePath")
+        or cached.get("originalBoardDataFilePath")
+        or _nested_text_value(cached.get("localContext") or {}, "originalBoardDataFilePath", "boardDataFilePath")
+        or str(dropped_board_path or "")
+    )
+    original_board_data = user_data_obj.get("originalBoardData") or cached.get("originalBoardData") or ""
+    if not original_board_data and original_board_path:
+        original_board_data, original_board_path = _read_board_file(str(original_board_path))
+    if not original_board_data:
+        original_board_data = dropped_board_data
+
+    dropped_objects = user_data_obj.get("droppedObjects") or cached.get("droppedObjects") or []
+    local_context = user_data_obj.get("localContext") or cached.get("localContext") or {}
+    constraints = user_data_obj.get("constraints") or {}
+    max_drc_iterations = _get_max_drc_iterations(user_data_obj)
+    output_dir = _resolve_reroute_output_dir(user_data_obj, str(original_board_path or ""), session_id or "")
+
+    check_report = {
+        "passed": bool(dropped_board_data),
+        "checks": [
+            {"name": "selection", "passed": bool(nets or selected_trace_ids), "detail": f"selectedNets={len(nets)}, selectedTraceIds={len(selected_trace_ids)}"},
+            {"name": "dropped_board_data", "passed": bool(dropped_board_data), "detail": "已获得拆线后版图数据" if dropped_board_data else "未获得拆线后版图数据，按上下文请求生成"},
+            {"name": "connectivity_scope", "passed": True, "detail": "仅对所选走线或 selectedNets 生成局部重布请求，不触碰其他网络"},
+        ],
+    }
+
+    payload = _generate_reroute_with_model(
+        nets=nets,
+        selected_trace_ids=selected_trace_ids,
+        dropped_board_data=dropped_board_data,
+        dropped_board_path=str(dropped_board_path or ""),
+        dropped_objects=dropped_objects,
+        local_context=local_context,
+        constraints=constraints,
+        check_report=check_report,
+        original_board_path=str(original_board_path or ""),
+    )
+    if max_drc_iterations > 0 and original_board_data and _model_patch_text(payload):
+        def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
+            return _generate_reroute_with_model(
+                nets=nets,
+                selected_trace_ids=selected_trace_ids,
+                dropped_board_data=dropped_board_data,
+                dropped_board_path=str(dropped_board_path or ""),
+                dropped_objects=dropped_objects,
+                local_context=local_context,
+                constraints=constraints,
+                check_report=check_report,
+                original_board_path=str(original_board_path or ""),
+                drc_feedback=feedback,
+                drc_iteration_history=iteration_history,
+            )
+
+        payload = _run_reroute_drc_iterations(
+            base_payload=payload,
+            original_board_data=original_board_data,
+            original_board_path=str(original_board_path or ""),
+            output_dir=output_dir,
+            sample_id=f"{session_id or 'reroute'}_{'_'.join(nets or selected_trace_ids)}",
+            max_iterations=max_drc_iterations,
+            regenerate=_regenerate,
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+registry.register(
+    name="reroute",
+    toolset="pcb",
+    schema={
+        "name": "reroute",
+        "description": (
+            "基于 drop_net 的拆线后上下文生成局部拆线重布结果包。"
+            "用于局部重布流程，不调用全局 BGA fanout router。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "userData": {
+                    "type": "string",
+                    "description": (
+                        "可选 JSON 字符串，可包含 selectedNets、selectedTraceIds、droppedBoardData、"
+                        "droppedBoardDataFilePath、originalBoardDataFilePath、localContext、constraints。"
+                    ),
+                }
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kwargs: reroute(args.get("userData", ""), session_id=kwargs.get("session_id")),
+    check_fn=lambda: True,
+)
+
+
+logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, route, drop_net, reroute")

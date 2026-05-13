@@ -66,11 +66,14 @@ jobs:
           # exe + _internal
           Copy-Item -Recurse dist\agent\* $PKG\
 
-          # PCB skill
-          New-Item -ItemType Directory -Force "$PKG\skills\hardware\pcb-intelligence" | Out-Null
-          if (Test-Path "skills\hardware\pcb-intelligence") {
-            Copy-Item -Recurse "skills\hardware\pcb-intelligence\*" `
-              "$PKG\skills\hardware\pcb-intelligence\"
+          # PCB skills
+          foreach ($skillName in @("pcb-intelligence", "pcb-reroute")) {
+            $skillSrc = "skills\hardware\$skillName"
+            $skillDst = "$PKG\skills\hardware\$skillName"
+            if (Test-Path $skillSrc) {
+              New-Item -ItemType Directory -Force $skillDst | Out-Null
+              Copy-Item -Recurse "$skillSrc\*" $skillDst
+            }
           }
 
           # Delivery scripts and templates

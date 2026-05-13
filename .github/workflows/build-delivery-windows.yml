@@ -180,14 +180,16 @@ jobs:
           pause
           "@ | Out-File -FilePath dist\agent\uninstall.bat -Encoding utf8
 
-      - name: Copy PCB skill
+      - name: Copy PCB skills
         shell: pwsh
         run: |
-          $skillSrc = "skills\hardware\pcb-intelligence"
-          $skillDst = "dist\agent\skills\hardware\pcb-intelligence"
-          if (Test-Path $skillSrc) {
-            New-Item -ItemType Directory -Force -Path $skillDst | Out-Null
-            Copy-Item -Recurse -Force "$skillSrc\*" $skillDst
+          foreach ($skillName in @("pcb-intelligence", "pcb-reroute")) {
+            $skillSrc = "skills\hardware\$skillName"
+            $skillDst = "dist\agent\skills\hardware\$skillName"
+            if (Test-Path $skillSrc) {
+              New-Item -ItemType Directory -Force -Path $skillDst | Out-Null
+              Copy-Item -Recurse -Force "$skillSrc\*" $skillDst
+            }
           }
 
       - name: Copy delivery docs

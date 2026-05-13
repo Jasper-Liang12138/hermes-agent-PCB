@@ -52,9 +52,14 @@ def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
     router_dir.mkdir()
     work_dir.mkdir()
 
-    _write_step(router_dir / "a.out", "assert sys.argv[1:] == ['layout_input.txt', 'component_input.txt']; (cwd / 'U27_pins.csv').write_text('PinNumber,Net\\n1,U27.NET1\\n', encoding='utf-8'); (cwd / 'layer_input.txt').write_text('layers', encoding='utf-8')")
-    _write_step(router_dir / "b.out", "assert sys.argv[1:] == ['layer_input.txt', 'layout_input.txt']; (cwd / 'order_input.txt').read_text(encoding='utf-8')")
-    _write_step(router_dir / "c.out", "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt']; (cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')")
+    _write_step(
+        router_dir / "c.out",
+        "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt', 'component_input.txt']; "
+        "assert (cwd / 'layer_input.txt').read_text(encoding='utf-8') == 'NET_A_P_SIG03 SIG03\\nNET_A_N_SIG03 SIG03\\n\\nU27'; "
+        "(cwd / 'U27_pins.csv').write_text('PinNumber,Net\\n1,U27.NET1\\n', encoding='utf-8'); "
+        "(cwd / 'net_list.txt').write_text('NET_A_P_SIG03 ; J1.A1 U27.A1 ; 3.00\\nNET_A_N_SIG03 ; J1.A2 U27.A2 ; 3.00\\n', encoding='utf-8'); "
+        "(cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')",
+    )
     _write_step(router_dir / "Turn_QYF.py", "assert sys.argv[1:] == ['layout_input.txt', 'ARC_output.txt', 'routing_input.txt']; (cwd / 'routing_input.txt').write_text('(arc full chain)', encoding='utf-8'); (cwd / 'data.txt').write_text('arc report', encoding='utf-8')")
 
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
@@ -68,13 +73,52 @@ def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
     result = pcb_tools.route_bga(json.dumps({
         "routerType": "arc",
         "selectedBGA": "U27",
-        "orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}],
+        "orderLines": [
+            {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+            {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+        ],
         "constraints": {"LineWidth": 3, "LineSpacing": 4.5},
     }))
 
     _assert_route_summary(result, "arc report", work_dir / "routing_input.txt", "arc-e2e")
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U27\n"
     assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "LineWidth:3\nLineSpacing:4.5\n"
+
+
+def test_arc_adapter_runs_pins_helper_when_router_does_not_emit_pin_csv(monkeypatch, tmp_path):
+    router_dir = tmp_path / "arc_runtime"
+    work_dir = tmp_path / "arc_work"
+    router_dir.mkdir()
+    work_dir.mkdir()
+
+    _write_step(router_dir / "get_pins.py", "assert sys.argv[1:] == ['layout_input.txt', 'U27']; (cwd / 'U27_pins.csv').write_text('PinNumber,Net\\n1,U27.NET1\\n', encoding='utf-8')")
+    _write_step(
+        router_dir / "c.out",
+        "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt', 'component_input.txt']; "
+        "(cwd / 'net_list.txt').write_text('NET_A_P_SIG03 ; J1.A1 U27.A1 ; 3.00\\nNET_A_N_SIG03 ; J1.A2 U27.A2 ; 3.00\\n', encoding='utf-8'); "
+        "(cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')",
+    )
+    _write_step(router_dir / "Turn_QYF.py", "(cwd / 'routing_input.txt').write_text('(arc helper)', encoding='utf-8'); (cwd / 'data.txt').write_text('arc helper report', encoding='utf-8')")
+
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "arc-helper"
+    transport.set_session_mode("arc-helper", "pcb")
+    transport._cached_project_data["arc-helper"] = '(pcb_data (component (name "U27") (package "BGA")))'
+
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("ROUTER_ARC_DIR", str(router_dir))
+
+    result = pcb_tools.route_bga(json.dumps({
+        "routerType": "arc",
+        "selectedBGA": "U27",
+        "orderLines": [
+            {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+            {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+        ],
+    }))
+
+    _assert_route_summary(result, "arc helper report", work_dir / "routing_input.txt", "arc-helper")
+    assert (work_dir / "U27_pins.csv").exists()
 
 
 def test_135_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
@@ -107,6 +151,36 @@ def test_135_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
     assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "VCC SIG04 2\n\nU22"
 
 
+def test_135_adapter_runs_pins_helper_when_router_does_not_emit_pin_csv(monkeypatch, tmp_path):
+    router_dir = tmp_path / "runtime135"
+    work_dir = tmp_path / "work135"
+    router_dir.mkdir()
+    work_dir.mkdir()
+
+    _write_step(router_dir / "d.out", "(cwd / 'net_list.txt').write_text('U22.NET1; layer; 4\\n', encoding='utf-8')")
+    _write_step(router_dir / "get_135_pins.py", "assert sys.argv[1:] == ['layout_input.txt', 'U22']; (cwd / 'U22_pins.csv').write_text('PinNumber,Net\\n1,U22.NET1\\n', encoding='utf-8')")
+    _write_step(router_dir / "e.out", "(cwd / 'order_out.txt').write_text('order', encoding='utf-8')")
+    _write_step(router_dir / "f.out", "(cwd / 'line.in').write_text('line in', encoding='utf-8'); (cwd / 'line.out').write_text('TOP!LINE!0!NET1!1!2!3!4!4\\n', encoding='utf-8')")
+    _write_step(router_dir / "Turn_135_QYF.py", "(cwd / 'routing_input.txt').write_text('(135 helper)', encoding='utf-8'); (cwd / 'data.txt').write_text('135 helper report', encoding='utf-8')")
+
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "135-helper"
+    transport.set_session_mode("135-helper", "pcb")
+    transport._cached_project_data["135-helper"] = '(pcb_data (component (name "U22") (package "BGA")))'
+
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(work_dir))
+    monkeypatch.setenv("ROUTER_135_DIR", str(router_dir))
+
+    result = pcb_tools.route_bga(json.dumps({
+        "routerType": "135",
+        "selectedBGA": "U22",
+        "orderLines": [{"net": "VCC", "layer": "SIG04", "order": 2}],
+    }))
+
+    _assert_route_summary(result, "135 helper report", work_dir / "routing_input.txt", "135-helper")
+    assert (work_dir / "U22_pins.csv").exists()
+
+
 def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
     arc_work = tmp_path / "arc_work"
     work135 = tmp_path / "work135"
@@ -116,9 +190,7 @@ def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
         path.mkdir()
 
     for name, body in {
-        "a.out": "assert sys.argv[1:] == ['layout_input.txt', 'component_input.txt']; (cwd / 'U1_pins.csv').write_text('PinNumber,Net\\n1,U1.NET1\\n', encoding='utf-8'); (cwd / 'layer_input.txt').write_text('layers', encoding='utf-8')",
-        "b.out": "assert sys.argv[1:] == ['layer_input.txt', 'layout_input.txt']; (cwd / 'order_input.txt').read_text(encoding='utf-8')",
-        "c.out": "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt']; (cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')",
+        "c.out": "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt', 'component_input.txt']; (cwd / 'U1_pins.csv').write_text('PinNumber,Net\\n1,U1.NET1\\n', encoding='utf-8'); (cwd / 'net_list.txt').write_text('NET_A_P_SIG03 ; J1.A1 U1.A1 ; 3.00\\nNET_A_N_SIG03 ; J1.A2 U1.A2 ; 3.00\\n', encoding='utf-8'); (cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')",
         "Turn_QYF.py": "assert sys.argv[1:] == ['layout_input.txt', 'ARC_output.txt', 'routing_input.txt']; (cwd / 'routing_input.txt').write_text('(arc selected)', encoding='utf-8'); (cwd / 'data.txt').write_text('arc report', encoding='utf-8')",
     }.items():
         _write_step(arc_runtime / name, body)
@@ -133,7 +205,10 @@ def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     base_payload = {
         "selectedBGA": "U1",
-        "orderLines": [{"net": "NET1", "layer": "SIG03", "order": 1}],
+        "orderLines": [
+            {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+            {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+        ],
         "constraints": {"LineWidth": 3, "LineSpacing": 4.5},
     }
 
@@ -152,4 +227,5 @@ def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
 
         result = pcb_tools.route_bga(json.dumps({**base_payload, **override}))
         _assert_route_summary(result, expected_report, work_dir / "routing_input.txt", session_id)
-        assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "NET1 SIG03 1\n\nU1"
+        expected_order = "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU1"
+        assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == expected_order

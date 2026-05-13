@@ -15,17 +15,20 @@ metadata:
 
 ## 概述
 
-本技能实现 BGA 扇出布线的全流程 AI 辅助，通过自然语言与用户交互，自动调用北科大规则布线器完成逃逸布线计算。
+本技能实现 BGA 扇出布线的全流程 AI 辅助，通过自然语言与用户交互，自动调用 Windows 原生 `arc` 或 `135` 布线器完成逃逸布线计算。
 
 对接启云方 PCB 设计工具，通过 WebSocket 双向通信，支持以下场景：
 1. **完整布线流程**：获取项目数据 → BGA 选择 → 生成扇出参数 → 执行布线 → 返回结果
 2. **对话查询**：项目信息查询、版本查询、工具列表查询
+
+如果用户明确要求“拆线后重布”“删除选中走线后 reroute”“局部重布”等局部拆线重布任务，不使用本技能的 `route` 主链路，应进入 `hardware/pcb-reroute` skill。
 
 ## 工具
 
 | 工具名 | 类型 | 功能 |
 |--------|------|------|
 | `getProjectData` | WebSocket 代理 | 获取 PCB 项目 S 表达式数据 |
+| `pcb_extract_bga` | 本地分析 | 从缓存版图中提取 BGA 列表、板级摘要和扇出上下文 |
 | `route` | 本地 adapter 调用 | 执行 BGA 扇出布线，根据 `routerType` 选择 `arc` 或 `135`，返回 `routingResult` 文件路径和报告，不向前端发送 `route` 工具调用 |
 
 ## Agent 工作流程（系统提示词控制，方案 A）
@@ -37,9 +40,10 @@ Step 1: 调用 getProjectData 获取版图数据
 Step 2: 分析数据，识别 BGA 元件列表
 Step 3: 如果存在多个 BGA，返回 selection 列表让用户选择
 Step 4: 用户选择后，生成扇出参数（逃逸层分配 + 逃逸顺序）
-Step 5: 返回 fanoutParams 给用户确认（可修改）
-Step 6: 用户确认后，调用 route 工具执行布线
-Step 7: 布线完成，返回 routingResult 文件路径 + 报告
+Step 5: 用户选择走线算法 arc 或 135
+Step 6: 返回 fanoutParams 给用户确认（可修改）
+Step 7: 用户确认后，调用 route 工具执行布线
+Step 8: 布线完成，返回 routingResult 文件路径 + 报告
 ```
 
 ## 系统提示词
@@ -156,6 +160,7 @@ Step 7: 布线完成，返回 routingResult 文件路径 + 报告
 - `##PCB_FIELDS##` 内的 JSON 必须完整、闭合、不可截断；不要在该区域内写解释文字或 Markdown
 - 不要重复输出同一段说明；流式回复时只输出一次最终说明
 - `routingResult` 必须是绝对文件路径字符串，指向 `routing_input.txt`，不是 S 表达式正文；正文只写简短总结
+- 本技能只做全局 BGA fanout/逃逸布线。局部拆线重布请求必须切换到 `hardware/pcb-reroute`，不要在本技能中调用 `drop_net` 或 `reroute`
 
 ## fanoutParams 格式规范（重要）
 

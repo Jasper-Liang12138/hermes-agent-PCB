@@ -8,4 +8,5 @@ if not exist "%USERPROFILE%\.hermes\.env" (
     exit /b 1
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sync_config.ps1"
 agent.exe %*

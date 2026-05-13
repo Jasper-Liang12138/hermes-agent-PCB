@@ -10,14 +10,14 @@ def test_wait_selection_accepts_non_u_candidate_label():
 
     adapter._update_route_state_from_fields(
         session_id,
-        {"selection": [{"label": "FPGA1", "detail": "BGA-1156"}]},
+        {"selection": [{"label": "FPGA1", "detail": "BGA-1156"}, {"label": "U27", "detail": "BGA-256"}]},
     )
 
     decision = adapter._decide_route(session_id, "选择 FPGA1")
 
     assert decision.mode == "pcb"
-    assert decision.reason == "selection_step"
-    assert decision.immediate_reply is None
+    assert decision.reason == "selection_step_wait_router_type"
+    assert "请回复 `arc` 或 `135`" in (decision.immediate_reply or "")
     assert adapter._session_selected_targets[session_id] == "FPGA1"
 
 
@@ -33,8 +33,8 @@ def test_wait_selection_accepts_label_embedded_in_route_request():
     decision = adapter._decide_route(session_id, "对 U27 布线")
 
     assert decision.mode == "pcb"
-    assert decision.reason == "selection_step"
-    assert decision.immediate_reply is None
+    assert decision.reason == "selection_step_wait_router_type"
+    assert "请回复 `arc` 或 `135`" in (decision.immediate_reply or "")
     assert adapter._session_selected_targets[session_id] == "U27"
 
 
@@ -44,7 +44,7 @@ def test_wait_selection_rejects_label_outside_current_candidates():
 
     adapter._update_route_state_from_fields(
         session_id,
-        {"selection": [{"label": "FPGA1", "detail": "BGA-1156"}]},
+        {"selection": [{"label": "FPGA1", "detail": "BGA-1156"}, {"label": "U35", "detail": "BGA-484"}]},
     )
 
     decision = adapter._decide_route(session_id, "选择 U27")

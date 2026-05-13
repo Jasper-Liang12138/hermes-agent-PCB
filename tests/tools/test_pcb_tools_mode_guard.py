@@ -10,6 +10,7 @@ import pytest
 
 from model_tools import handle_function_call
 from tools import pcb_tools
+from tools import pcb_reroute_drc
 
 
 def _pin_csv(component: str) -> str:
@@ -29,12 +30,14 @@ def _restore_transport_state():
     prev_session = transport.current_session_id
     prev_modes = dict(transport._session_modes)
     prev_cache = dict(transport._cached_project_data)
+    prev_reroute_cache = dict(transport._cached_reroute_context)
     prev_adapter = transport._websocket_adapter
     prev_loop = transport._main_loop
     yield
     transport.current_session_id = prev_session
     transport._session_modes = prev_modes
     transport._cached_project_data = prev_cache
+    transport._cached_reroute_context = prev_reroute_cache
     transport._websocket_adapter = prev_adapter
     transport._main_loop = prev_loop
 
@@ -391,3 +394,332 @@ def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
         "e.out",
         "f.out",
     ]
+
+
+def test_extract_reroute_nets_from_user_text():
+    assert pcb_tools.extract_reroute_nets("请把 BGA U2 的 net13、net17 拆线后重新布线") == ["net13", "net17"]
+    assert pcb_tools.extract_reroute_nets("reroute NET_A1 and net_A1, then net/B2") == ["NET_A1", "net/B2"]
+    assert pcb_tools.extract_reroute_nets("这里只解释概念，不指定网络") == []
+
+
+def test_drop_net_blocked_in_chat_mode():
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-chat-drop"
+    transport.set_session_mode("sess-chat-drop", "chat")
+
+    result = pcb_tools.drop_net("请把 net13 拆线后重布", projectID="proj1")
+    payload = json.loads(result)
+
+    assert payload["selectedNets"] == []
+    assert "chat" in payload["error"]
+
+
+def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop"
+    transport.set_session_mode("sess-pcb-drop", "pcb")
+    calls = []
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        calls.append((tool_name, arguments, timeout, session_id))
+        if tool_name == "getSelectedElements":
+            return {"ids": ["2386476278", "3424247826"]}
+        if tool_name == "deleteTracesById":
+            return "已成功删除"
+        if tool_name == "getProjectData":
+            return "(pcb after delete)"
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    payload = json.loads(result)
+
+    assert calls == [
+        ("getSelectedElements", {"PFindType": "TRACES"}, 30.0, "sess-pcb-drop"),
+        ("deleteTracesById", {"ids": ["2386476278", "3424247826"]}, 60.0, "sess-pcb-drop"),
+        ("getProjectData", {}, 30.0, "sess-pcb-drop"),
+    ]
+    assert payload["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert payload["droppedBoardData"] == "(pcb after delete)"
+    cached = transport.get_cached_reroute_context("sess-pcb-drop")
+    assert cached["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert cached["localContext"]["source"] == "getSelectedElements/deleteTracesById/getProjectData"
+
+
+def test_drop_net_rejects_too_many_selected_traces(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-many"
+    transport.set_session_mode("sess-pcb-drop-many", "pcb")
+    calls = []
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        calls.append(tool_name)
+        if tool_name == "getSelectedElements":
+            return {"ids": [str(index) for index in range(41)]}
+        raise AssertionError("delete/getProjectData should not be called")
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    payload = json.loads(result)
+
+    assert calls == ["getSelectedElements"]
+    assert payload["tooManySelectedElements"] is True
+    assert payload["selectionCount"] == 41
+    assert transport.get_cached_reroute_context("sess-pcb-drop-many") is None
+
+
+def test_drop_net_rejects_non_json_selected_trace_string(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-strict"
+    transport.set_session_mode("sess-pcb-drop-strict", "pcb")
+    calls = []
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        calls.append(tool_name)
+        if tool_name == "getSelectedElements":
+            return "['2386476278', '3424247826']"
+        raise AssertionError("strict parsing should reject non-JSON selection strings")
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    payload = json.loads(result)
+
+    assert calls == ["getSelectedElements"]
+    assert payload["selectedTraceIds"] == []
+    assert "No selected traces" in payload["error"]
+
+
+def test_reroute_uses_cached_drop_context(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute"
+    transport.set_session_mode("sess-pcb-reroute", "pcb")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13", "net17"],
+            "droppedBoardData": "(pcb after drop)",
+            "droppedObjects": [{"net": "net13"}],
+            "localContext": {"bbox": [0, 0, 10, 10]},
+        },
+        session_id="sess-pcb-reroute",
+    )
+    monkeypatch.setattr(
+        pcb_tools,
+        "_generate_reroute_with_model",
+        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    )
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["type"] == "local_reroute"
+    assert payload["rerouteResult"]["selectedNets"] == ["net13", "net17"]
+    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
+    assert payload["checkReport"]["passed"] is True
+    assert "局部重布" in payload["explanation"]
+
+
+def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-traces"
+    transport.set_session_mode("sess-pcb-reroute-traces", "pcb")
+    transport.cache_reroute_context(
+        {
+            "selectedTraceIds": ["2386476278", "3424247826"],
+            "droppedBoardData": "(pcb after delete)",
+            "droppedObjects": [{"id": "2386476278", "type": "trace"}],
+            "localContext": {"selectionCount": 2},
+        },
+        session_id="sess-pcb-reroute-traces",
+    )
+    monkeypatch.setattr(
+        pcb_tools,
+        "_generate_reroute_with_model",
+        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    )
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-traces")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["mode"] == "selected_traces_after_delete"
+    assert payload["rerouteResult"]["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_selected_traces"
+    assert payload["checkReport"]["passed"] is True
+
+
+def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-file"
+    transport.set_session_mode("sess-pcb-reroute-file", "pcb")
+    board_path = tmp_path / "after_drop.kicad_pcb"
+    board_path.write_text("(pcb after drop model input)", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardDataFilePath": str(board_path),
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-file",
+    )
+    seen = {}
+
+    def _fake_generate(**kwargs):
+        seen.update(kwargs)
+        payload = pcb_tools._build_fallback_reroute_payload(**kwargs)
+        payload["rerouteResult"]["source"] = "fake_model"
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-file")
+    payload = json.loads(result)
+
+    assert seen["dropped_board_data"] == "(pcb after drop model input)"
+    assert seen["dropped_board_path"] == str(board_path)
+    assert payload["rerouteResult"]["source"] == "fake_model"
+
+
+def test_reroute_drc_pass_returns_routed_board_path(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-pass"
+    transport.set_session_mode("sess-pcb-reroute-drc-pass", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    dropped_path = tmp_path / "after_drop.kicad_pcb"
+    dropped_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardDataFilePath": str(dropped_path),
+            "originalBoardDataFilePath": str(original_path),
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-drc-pass",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{key: value for key, value in kwargs.items() if key not in {"drc_feedback", "drc_iteration_history"}}
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-drc-pass")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(tmp_path / "routed.kicad_pcb")
+    assert payload["rerouteResult"]["originalBoardDataFilePath"] == str(original_path)
+    assert payload["checkReport"]["passed"] is True
+
+
+def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-retry"
+    transport.set_session_mode("sess-pcb-reroute-drc-retry", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-drc-retry",
+    )
+    generate_feedback: list[list[str]] = []
+    generate_history: list[list[dict]] = []
+
+    def _fake_generate(**kwargs):
+        generate_feedback.append(list(kwargs.get("drc_feedback") or []))
+        generate_history.append(list(kwargs.get("drc_iteration_history") or []))
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{key: value for key, value in kwargs.items() if key not in {"drc_feedback", "drc_iteration_history"}}
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        if kwargs["iteration"] == 1:
+            return pcb_reroute_drc.RerouteDrcAttempt(
+                iteration=1,
+                passed=False,
+                failure_summary='hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}',
+            )
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=2,
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed_iter2.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(json.dumps({"maxDrcIterations": 3}, ensure_ascii=False), session_id="sess-pcb-reroute-drc-retry")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert payload["rerouteResult"]["drcIterations"] == 2
+    assert generate_feedback[0] == []
+    assert generate_feedback[1] == ['hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}']
+    assert generate_history[0] == []
+    assert generate_history[1][0]["iteration"] == 1
+    assert generate_history[1][0]["kicadPatch"].startswith("(segment")
+    assert generate_history[1][0]["failureSummary"] == 'hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}'
+
+
+def test_reroute_drc_failure_returns_original_board_path(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-fail"
+    transport.set_session_mode("sess-pcb-reroute-drc-fail", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-drc-fail",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{key: value for key, value in kwargs.items() if key not in {"drc_feedback", "drc_iteration_history"}}
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=False,
+            failure_summary=f"iteration {kwargs['iteration']} failed",
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    result = pcb_tools.reroute(json.dumps({"maxDrcIterations": 2}, ensure_ascii=False), session_id="sess-pcb-reroute-drc-fail")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is False
+    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(original_path)
+    assert payload["rerouteResult"]["drcFailureReasons"] == ["iteration 1 failed", "iteration 2 failed"]
+    assert payload["checkReport"]["passed"] is False

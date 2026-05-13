@@ -85,12 +85,13 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
         "host": "127.0.0.1",
         "port": port,
         "route_intent_llm_enabled": False,
+        "trace_pcb_messages": False,
     }
     merged_extra.update(extra)
     return WebSocketAdapter(PlatformConfig(enabled=True, extra=merged_extra))
 
 
-async def _run_websocket_pcb_flow_round_trip() -> None:
+async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     """Covers selection -> fanoutParams -> routingResult over real WebSocket I/O."""
     port = _free_port()
     adapter = _make_adapter(port)
@@ -100,6 +101,7 @@ async def _run_websocket_pcb_flow_round_trip() -> None:
     observed_user_text: list[str] = []
 
     fanout_params = {
+        "routerType": "arc",
         "orderLines": [
             {"net": "GND", "layer": "SIG03", "order": 1},
             {"net": "VCC", "layer": "SIG03", "order": 2},
@@ -114,6 +116,14 @@ async def _run_websocket_pcb_flow_round_trip() -> None:
         ),
         "report": "布线连通率: 100%",
     }
+    from tools import pcb_tools
+
+    def _fake_route_bga(user_data: str, session_id: str | None = None) -> str:
+        assert session_id == "sess-pcb-1"
+        assert json.loads(user_data) == {**fanout_params, "selectedBGA": "U27"}
+        return json.dumps(route_result, ensure_ascii=False)
+
+    monkeypatch.setattr(pcb_tools, "route_bga", _fake_route_bga)
 
     async def handler(event):
         observed_user_text.append(event.text)
@@ -130,7 +140,7 @@ async def _run_websocket_pcb_flow_round_trip() -> None:
                 "##PCB_FIELDS_END##"
             )
 
-        if "选择 U27" in event.text:
+        if "routerType 已确定为 arc" in event.text:
             return (
                 "已生成扇出参数，请确认。\n\n"
                 "##PCB_FIELDS##\n"
@@ -186,38 +196,167 @@ async def _run_websocket_pcb_flow_round_trip() -> None:
                 ]
 
                 await ws.send_str(_user_message(session_id, project_id, "选择 U27"))
+                router_msg = await _recv_json(ws)
+                assert router_msg["type"] == "message"
+                assert "请选择走线算法类型" in router_msg["body"]["content"]
+
+                await ws.send_str(_user_message(session_id, project_id, "arc"))
                 fanout_msg = await _recv_json(ws)
                 assert fanout_msg["type"] == "message"
                 assert fanout_msg["body"]["fanoutParams"] == fanout_params
 
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
-                route_call = await _recv_json(ws)
-                assert route_call["type"] == "tool-calls"
-                assert route_call["body"]["content"]["name"] == "route"
-                assert json.loads(route_call["body"]["content"]["arguments"]["userData"]) == fanout_params
-                await ws.send_str(
-                    _tool_result(
-                        route_call["body"]["content"]["id"],
-                        route_result,
-                    )
-                )
-
                 routed_msg = await _recv_json(ws)
+                if routed_msg["type"] == "message" and routed_msg["body"]["content"].startswith("已确认，正在调用"):
+                    routed_msg = await _recv_json(ws)
                 assert routed_msg["type"] == "message"
+                assert routed_msg["body"]["isFinal"] is True
                 assert routed_msg["body"]["routingResult"] == route_result["routingResult"]
 
     finally:
         await adapter.disconnect()
 
-    assert len(observed_user_text) == 3
+    assert len(observed_user_text) == 2
     assert "帮我进行BGA逃逸布线" in observed_user_text[0]
     assert "不要再次调用 getProjectData" in observed_user_text[0]
-    assert observed_user_text[1].endswith("选择 U27")
-    assert observed_user_text[2].endswith("确认")
+    assert "routerType 已确定为 arc" in observed_user_text[1]
 
 
-def test_websocket_pcb_flow_round_trip():
-    asyncio.get_event_loop().run_until_complete(_run_websocket_pcb_flow_round_trip())
+def test_websocket_pcb_flow_round_trip(monkeypatch):
+    asyncio.get_event_loop().run_until_complete(_run_websocket_pcb_flow_round_trip(monkeypatch))
+
+
+def test_websocket_reroute_intent_loads_reroute_skill_without_bootstrap():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-intent"
+
+    decision = adapter._decide_route(
+        session_id,
+        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+    )
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
+def test_websocket_reroute_short_command_works_in_pcb_context():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-short"
+    adapter._set_session_mode(session_id, "pcb")
+
+    decision = adapter._decide_route(session_id, "拆线重布")
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
+def test_websocket_reroute_interrupts_pending_fanout_confirmation():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-interrupt"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+    }
+
+    decision = adapter._decide_route(session_id, "拆线重布")
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.reason == "pcb_reroute_selected"
+    assert adapter._session_flow_states[session_id] == "idle"
+    assert session_id not in adapter._session_fanout_params
+
+
+def test_websocket_reroute_llm_intent_takes_priority_over_keyword_fallback():
+    adapter = _make_adapter()
+
+    chat_decision = adapter._decide_route(
+        "sess-reroute-llm-chat",
+        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+        llm_intent={
+            "intent": "chat",
+            "route_mode": "chat",
+            "confidence": 0.91,
+            "should_call_get_project_data": False,
+        },
+    )
+    assert chat_decision.mode == "chat"
+    assert chat_decision.intent == "chat"
+
+    reroute_decision = adapter._decide_route(
+        "sess-reroute-llm-direct",
+        "把这些未布通网络重新整理一下",
+        llm_intent={
+            "intent": "pcb_reroute_selected",
+            "route_mode": "pcb",
+            "confidence": 0.88,
+            "should_call_get_project_data": False,
+        },
+    )
+    assert reroute_decision.mode == "pcb"
+    assert reroute_decision.intent == "pcb_reroute_selected"
+    assert reroute_decision.bootstrap_get_project is False
+
+
+async def _run_websocket_reroute_fields_round_trip() -> None:
+    port = _free_port()
+    adapter = _make_adapter(port)
+    session_id = "sess-reroute-fields"
+    project_id = "proj-reroute-001"
+    observed_auto_skill: list[str | None] = []
+
+    reroute_fields = {
+        "rerouteResult": {
+            "type": "local_reroute",
+            "selectedNets": ["net13", "net17"],
+            "operations": [{"action": "reroute_net", "net": "net13"}],
+        },
+        "checkReport": {"passed": True, "checks": []},
+        "explanation": "局部重布结果已生成",
+    }
+
+    async def handler(event):
+        observed_auto_skill.append(event.auto_skill)
+        assert "不要再次调用 getProjectData" not in event.text
+        return (
+            "已完成局部拆线重布。\n\n"
+            "##PCB_FIELDS##\n"
+            f"{json.dumps(reroute_fields, ensure_ascii=False)}\n"
+            "##PCB_FIELDS_END##"
+        )
+
+    adapter.set_message_handler(handler)
+    await adapter.connect()
+
+    try:
+        uri = f"http://127.0.0.1:{port}"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
+                await ws.send_str(
+                    _user_message(
+                        session_id,
+                        project_id,
+                        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
+                    )
+                )
+
+                msg = await _recv_json(ws)
+                assert msg["type"] == "message"
+                assert msg["body"]["rerouteResult"] == reroute_fields["rerouteResult"]
+                assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
+                assert msg["body"]["explanation"] == reroute_fields["explanation"]
+    finally:
+        await adapter.disconnect()
+
+    assert observed_auto_skill == ["hardware/pcb-reroute"]
+
+
+def test_websocket_reroute_fields_round_trip():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip())
 
 
 async def _run_websocket_chat_turn_not_misrouted() -> None:
@@ -343,7 +482,7 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
-                assert "当前还在选择阶段" in second["body"]["content"]
+                assert "执行布线前必须先选择布线器" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 
@@ -373,8 +512,6 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
                 '{"selection":[{"label":"FPGA1","detail":"BGA-1156"}]}\n'
                 "##PCB_FIELDS_END##"
             )
-        if "选择 FPGA1" in event.text:
-            return "已识别到目标器件，继续生成扇出参数。"
         raise AssertionError(f"Unexpected user turn passed to handler: {event.text}")
 
     adapter.set_message_handler(handler)
@@ -401,18 +538,109 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
                 await ws.send_str(_user_message(session_id, project_id, "选择 FPGA1"))
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
-                assert second["body"]["content"] == "已识别到目标器件，继续生成扇出参数。"
+                assert "已选择目标 BGA：FPGA1" in second["body"]["content"]
+                assert "请回复 `arc` 或 `135`" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 
-    assert len(handled_turns) == 2
+    assert len(handled_turns) == 1
     assert "帮我进行BGA逃逸布线" in handled_turns[0]
     assert "不要再次调用 getProjectData" in handled_turns[0]
-    assert handled_turns[1] == f"[projectid: {project_id}]\n选择 FPGA1"
 
 
 def test_websocket_selection_accepts_non_u_refdes():
     asyncio.get_event_loop().run_until_complete(_run_websocket_selection_accepts_non_u_refdes())
+
+
+def test_router_choice_prompt_sets_wait_router_state():
+    adapter = _make_adapter()
+    session_id = "sess-router-choice-visible"
+    adapter._set_session_mode(session_id, "pcb")
+
+    content = "已完成 BGA 分析，请选择走线算法类型：arc 或 135。"
+    guarded = adapter._guard_router_choice_before_confirm(session_id, content, {})
+
+    assert guarded == content
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+
+def test_router_type_followup_recovers_when_flow_state_was_lost():
+    adapter = _make_adapter()
+    session_id = "sess-router-choice-lost-state"
+    adapter._set_session_mode(session_id, "pcb", lock_seconds=0.0)
+    adapter._set_flow_state(session_id, "idle")
+
+    decision = adapter._decide_route(session_id, "135")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "router_type_step"
+    assert adapter._session_router_types[session_id] == "135"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+
+def test_fanout_params_visible_content_is_normalized():
+    content = (
+        "已生成扇出参数，请确认：\n"
+        "- 目标 BGA：U22\n"
+        "请已生成扇出参数，请确认：\n"
+        "- 目标 BGA：U22请回复 **确认** 执行布线。"
+    )
+    fanout_params = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+        "orderLines": [
+            {"net": "GND", "layer": "Top", "order": 1},
+            {"net": "VCC", "layer": "Art03", "order": 2},
+            {"net": "CLK", "layer": "Art03", "order": 3},
+        ],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+
+    normalized = WebSocketAdapter._fallback_visible_content_for_fields(
+        content,
+        {"fanoutParams": fanout_params},
+    )
+
+    assert normalized.count("已生成扇出参数，请确认") == 1
+    assert "请已生成" not in normalized
+    assert "目标 BGA：U22" in normalized
+    assert "走线算法：135（135 度折角走线）" in normalized
+    assert "逃逸层：Top、Art03" in normalized
+    assert "请回复“确认”执行布线" in normalized
+
+
+async def _run_pcb_outbound_trace_log(tmp_path) -> None:
+    adapter = _make_adapter(
+        trace_pcb_messages=True,
+        pcb_trace_log_path=str(tmp_path / "pcb_websocket_trace.jsonl"),
+    )
+    ws = _FakeWS()
+    session_id = "sess-trace-routing"
+    adapter._connections[session_id] = (ws, "proj-trace-001")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content=(
+            "布线完成。\n\n"
+            "##PCB_FIELDS##\n"
+            '{"routingResult":"F:\\\\router_work\\\\routing_input.txt"}\n'
+            "##PCB_FIELDS_END##"
+        ),
+    )
+
+    assert result.success is True
+    trace_path = tmp_path / "pcb_websocket_trace.jsonl"
+    event = json.loads(trace_path.read_text(encoding="utf-8").strip())
+    assert event["delivered"] is True
+    assert event["reason"] == "sent"
+    assert event["sessionId"] == session_id
+    assert event["projectid"] == "proj-trace-001"
+    assert event["fieldKeys"] == ["routingResult"]
+    assert event["routingResult"] == "F:\\router_work\\routing_input.txt"
+
+
+def test_pcb_outbound_trace_log(tmp_path):
+    asyncio.get_event_loop().run_until_complete(_run_pcb_outbound_trace_log(tmp_path))
 
 
 async def _run_stream_fields_emitted_without_true_final() -> None:
@@ -443,7 +671,7 @@ async def _run_stream_fields_emitted_without_true_final() -> None:
     assert first["isFinal"] is None
     assert first["selection"] == [{"label": "U27", "detail": "BGA-256"}]
     assert "##PCB_FIELDS##" not in first["content"]
-    assert adapter._session_flow_states.get(session_id) == "wait_selection"
+    assert adapter._session_flow_states.get(session_id) == "wait_router_type"
 
     # 同一份累计内容重复到达时，不应重复发同样的结构字段
     result2 = await adapter.edit_message(

@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $BuildDir = Join-Path $RepoRoot "dist\agent-gateway"
 $DeliverySrc = Join-Path $RepoRoot ".github\delivery"
-$SkillSrc = Join-Path $RepoRoot "skills\hardware\pcb-intelligence"
+$HardwareSkillsSrc = Join-Path $RepoRoot "skills\hardware"
 $DocsSrc = Join-Path $RepoRoot "docs"
 
 function Write-Info($msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
@@ -59,25 +59,37 @@ Write-Info "Copying built runtime files..."
 Copy-Item -Recurse -Force (Join-Path $BuildDir "*") $OutputDir
 
 Write-Info "Copying delivery scripts..."
-foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "template.env", "template-config.yaml", "使用说明.md", "开发测试包使用说明.md")) {
+foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "sync_config.ps1", "template.env", "template-config.yaml", "使用说明.md", "开发测试包使用说明.md")) {
     $src = Join-Path $DeliverySrc $name
     if (Test-Path $src) {
         Copy-Item -Force $src $OutputDir
     }
 }
 
-Write-Info "Copying PCB skill..."
-if (Test-Path $SkillSrc) {
-    $skillDst = Join-Path $OutputDir "skills\hardware\pcb-intelligence"
-    New-Item -ItemType Directory -Force -Path $skillDst | Out-Null
-    Copy-Item -Recurse -Force (Join-Path $SkillSrc "*") $skillDst
+Write-Info "Copying PCB skills..."
+if (Test-Path $HardwareSkillsSrc) {
+    foreach ($skillName in @("pcb-intelligence", "pcb-reroute")) {
+        $skillSrc = Join-Path $HardwareSkillsSrc $skillName
+        if (Test-Path $skillSrc) {
+            $skillDst = Join-Path $OutputDir "skills\hardware\$skillName"
+            New-Item -ItemType Directory -Force -Path $skillDst | Out-Null
+            Copy-Item -Recurse -Force (Join-Path $skillSrc "*") $skillDst
+        } else {
+            Write-Warn "未找到 skill 源目录: $skillSrc"
+        }
+    }
 } else {
-    Write-Warn "未找到 skill 源目录: $SkillSrc"
+    Write-Warn "未找到 hardware skill 源目录: $HardwareSkillsSrc"
 }
 
 Write-Info "Copying docs..."
 if (Test-Path $DocsSrc) {
     Copy-Files (Join-Path $DocsSrc "*") (Join-Path $OutputDir "docs")
+}
+
+if ((Test-Path (Join-Path $OutputDir "sync_config.ps1")) -and (Test-Path (Join-Path $OutputDir "config.ini"))) {
+    Write-Info "Syncing external config.ini into packaged runtime..."
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $OutputDir "sync_config.ps1")
 }
 
 Write-Ok "Delivery package ready: $OutputDir"

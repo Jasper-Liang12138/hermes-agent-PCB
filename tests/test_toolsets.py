@@ -141,3 +141,18 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_websocket_pcb_toolsets_include_bga_and_reroute_tools(self):
+        expected = {
+            "getProjectData",
+            "getSelectedElements",
+            "GetSelectedElements",
+            "deleteTracesById",
+            "route",
+            "pcb_extract_bga",
+            "drop_net",
+            "reroute",
+        }
+
+        assert expected.issubset(set(resolve_toolset("hermes-websocket")))
+        assert expected.issubset(set(resolve_toolset("hermes-websocket-pcb")))
