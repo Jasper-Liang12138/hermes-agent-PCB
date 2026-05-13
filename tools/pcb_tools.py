@@ -1251,9 +1251,14 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         routing_result_path = _router_result_path(work_dir)
         routing_result_size = routing_result_path.stat().st_size
         report = _read_router_report(work_dir)
-        _transport.set_pending_pcb_fields({"routingResult": str(routing_result_path)}, session_id=session_id)
-
         report_text = report.strip().rstrip("。")
+        _transport.set_pending_pcb_fields(
+            {
+                "routingResult": str(routing_result_path),
+                "report": report_text or "布线完成（无详细报告）",
+            },
+            session_id=session_id,
+        )
         summary = report_text if report_text.startswith("布线完成") else f"布线完成。{report_text}"
         return (
             f"{summary}。"

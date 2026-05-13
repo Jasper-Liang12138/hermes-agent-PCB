@@ -52,6 +52,7 @@ _PCB_BODY_FIELD_KEYS = (
     "selection",
     "fanoutParams",
     "routingResult",
+    "report",
     "rerouteResult",
     "routedBoardDataFilePath",
     "checkReport",
@@ -672,6 +673,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         for key in ("routingResult", "routedBoardDataFilePath"):
             if key in body:
                 event[key] = body.get(key)
+        if "report" in body:
+            event["reportPreview"] = str(body.get("report") or "")[:240]
         if "fanoutParams" in body and isinstance(body.get("fanoutParams"), dict):
             fanout_params = body["fanoutParams"]
             event["fanoutSummary"] = {
@@ -870,7 +873,10 @@ class WebSocketAdapter(BasePlatformAdapter):
             parsed = json.loads(visible)
             if isinstance(parsed, dict):
                 fields["routingResult"] = str(parsed.get("routingResult") or "")
-                visible = str(parsed.get("report") or parsed.get("error") or "布线执行完成。")
+                report = str(parsed.get("report") or "").strip()
+                if report:
+                    fields["report"] = report
+                visible = str(report or parsed.get("error") or "布线执行完成。")
         except (TypeError, ValueError):
             pass
 
@@ -1535,7 +1541,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         content: str,
         pcb_fields: Dict[str, Any],
     ) -> str:
-        if "fanoutParams" in pcb_fields or "routingResult" in pcb_fields:
+        if "fanoutParams" in pcb_fields or "routingResult" in pcb_fields or "report" in pcb_fields:
             return content
         if "selection" in pcb_fields:
             selection = pcb_fields.get("selection")
@@ -1602,6 +1608,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         if content and content.strip():
             return content
         if "routingResult" in pcb_fields:
+            report = str(pcb_fields.get("report") or "").strip()
+            if report:
+                return report
             return "布线完成，结果已发送到前端。"
         if "selection" in pcb_fields:
             selection = pcb_fields.get("selection")
@@ -2675,14 +2684,39 @@ class WebSocketAdapter(BasePlatformAdapter):
         for key in _PCB_BODY_FIELD_KEYS:
             if key in data:
                 fields[key] = data[key]
+        fanout_params = WebSocketAdapter._coerce_fanout_params(data)
+        if fanout_params and "fanoutParams" not in fields:
+            fields["fanoutParams"] = fanout_params
 
         nested = data.get("body")
         if isinstance(nested, dict):
             for key in _PCB_BODY_FIELD_KEYS:
                 if key in nested and key not in fields:
                     fields[key] = nested[key]
+            nested_fanout_params = WebSocketAdapter._coerce_fanout_params(nested)
+            if nested_fanout_params and "fanoutParams" not in fields:
+                fields["fanoutParams"] = nested_fanout_params
 
         return fields
+
+    @staticmethod
+    def _coerce_fanout_params(data: Dict[str, Any]) -> Dict[str, Any]:
+        raw = data.get("fanoutParams")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+
+        keys = ("selectedBGA", "routerType", "orderLines", "constraints")
+        if not any(key in data for key in keys):
+            return {}
+        fanout_params = {key: data[key] for key in keys if key in data}
+        return fanout_params if any(key in fanout_params for key in ("routerType", "orderLines")) else {}
 
     @staticmethod
     def _has_pcb_structured_data(data: Any) -> bool:

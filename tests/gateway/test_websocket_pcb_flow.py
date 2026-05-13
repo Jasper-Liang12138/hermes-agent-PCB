@@ -212,6 +212,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 assert routed_msg["type"] == "message"
                 assert routed_msg["body"]["isFinal"] is True
                 assert routed_msg["body"]["routingResult"] == route_result["routingResult"]
+                assert routed_msg["body"]["report"] == route_result["report"]
 
     finally:
         await adapter.disconnect()
@@ -607,6 +608,37 @@ def test_fanout_params_visible_content_is_normalized():
     assert "走线算法：135（135 度折角走线）" in normalized
     assert "逃逸层：Top、Art03" in normalized
     assert "请回复“确认”执行布线" in normalized
+
+
+def test_direct_fanout_payload_is_sent_as_fanout_params():
+    fields = WebSocketAdapter._collect_pcb_fields(
+        {
+            "selectedBGA": "U22",
+            "routerType": "135",
+            "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+            "constraints": {"LineWidth": 4, "LineSpacing": 3},
+        }
+    )
+
+    assert fields["fanoutParams"] == {
+        "selectedBGA": "U22",
+        "routerType": "135",
+        "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+
+
+def test_routing_result_report_visible_fallback():
+    content = WebSocketAdapter._fallback_visible_content_for_fields(
+        "",
+        {
+            "routingResult": r"F:\router_work\routing_input.txt",
+            "report": "布线连通率：98.44%\n总线长：132977.590\n通孔数量：126",
+        },
+    )
+
+    assert "布线连通率：98.44%" in content
+    assert "通孔数量：126" in content
 
 
 async def _run_pcb_outbound_trace_log(tmp_path) -> None:

@@ -21,7 +21,10 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     assert result.startswith("布线完成")
     assert report in result
     assert str(routing_path) in result
-    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == {"routingResult": str(routing_path)}
+    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == {
+        "routingResult": str(routing_path),
+        "report": report,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +34,7 @@ def _restore_transport_state():
     prev_modes = dict(transport._session_modes)
     prev_cache = dict(transport._cached_project_data)
     prev_reroute_cache = dict(transport._cached_reroute_context)
+    prev_pending_fields = dict(transport._pending_pcb_fields)
     prev_adapter = transport._websocket_adapter
     prev_loop = transport._main_loop
     yield
@@ -38,6 +42,7 @@ def _restore_transport_state():
     transport._session_modes = prev_modes
     transport._cached_project_data = prev_cache
     transport._cached_reroute_context = prev_reroute_cache
+    transport._pending_pcb_fields = prev_pending_fields
     transport._websocket_adapter = prev_adapter
     transport._main_loop = prev_loop
 
@@ -159,8 +164,10 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
         elif executable == "b.out":
             assert cmd[-2:] == ["layer_input.txt", "layout_input.txt"]
         elif executable == "c.out":
-            assert cmd[-3:] == ["order_input.txt", "layout_input.txt", "constrain.txt"]
+            assert cmd[-4:] == ["order_input.txt", "layout_input.txt", "constrain.txt", "component_input.txt"]
+            (tmp_path / "U35_pins.csv").write_text(_pin_csv("U35"), encoding="utf-8")
             (tmp_path / "ARC_output.txt").write_text("arc", encoding="utf-8")
+            (tmp_path / "net_list.txt").write_text("NET_A_P_SIG03 ; J1.A1 U35.A1 ; 3.00\n", encoding="utf-8")
         elif executable == "Turn_QYF.py":
             assert cmd[-3:] == ["layout_input.txt", "ARC_output.txt", "routing_input.txt"]
         else:
@@ -171,10 +178,20 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
     monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
     monkeypatch.setenv("ROUTER_ARC_DIR", str(router_dir))
 
-    result = pcb_tools.route_bga('{"routerType":"arc","orderLines":[{"net":"GND","layer":"SIG03","order":1}]}')
+    result = pcb_tools.route_bga(
+        json.dumps({
+            "routerType": "arc",
+            "orderLines": [
+                {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+                {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+            ],
+        })
+    )
 
     _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-route-selected")
-    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU35"
+    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == (
+        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU35"
+    )
 
 
 def test_handle_function_call_uses_explicit_session_for_get_project_data(monkeypatch):
@@ -241,7 +258,9 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
         elif executable == "b.out":
             pass
         elif executable == "c.out":
+            (tmp_path / "FPGA1_pins.csv").write_text(_pin_csv("FPGA1"), encoding="utf-8")
             (tmp_path / "ARC_output.txt").write_text("arc", encoding="utf-8")
+            (tmp_path / "net_list.txt").write_text("NET_A_P_SIG03 ; J1.A1 FPGA1.A1 ; 3.00\n", encoding="utf-8")
         elif executable == "Turn_QYF.py":
             pass
         else:
@@ -254,13 +273,27 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
 
     result = handle_function_call(
         "route",
-        {"userData": '{"routerType":"arc","orderLines":[{"net":"GND","layer":"SIG03","order":1}],"selectedBGA":"FPGA1"}'},
+        {
+            "userData": json.dumps(
+                {
+                    "routerType": "arc",
+                    "orderLines": [
+                        {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+                        {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+                    ],
+                    "selectedBGA": "FPGA1",
+                },
+                ensure_ascii=False,
+            )
+        },
         session_id="sess-explicit-route",
     )
 
     _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-explicit-route")
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "FPGA1")))'
-    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nFPGA1"
+    assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == (
+        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nFPGA1"
+    )
 
 
 def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
@@ -297,8 +330,10 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
             assert args == ["layer_input.txt", "layout_input.txt"]
             (work_dir / "order_input.txt").write_text((work_dir / "order_input.txt").read_text(encoding="utf-8"), encoding="utf-8")
         elif executable == "c.out":
-            assert args == ["order_input.txt", "layout_input.txt", "constrain.txt"]
+            assert args == ["order_input.txt", "layout_input.txt", "constrain.txt", "component_input.txt"]
+            (work_dir / "U27_pins.csv").write_text(_pin_csv("U27"), encoding="utf-8")
             (work_dir / "ARC_output.txt").write_text("arc-lines", encoding="utf-8")
+            (work_dir / "net_list.txt").write_text("NET_A_P_SIG03 ; J1.A1 U27.A1 ; 3.00\n", encoding="utf-8")
         elif str(cmd[1]).endswith("Turn_QYF.py"):
             assert cmd[2:] == ["layout_input.txt", "ARC_output.txt", "routing_input.txt"]
         else:
@@ -313,7 +348,10 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
         json.dumps({
             "routerType": "arc",
             "selectedBGA": "U27",
-            "orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}],
+            "orderLines": [
+                {"net": "NET_A_P_SIG03", "layer": "SIG03", "order": 1},
+                {"net": "NET_A_N_SIG03", "layer": "SIG03", "order": 2},
+            ],
             "constraints": {"LineWidth": 3, "LineSpacing": 4.5},
         })
     )
@@ -321,13 +359,11 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
     _assert_route_summary(result, "arc ok", work_dir / "routing_input.txt", "sess-arc-route")
     assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-arc-route"]
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U27\n"
-    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "GND SIG03 1\n\nU27"
+    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == (
+        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU27"
+    )
     assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "LineWidth:3\nLineSpacing:4.5\n"
-    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == [
-        "a.out",
-        "b.out",
-        "c.out",
-    ]
+    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == ["c.out"]
 
 
 def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
