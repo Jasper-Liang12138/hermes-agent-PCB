@@ -39,7 +39,7 @@ Do not call tools for conceptual questions, explanations, router selection for B
 | Tool | Purpose |
 |------|---------|
 | `drop_net` | Compatibility entrypoint for the local rip-up stage. Internally calls `getSelectedElements` with `PFindType="TRACES"`, then `deleteTracesById`, then `getProjectData`. |
-| `reroute` | Reads the cached selected trace ids and post-delete board data, generates local reroute output, optional KiCad patch, check report, and DRC result. |
+| `reroute` | Reads the cached selected trace ids and post-delete board data, generates local reroute output, check report, and public txt result file for EDA import. |
 
 Frontend tools are called by `drop_net`; do not call them manually unless explicitly debugging:
 - `getSelectedElements(PFindType="TRACES")`
@@ -86,9 +86,9 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
     "operations": [],
     "drcPassed": true,
     "drcIterations": 1,
-    "routedBoardDataFilePath": "F:\\project\\.hermes_reroute\\session_iter1.kicad_pcb"
+    "routedLayoutTxtFilePath": "F:\\project\\.hermes_reroute\\txt\\session_iter1.txt"
   },
-  "routedBoardDataFilePath": "F:\\project\\.hermes_reroute\\session_iter1.kicad_pcb",
+  "routedLayoutTxtFilePath": "F:\\project\\.hermes_reroute\\txt\\session_iter1.txt",
   "checkReport": {
     "passed": true,
     "checks": []
@@ -106,4 +106,5 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
 - Do not call `reroute` if selected trace id count is 0 or greater than 40.
 - Do not call `reroute` if `deleteTracesById` fails.
 - `##PCB_FIELDS##` content must be valid JSON.
+- Do not expose internal `.kicad_pcb` file paths in visible text or `##PCB_FIELDS##`; only expose the txt/S-expression result path via `routedLayoutTxtFilePath`.
 - Keep visible text short; large board data, patches, and DRC details belong in structured fields or output files.

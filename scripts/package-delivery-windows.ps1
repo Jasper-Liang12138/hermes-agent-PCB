@@ -11,6 +11,7 @@ $BuildDir = Join-Path $RepoRoot "dist\agent-gateway"
 $DeliverySrc = Join-Path $RepoRoot ".github\delivery"
 $HardwareSkillsSrc = Join-Path $RepoRoot "skills\hardware"
 $DocsSrc = Join-Path $RepoRoot "docs"
+$ConfigSrc = Join-Path $RepoRoot "config.ini"
 
 function Write-Info($msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -64,6 +65,13 @@ foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "sync_config.ps
     if (Test-Path $src) {
         Copy-Item -Force $src $OutputDir
     }
+}
+
+if (Test-Path $ConfigSrc) {
+    Write-Info "Copying editable config.ini..."
+    Copy-Item -Force $ConfigSrc $OutputDir
+} else {
+    Write-Warn "未找到 config.ini: $ConfigSrc"
 }
 
 Write-Info "Copying PCB skills..."

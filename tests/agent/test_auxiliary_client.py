@@ -22,6 +22,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _try_payment_fallback,
     _resolve_auto,
+    _build_call_kwargs,
 )
 
 
@@ -1541,6 +1542,33 @@ class TestAsyncCallLlmFallback:
 
         assert result is fb_response
         mock_fb.assert_called_once_with("auto", "compression", reason="connection error")
+
+
+class TestQwen3NoThinkCompat:
+    def test_build_call_kwargs_prefixes_no_think_for_ctyun_endpoint(self):
+        messages = [{"role": "user", "content": "你好"}]
+
+        kwargs = _build_call_kwargs(
+            "custom",
+            "sef59b42818743ca982cb821750beb3a",
+            messages,
+            base_url="https://wishub-x5.ctyun.cn/v1",
+        )
+
+        assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+        assert messages[0]["content"] == "你好"
+
+    def test_build_call_kwargs_does_not_duplicate_no_think(self):
+        messages = [{"role": "user", "content": "/no_think\n你好"}]
+
+        kwargs = _build_call_kwargs(
+            "custom",
+            "qwen3-32b",
+            messages,
+            base_url="https://wishub-x5.ctyun.cn/v1",
+        )
+
+        assert kwargs["messages"][0]["content"] == "/no_think\n你好"
 class TestStaleBaseUrlWarning:
     """_resolve_auto() warns when OPENAI_BASE_URL conflicts with config provider (#5161)."""
 

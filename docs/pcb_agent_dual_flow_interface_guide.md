@@ -101,7 +101,7 @@ Agent 调前端工具：
 | `fanoutParams` | object | BGA 扇出 | 待用户确认的扇出参数 |
 | `routingResult` | string | BGA 扇出 | `routing_input.txt` 绝对路径 |
 | `rerouteResult` | object | 拆线重布 | 局部重布结构化结果 |
-| `routedBoardDataFilePath` | string | 拆线重布 | 可回填的新版图文件路径 |
+| `routedLayoutTxtFilePath` | string | 拆线重布 | DRC 通过后可导入 EDA 的 txt/S 表达式结果文件路径 |
 | `checkReport` | object | 拆线重布 | 检查/DRC 报告 |
 | `explanation` | string | 拆线重布 | 给用户看的结果说明 |
 
@@ -444,9 +444,9 @@ reroute selected traces
       ],
       "drcPassed": true,
       "drcIterations": 1,
-      "routedBoardDataFilePath": "F:\\project\\.hermes_reroute\\session_iter1.kicad_pcb"
+      "routedLayoutTxtFilePath": "F:\\project\\.hermes_reroute\\txt\\session_iter1.txt"
     },
-    "routedBoardDataFilePath": "F:\\project\\.hermes_reroute\\session_iter1.kicad_pcb",
+    "routedLayoutTxtFilePath": "F:\\project\\.hermes_reroute\\txt\\session_iter1.txt",
     "checkReport": {
       "passed": true,
       "checks": []
@@ -458,8 +458,8 @@ reroute selected traces
 
 前端处理要求：
 
-1. 优先读取 `body.routedBoardDataFilePath`。
-2. 如果该字段存在，按文件路径导入/回填新版图。
+1. 优先读取 `body.routedLayoutTxtFilePath`。
+2. 如果该字段存在，调用 `importLines` 或按文件路径导入/回填新版图。
 3. 如果没有该字段，读取 `body.rerouteResult` 中的 `operations` 或 `kicadPatch`，根据前端能力处理。
 4. 展示 `checkReport` 和 `explanation` 给用户。
 
@@ -473,8 +473,8 @@ reroute selected traces
 | 前端工具 | `getProjectData` | `getSelectedElements`、`deleteTracesById`、`getProjectData` |
 | 本地工具 | `route` | `reroute` |
 | 是否选择 `arc`/`135` | 是 | 否 |
-| 最终字段 | `routingResult` | `rerouteResult`、`routedBoardDataFilePath`、`checkReport`、`explanation` |
-| 输出语义 | `routing_input.txt` 文件路径 | 局部重布结果包或新版图文件路径 |
+| 最终字段 | `routingResult` | `rerouteResult`、`routedLayoutTxtFilePath`、`checkReport`、`explanation` |
+| 输出语义 | `routing_input.txt` 文件路径 | DRC 通过后的 txt/S 表达式导入文件路径 |
 
 ## isFinal 约定
 
@@ -527,7 +527,7 @@ BGA 扇出布线：
 - `deleteTracesById(ids)` 能删除选中走线并返回成功。
 - 删除后 `getProjectData` 返回新版图数据。
 - 能读取 `rerouteResult`。
-- 能读取并导入 `routedBoardDataFilePath`。
+- 能读取并导入 `routedLayoutTxtFilePath`。
 - 能展示 `checkReport` 和 `explanation`。
 
 ## 常见错误定位
@@ -556,4 +556,3 @@ Agent 已经完成布线器调用并下发路径。继续检查：
 - 返回 ID 是否为空。
 - ID 是否超过 40 条。
 - `deleteTracesById` 是否返回失败。
-

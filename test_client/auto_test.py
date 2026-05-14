@@ -5,7 +5,7 @@
 流程：
   Round 1: 发送布线请求 → 自动回复 getProjectData mock 数据 → 收到 selection
   Round 2: 自动发送"选择 U27" → 收到 fanoutParams
-  Round 3: 自动发送"确认" → 自动回复 route mock 数据 → 收到 routingResult
+  Round 3: 自动发送"确认" → 自动回复 importLines mock 数据 → 收到 routingResult
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ TOOL_MOCK: dict[str, Any] = {
     "getProjectData":     MOCK_PROJECT_DATA,
     "GetSelectedElements": {"ids": []},
     "route":              MOCK_ROUTE_RESULT,
+    "importLines":         {"success": True, "message": "导入完成"},
 }
 
 

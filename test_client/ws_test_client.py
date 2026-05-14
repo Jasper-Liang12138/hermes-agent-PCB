@@ -51,6 +51,8 @@ def _default_tool_result(tool_name: str) -> Any:
             "routingResult": r"F:\router_work\routing_input.txt",
             "report": "mock route finished",
         }
+    if tool_name == "importLines":
+        return {"success": True, "message": "导入完成"}
     if tool_name == "GetSelectedElements":
         return [{"label": "U27", "detail": "BGA256"}]
     return f"mock result for {tool_name}"

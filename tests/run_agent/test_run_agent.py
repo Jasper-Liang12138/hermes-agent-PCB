@@ -972,6 +972,27 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 65536
 
+    def test_qwen3_custom_endpoint_prefixes_no_think(self, agent):
+        agent.base_url = "https://wishub-x5.ctyun.cn/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "sef59b42818743ca982cb821750beb3a"
+        messages = [{"role": "user", "content": "你好"}]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+        assert messages[0]["content"] == "你好"
+
+    def test_qwen3_custom_endpoint_does_not_duplicate_no_think(self, agent):
+        agent.base_url = "https://wishub-x5.ctyun.cn/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "qwen3-32b"
+        messages = [{"role": "user", "content": "/no_think\n你好"}]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+
 
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):

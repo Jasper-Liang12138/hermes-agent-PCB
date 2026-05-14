@@ -5850,6 +5850,49 @@ class AIAgent:
         """Return True when the base URL targets Qwen Portal."""
         return "portal.qwen.ai" in self._base_url_lower
 
+    def _is_qwen3_no_think_endpoint(self) -> bool:
+        """Return True for Qwen3 OpenAI-compatible endpoints that need /no_think."""
+        if self.api_mode != "chat_completions":
+            return False
+        if os.getenv("HERMES_QWEN3_AUTO_NO_THINK", "1").lower() in {"0", "false", "no", "off"}:
+            return False
+        model = (self.model or "").lower()
+        base = self._base_url_lower
+        return (
+            "qwen3" in model
+            or "wishub-x5.ctyun.cn" in base
+            or os.getenv("HERMES_QWEN3_FORCE_NO_THINK", "").lower() in {"1", "true", "yes", "on"}
+        )
+
+    @staticmethod
+    def _content_has_no_think_prefix(content: str) -> bool:
+        return bool(re.match(r"^\s*/no_think\b", content or "", flags=re.IGNORECASE))
+
+    def _qwen3_add_no_think_to_messages(self, api_messages: list) -> list:
+        """Copy messages and prefix the latest user text with /no_think."""
+        prepared = copy.deepcopy(api_messages)
+        for msg in reversed(prepared):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                if not self._content_has_no_think_prefix(content):
+                    msg["content"] = "/no_think\n" + content
+                return prepared
+            if isinstance(content, list):
+                for index, part in enumerate(content):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        if not self._content_has_no_think_prefix(part["text"]):
+                            part["text"] = "/no_think\n" + part["text"]
+                        return prepared
+                    if isinstance(part, str):
+                        if not self._content_has_no_think_prefix(part):
+                            content[index] = "/no_think\n" + part
+                        return prepared
+                content.insert(0, {"type": "text", "text": "/no_think"})
+                return prepared
+        return prepared
+
     def _qwen_prepare_chat_messages(self, api_messages: list) -> list:
         prepared = copy.deepcopy(api_messages)
         if not prepared:
@@ -6037,6 +6080,9 @@ class AIAgent:
                         if isinstance(tool_call, dict):
                             tool_call.pop("call_id", None)
                             tool_call.pop("response_item_id", None)
+
+        if self._is_qwen3_no_think_endpoint():
+            sanitized_messages = self._qwen3_add_no_think_to_messages(sanitized_messages)
 
         # Qwen portal: normalize content to list-of-dicts, inject cache_control.
         # Must run AFTER codex sanitization so we transform the final messages.
@@ -8131,6 +8177,13 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
+                    elif self._is_qwen3_no_think_endpoint():
+                        # The deployed Qwen3/MindSpeed OpenAI-compatible gateway
+                        # supports non-streaming chat completions reliably, but
+                        # its SSE chunks may omit usable delta.content.  If we
+                        # stream it, the agent sees an empty final response even
+                        # though /v1/chat/completions returns content.
+                        _use_streaming = False
 
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(

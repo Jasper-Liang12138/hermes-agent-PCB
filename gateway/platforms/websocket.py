@@ -4,7 +4,7 @@
   用户消息:   {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"user",  "content":"..."}}
   工具调用:   {"type":"tool-calls",   "body":{"role":"agent", "content":{"id":"...", "name":"...", "arguments":{...}}}}
   工具结果:   {"type":"tool-results", "body":{"role":"tool",  "content":{"id":"...", "result":"..."}}}
-  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult/rerouteResult/routedBoardDataFilePath/checkReport/explanation]}}
+  Agent回复:  {"sessionId":"...", "projectid":"...", "type":"message",      "body":{"role":"agent", "msgId":"...", "content":"...", "thinking":"...", "isFinal":true/false/null, [selection/fanoutParams/routingResult/rerouteResult/routedLayoutTxtFilePath/checkReport/explanation]}}
   错误:       {"sessionId":"...", "projectid":"...", "type":"error",        "body":{"role":"agent", "code":50001, "message":"..."}}
 
 结构化字段传递机制：
@@ -54,12 +54,13 @@ _PCB_BODY_FIELD_KEYS = (
     "routingResult",
     "report",
     "rerouteResult",
-    "routedBoardDataFilePath",
+    "routedLayoutTxtFilePath",
     "checkReport",
     "explanation",
     "boardSummary",
     "fanoutContext",
 )
+_IMPORT_LINES_TIMEOUT_SECONDS = 300.0
 _PCB_STRUCTURED_KEYS = frozenset(
     _PCB_BODY_FIELD_KEYS
     + (
@@ -78,6 +79,8 @@ _PCB_STRUCTURED_KEYS = frozenset(
         "selectedBGA",
         "routerType",
         "constraints",
+        "routedBoardDataFilePath",
+        "routedLayoutTxtFilePath",
     )
 )
 _PCB_STRUCTURED_KEY_RE = re.compile(
@@ -140,6 +143,11 @@ _PCB_DOMAIN_RE = re.compile(
     r"(pcb|板子|版图|bga|fpga|芯片|器件|封装|扇出|逃逸|布线|走线|线网|网络|net|框选|选中|选中元件|trace|traces|projectdata|getprojectdata|getselectedelements|route|fanout)",
     re.IGNORECASE,
 )
+_PCB_SHORT_COMMAND_RE = re.compile(
+    r"^\s*(?:pcb\s*)?(?:bga|fpga)?\s*(?:逃逸|扇出|布线|走线|fanout|route)"
+    r"(?:\s*(?:布线|走线|fanout|route))?\s*$",
+    re.IGNORECASE,
+)
 _SELECTION_RE = re.compile(r"(选择\s*U?\d+|选\s*U?\d+|^U\d+$)", re.IGNORECASE)
 _SELECTION_PREFIX_RE = re.compile(r"^\s*(?:我\s*)?(?:选择|选)\s*(.+?)\s*$", re.IGNORECASE)
 _ROUTER_TYPE_RE = re.compile(r"^\s*(?:选择|选|用|使用)?\s*(arc|135|1|2|圆弧|弧形|折角|135\s*度)\s*$", re.IGNORECASE)
@@ -147,9 +155,10 @@ _CONFIRM_RE = re.compile(r"(确认|继续|执行|开始布线|开始|go|yes|ok)"
 _CANCEL_RE = re.compile(r"(取消|退出|中止|停止|cancel|abort|exit)", re.IGNORECASE)
 _CHAT_ONLY_RE = re.compile(
     r"(不要.*(布线|route|getprojectdata|getselectedelements)"
-    r"|只聊|闲聊|解释|介绍|笑话|今天星期几|区别|是什么|什么意思|含义|原理|对比|比较|优缺点|讲讲|聊聊|科普|简短回答|简要说明)",
+    r"|只聊|闲聊|你好|您好|hello|hi|解释|介绍|笑话|今天星期几|区别|是什么|什么意思|含义|原理|对比|比较|优缺点|讲讲|聊聊|科普|简短回答|简要说明)",
     re.IGNORECASE,
 )
+_CHAT_GREETING_RE = re.compile(r"^\s*(你好|您好|hello|hi|hey|在吗|在不在)[！!。.\s]*$", re.IGNORECASE)
 _STREAM_CURSOR_RE = re.compile(r"(?:\s?▉)$")
 _ROUTE_INTENT_LABEL_RE = re.compile(
     r"\b(chat|pcb_entry|pcb_followup|pcb_select_target|pcb_confirm_route|"
@@ -674,7 +683,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "fieldKeys": field_keys,
             "contentPreview": content[:240],
         }
-        for key in ("routingResult", "routedBoardDataFilePath"):
+        for key in ("routingResult", "routedLayoutTxtFilePath"):
             if key in body:
                 event[key] = body.get(key)
         if "report" in body:
@@ -737,11 +746,14 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not isinstance(turn_options, dict):
             turn_options = {}
 
-        llm_intent = await self._classify_route_intent_with_llm(
-            session_id=session_id,
-            user_text=user_text,
-            project_id=project_id,
-        )
+        if self._should_use_route_intent_llm(session_id, str(user_text or "")):
+            llm_intent = await self._classify_route_intent_with_llm(
+                session_id=session_id,
+                user_text=user_text,
+                project_id=project_id,
+            )
+        else:
+            llm_intent = None
         decision = self._decide_route(session_id, user_text, llm_intent=llm_intent)
         if decision.immediate_reply:
             await self._send_router_reply(session_id, decision.immediate_reply)
@@ -883,12 +895,18 @@ class WebSocketAdapter(BasePlatformAdapter):
                 report = str(parsed.get("report") or "").strip()
                 if report:
                     fields["report"] = report
+                for key in ("successPins", "failedPins"):
+                    if key in parsed:
+                        fields[key] = parsed[key]
                 visible = str(report or parsed.get("error") or "布线执行完成。")
         except (TypeError, ValueError):
             pass
 
         pending_fields = self._pop_pending_pcb_fields(session_id)
         fields.update(pending_fields)
+        import_status = await self._import_fanout_result(session_id, route_params, fields)
+        if import_status:
+            visible = f"{visible.rstrip()}\n\n{import_status}".strip()
         if fields:
             visible = (
                 f"{visible}\n\n"
@@ -903,6 +921,116 @@ class WebSocketAdapter(BasePlatformAdapter):
             metadata={"stream_is_final": True},
         )
         return True
+
+    async def _import_fanout_result(
+        self,
+        session_id: str,
+        route_params: Dict[str, Any],
+        fields: Dict[str, Any],
+    ) -> str:
+        routing_result = str(fields.get("routingResult") or "").strip()
+        if not routing_result or routing_result.lstrip().startswith("("):
+            return ""
+
+        arguments = {
+            "filePath": routing_result,
+            "successPins": self._first_pin_list(fields.get("successPins"), route_params.get("successPins")),
+            "failedPins": self._first_pin_list(fields.get("failedPins"), route_params.get("failedPins")),
+        }
+        call_id = f"import_lines_{uuid.uuid4().hex[:8]}"
+        logger.info("正在导入版图: session=%s file=%s timeout=%.1fs", session_id, routing_result, _IMPORT_LINES_TIMEOUT_SECONDS)
+        await self.send(
+            chat_id=session_id,
+            content="正在导入版图，请稍候...",
+            metadata={"is_final": False},
+        )
+        try:
+            result = await self.send_tool_call(
+                session_id=session_id,
+                call_id=call_id,
+                tool_name="importLines",
+                arguments=arguments,
+                timeout=_IMPORT_LINES_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("importLines failed: session=%s file=%s error=%s", session_id, routing_result, exc)
+            return f"已生成布线结果，但调用 EDA 导入工具 importLines 失败：{exc}"
+        return self._format_import_lines_status(result)
+
+    @staticmethod
+    def _first_pin_list(*values: Any) -> list[str]:
+        for value in values:
+            pins = WebSocketAdapter._coerce_pin_list(value)
+            if pins:
+                return pins
+        return []
+
+    @staticmethod
+    def _coerce_pin_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = [item.strip() for item in re.split(r"[,;，；\s]+", text) if item.strip()]
+            return WebSocketAdapter._coerce_pin_list(parsed)
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @staticmethod
+    def _format_import_lines_status(result: Any) -> str:
+        parsed = result
+        if isinstance(result, str):
+            text = result.strip()
+            if not text:
+                return "已调用 EDA 导入工具 importLines。"
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return f"EDA 导入结果：{text[:240]}"
+        if isinstance(parsed, dict):
+            success = parsed.get("success")
+            ok = parsed.get("ok")
+            if success is False or ok is False:
+                message = parsed.get("message") or parsed.get("error") or parsed
+                return f"已调用 importLines，但 EDA 返回导入失败：{message}"
+            message = parsed.get("message") or parsed.get("result") or parsed.get("status")
+            if message:
+                return f"EDA 导入结果：{str(message)[:240]}"
+            return "EDA 导入完成。"
+        if parsed is True:
+            return "EDA 导入完成。"
+        return f"EDA 导入结果：{str(parsed)[:240]}"
+
+    async def _import_reroute_result(self, session_id: str, fields: Dict[str, Any]) -> str:
+        txt_path = str(fields.get("routedLayoutTxtFilePath") or "").strip()
+        if not txt_path:
+            return ""
+
+        call_id = f"import_reroute_{uuid.uuid4().hex[:8]}"
+        logger.info("正在导入版图: session=%s file=%s timeout=%.1fs", session_id, txt_path, _IMPORT_LINES_TIMEOUT_SECONDS)
+        await self.send(
+            chat_id=session_id,
+            content="正在导入版图，请稍候...",
+            metadata={"is_final": False},
+        )
+        try:
+            result = await self.send_tool_call(
+                session_id=session_id,
+                call_id=call_id,
+                tool_name="importLines",
+                arguments={"filePath": txt_path, "successPins": [], "failedPins": []},
+                timeout=_IMPORT_LINES_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("reroute importLines failed: session=%s file=%s error=%s", session_id, txt_path, exc)
+            return f"已生成重布结果，但调用 EDA 导入工具 importLines 失败：{exc}"
+        return self._format_import_lines_status(result)
 
     async def _bootstrap_get_project_data(
         self,
@@ -1104,7 +1232,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
-        将 Agent 最终响应发回给 PCB 客户端（非流式，isFinal=null）。
+        将 Agent 最终响应发回给 PCB 客户端（非流式默认 isFinal=true）。
 
         处理：
         1. 提取 ##THINKING## 块 → thinking 字段
@@ -1118,8 +1246,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         thinking, content_no_thinking = self._extract_thinking(content)
 
         stream_is_final = None
+        explicit_is_final = None
         if isinstance(metadata, dict):
             stream_is_final = metadata.get("stream_is_final")
+            explicit_is_final = metadata.get("is_final")
+        outbound_is_final = (
+            bool(explicit_is_final)
+            if explicit_is_final is not None
+            else (stream_is_final if stream_is_final is not None else True)
+        )
 
         if stream_is_final is not None:
             content_no_thinking, stream_fields = self._peel_stream_pcb_protocol(
@@ -1173,13 +1308,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         if stream_is_final is not None and not stream_is_final and pcb_fields:
             self._remember_stream_pcb_fields(chat_id, pcb_fields)
             pcb_fields = {}
+        if stream_is_final is None or stream_is_final:
+            pcb_fields = await self._prepare_final_pcb_fields_for_frontend(chat_id, pcb_fields)
         clean_content = self._fallback_visible_content_for_fields(clean_content, pcb_fields)
 
         body: Dict[str, Any] = {
             "msgId": msg_id,
             "role": "agent",
             "content": clean_content,
-            "isFinal": stream_is_final if stream_is_final is not None else None,
+            "isFinal": outbound_is_final,
         }
 
         if thinking:
@@ -1290,6 +1427,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
             pcb_fields.update(extra_fields)
             clean_content = self._strip_stream_protocol_leak(clean_content)
+            pcb_fields = await self._prepare_final_pcb_fields_for_frontend(chat_id, pcb_fields)
             self._stream_content_buffers[chat_id] = clean_content
             emitted_fields = pcb_fields
 
@@ -1458,8 +1596,32 @@ class WebSocketAdapter(BasePlatformAdapter):
     @staticmethod
     def _is_strong_pcb_intent(text: str) -> bool:
         return bool(
+            _PCB_SHORT_COMMAND_RE.search(text)
+            or
             (_PCB_ACTION_RE.search(text) and _PCB_DOMAIN_RE.search(text))
             or _SELECTION_RE.search(text)
+        )
+
+    def _should_use_route_intent_llm(self, session_id: str, text: str) -> bool:
+        text = (text or "").strip()
+        if not text:
+            return False
+        if _CHAT_GREETING_RE.search(text):
+            return False
+        if self._is_explicit_no_operation(text):
+            return False
+        if _CHAT_ONLY_RE.search(text) and not (
+            self._is_strong_pcb_intent(text) or _REROUTE_RE.search(text)
+        ):
+            return False
+        if self._session_flow_states.get(session_id, _FLOW_IDLE) != _FLOW_IDLE:
+            return True
+        if self._session_mode(session_id) == _ROUTE_MODE_PCB and self._is_mode_locked(session_id):
+            return True
+        return bool(
+            self._is_strong_pcb_intent(text)
+            or _REROUTE_RE.search(text)
+            or _PCB_DOMAIN_RE.search(text)
         )
 
     @staticmethod
@@ -1630,6 +1792,11 @@ class WebSocketAdapter(BasePlatformAdapter):
             if report:
                 return report
             return "布线完成，结果已发送到前端。"
+        if "rerouteResult" in pcb_fields or "routedLayoutTxtFilePath" in pcb_fields:
+            explanation = str(pcb_fields.get("explanation") or "").strip()
+            if explanation:
+                return explanation
+            return "局部拆线重布已完成，结果已发送到前端。"
         if "selection" in pcb_fields:
             selection = pcb_fields.get("selection")
             if isinstance(selection, list) and len(selection) == 1:
@@ -1642,6 +1809,60 @@ class WebSocketAdapter(BasePlatformAdapter):
         if "boardSummary" in pcb_fields or "fanoutContext" in pcb_fields:
             return "已完成版图分析。"
         return content
+
+    async def _prepare_final_pcb_fields_for_frontend(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
+        fields = self._sanitize_public_pcb_fields(pcb_fields)
+        if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields:
+            return fields
+        import_status = await self._import_reroute_result(session_id, fields)
+        if import_status:
+            explanation = str(fields.get("explanation") or "").strip()
+            fields["explanation"] = f"{explanation}\n\n{import_status}".strip() if explanation else import_status
+        return fields
+
+    @staticmethod
+    def _sanitize_public_pcb_fields(pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(pcb_fields, dict) or not pcb_fields:
+            return {}
+        sanitized = WebSocketAdapter._strip_internal_board_paths(pcb_fields)
+        return sanitized if isinstance(sanitized, dict) else {}
+
+    @staticmethod
+    def _strip_internal_board_paths(value: Any) -> Any:
+        internal_keys = {
+            "routedBoardDataFilePath",
+            "originalBoardDataFilePath",
+            "droppedBoardDataFilePath",
+            "filledBoardDataFilePath",
+            "kicadPatch",
+            "kicad_patch",
+            "patchText",
+            "rawModelOutput",
+        }
+        if isinstance(value, dict):
+            return {
+                key: WebSocketAdapter._strip_internal_board_paths(item)
+                for key, item in value.items()
+                if key not in internal_keys and not WebSocketAdapter._is_internal_kicad_path(item)
+            }
+        if isinstance(value, list):
+            return [
+                WebSocketAdapter._strip_internal_board_paths(item)
+                for item in value
+                if not WebSocketAdapter._is_internal_kicad_path(item)
+            ]
+        if isinstance(value, str):
+            return re.sub(
+                r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)",
+                "内部版图文件",
+                value,
+                flags=re.IGNORECASE,
+            ).replace(".kicad_pcb", "")
+        return value
+
+    @staticmethod
+    def _is_internal_kicad_path(value: Any) -> bool:
+        return isinstance(value, str) and value.lower().endswith(".kicad_pcb")
 
     @staticmethod
     def _fanout_confirmation_content(fanout_params: Any) -> str:

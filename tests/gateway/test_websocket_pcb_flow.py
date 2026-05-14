@@ -117,10 +117,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
         "constraints": {"LineWidth": 4, "LineSpacing": 3},
     }
     route_result = {
-        "routingResult": (
-            '(routes (route (net "GND") (layer "SIG03") '
-            '(path (line (start 1 2) (end 3 4) (width 3)))))'
-        ),
+        "routingResult": r"F:\router_work\routing_input.txt",
         "report": "布线连通率: 100%",
     }
     from tools import pcb_tools
@@ -214,12 +211,38 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
 
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 routed_msg = await _recv_json(ws)
-                if routed_msg["type"] == "message" and routed_msg["body"]["content"].startswith("已确认，正在调用"):
+                saw_import_status = False
+                while routed_msg["type"] == "message":
+                    content = routed_msg["body"].get("content", "")
+                    if content == "正在导入版图，请稍候...":
+                        saw_import_status = True
+                        assert routed_msg["body"]["isFinal"] is False
+                    elif content.startswith("已确认，正在调用"):
+                        assert routed_msg["body"]["isFinal"] is True
+                    else:
+                        raise AssertionError(f"Unexpected message before importLines: {routed_msg}")
                     routed_msg = await _recv_json(ws)
+                assert saw_import_status
+                assert routed_msg["type"] == "tool-calls"
+                assert routed_msg["body"]["content"]["name"] == "importLines"
+                assert routed_msg["body"]["content"]["arguments"] == {
+                    "filePath": route_result["routingResult"],
+                    "successPins": [],
+                    "failedPins": [],
+                }
+                await ws.send_str(
+                    _tool_result(
+                        routed_msg["body"]["content"]["id"],
+                        {"success": True, "message": "导入完成"},
+                    )
+                )
+
+                routed_msg = await _recv_json(ws)
                 assert routed_msg["type"] == "message"
                 assert routed_msg["body"]["isFinal"] is True
                 assert routed_msg["body"]["routingResult"] == route_result["routingResult"]
                 assert routed_msg["body"]["report"] == route_result["report"]
+                assert "导入完成" in routed_msg["body"]["content"]
 
     finally:
         await adapter.disconnect()
@@ -339,7 +362,11 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
             "type": "local_reroute",
             "selectedNets": ["net13", "net17"],
             "operations": [{"action": "reroute_net", "net": "net13"}],
+            "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
+            "routedLayoutTxtFilePath": r"F:\public\routed.txt",
         },
+        "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
+        "routedLayoutTxtFilePath": r"F:\public\routed.txt",
         "checkReport": {"passed": True, "checks": []},
         "explanation": "局部重布结果已生成",
     }
@@ -371,9 +398,37 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
 
                 msg = await _recv_json(ws)
                 assert msg["type"] == "message"
-                assert msg["body"]["rerouteResult"] == reroute_fields["rerouteResult"]
+                assert msg["body"]["content"] == "正在导入版图，请稍候..."
+                assert msg["body"]["isFinal"] is False
+
+                msg = await _recv_json(ws)
+                assert msg["type"] == "tool-calls"
+                assert msg["body"]["content"]["name"] == "importLines"
+                assert msg["body"]["content"]["arguments"] == {
+                    "filePath": r"F:\public\routed.txt",
+                    "successPins": [],
+                    "failedPins": [],
+                }
+                await ws.send_str(
+                    _tool_result(
+                        msg["body"]["content"]["id"],
+                        {"success": True, "message": "导入完成"},
+                    )
+                )
+
+                msg = await _recv_json(ws)
+                assert msg["type"] == "message"
+                assert msg["body"]["rerouteResult"] == {
+                    "type": "local_reroute",
+                    "selectedNets": ["net13", "net17"],
+                    "operations": [{"action": "reroute_net", "net": "net13"}],
+                    "routedLayoutTxtFilePath": r"F:\public\routed.txt",
+                }
+                assert msg["body"]["routedLayoutTxtFilePath"] == r"F:\public\routed.txt"
+                assert "routedBoardDataFilePath" not in msg["body"]
                 assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
-                assert msg["body"]["explanation"] == reroute_fields["explanation"]
+                assert "导入完成" in msg["body"]["explanation"]
+                assert ".kicad_pcb" not in json.dumps(msg["body"], ensure_ascii=False)
     finally:
         await adapter.disconnect()
 
@@ -382,6 +437,48 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
 
 def test_websocket_reroute_fields_round_trip():
     asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip())
+
+
+async def _run_websocket_failed_reroute_does_not_import() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-failed-no-import"
+    adapter._connections[session_id] = (ws, "proj-reroute-failed")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content=(
+            "局部拆线重布未通过 DRC。\n\n"
+            "##PCB_FIELDS##\n"
+            + json.dumps(
+                {
+                    "rerouteResult": {
+                        "type": "local_reroute",
+                        "drcPassed": False,
+                        "routedBoardDataFilePath": r"F:\internal\failed.kicad_pcb",
+                    },
+                    "checkReport": {"passed": False, "checks": []},
+                    "explanation": r"DRC 未通过，内部路径 F:\internal\failed.kicad_pcb 不应给前端。",
+                },
+                ensure_ascii=False,
+            )
+            + "\n##PCB_FIELDS_END##"
+        ),
+        metadata={"stream_is_final": True},
+    )
+
+    assert result.success is True
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["type"] == "message"
+    body = ws.sent[0]["body"]
+    assert body["rerouteResult"]["drcPassed"] is False
+    assert "routedLayoutTxtFilePath" not in body
+    assert "routedBoardDataFilePath" not in body["rerouteResult"]
+    assert ".kicad_pcb" not in json.dumps(body, ensure_ascii=False)
+
+
+def test_websocket_failed_reroute_does_not_import():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_failed_reroute_does_not_import())
 
 
 async def _run_websocket_reroute_sends_skill_status() -> None:
@@ -718,6 +815,44 @@ def test_routing_result_report_visible_fallback():
     assert "通孔数量：126" in content
 
 
+async def _run_plain_send_defaults_to_final() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-plain-chat"
+    adapter._connections[session_id] = (ws, "proj-plain-chat")
+
+    result = await adapter.send(chat_id=session_id, content="你好，我在。")
+
+    assert result.success is True
+    assert ws.sent[-1]["body"]["content"] == "你好，我在。"
+    assert ws.sent[-1]["body"]["isFinal"] is True
+
+
+def test_plain_send_defaults_to_final():
+    asyncio.get_event_loop().run_until_complete(_run_plain_send_defaults_to_final())
+
+
+async def _run_plain_status_send_can_mark_non_final() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-status-send"
+    adapter._connections[session_id] = (ws, "proj-status-send")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content="⚠️ Empty response from model — retrying (1/3)",
+        metadata={"is_final": False},
+    )
+
+    assert result.success is True
+    assert ws.sent[-1]["body"]["content"] == "⚠️ Empty response from model — retrying (1/3)"
+    assert ws.sent[-1]["body"]["isFinal"] is False
+
+
+def test_plain_status_send_can_mark_non_final():
+    asyncio.get_event_loop().run_until_complete(_run_plain_status_send_can_mark_non_final())
+
+
 async def _run_pcb_outbound_trace_log(tmp_path) -> None:
     adapter = _make_adapter(
         trace_pcb_messages=True,
@@ -938,6 +1073,36 @@ async def test_handle_user_message_chat_does_not_inject_project_id():
 
 
 @pytest.mark.asyncio
+async def test_plain_greeting_skips_route_intent_llm():
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    seen = {}
+
+    async def fail_classify(**kwargs):
+        raise AssertionError("plain greeting should not call route intent LLM")
+
+    async def handler(event):
+        seen["text"] = event.text
+        seen["raw"] = event.raw_message
+        return "你好，我在。"
+
+    adapter._classify_route_intent_with_llm = fail_classify
+    adapter.set_message_handler(handler)
+    ws = _FakeWS()
+    adapter._connections["sess-greeting"] = (ws, "proj-greeting")
+
+    await adapter._handle_user_message(
+        {"type": "message", "body": {"role": "user", "content": "你好"}},
+        "sess-greeting",
+        "proj-greeting",
+    )
+
+    assert seen["text"] == "你好"
+    assert seen["raw"]["options"]["route_mode"] == "chat"
+    assert ws.sent[-1]["body"]["content"] == "你好，我在。"
+    assert ws.sent[-1]["body"]["isFinal"] is True
+
+
+@pytest.mark.asyncio
 async def test_send_tool_call_includes_session_and_project():
     adapter = _make_adapter()
     ws = _FakeWS()
@@ -965,6 +1130,46 @@ async def test_send_tool_call_includes_session_and_project():
     assert result == "(pcb_data)"
 
 
+@pytest.mark.asyncio
+async def test_import_fanout_result_calls_import_lines():
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-import-lines"
+    adapter._connections[session_id] = (ws, "proj-import-lines")
+
+    task = asyncio.create_task(
+        adapter._import_fanout_result(
+            session_id,
+            {"successPins": ["U27.B13"], "failedPins": ["U27.B27"]},
+            {"routingResult": r"F:\router_work\routing_input.txt"},
+        )
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if len(ws.sent) >= 2:
+            break
+
+    status_msg = next(item for item in ws.sent if item["type"] == "message")
+    assert status_msg["type"] == "message"
+    assert status_msg["body"]["content"] == "正在导入版图，请稍候..."
+    assert status_msg["body"]["isFinal"] is False
+
+    sent = next(item for item in ws.sent if item["type"] == "tool-calls")
+    assert sent["type"] == "tool-calls"
+    assert sent["body"]["content"]["name"] == "importLines"
+    assert sent["body"]["content"]["arguments"] == {
+        "filePath": r"F:\router_work\routing_input.txt",
+        "successPins": ["U27.B13"],
+        "failedPins": ["U27.B27"],
+    }
+
+    adapter._resolve_tool_result(
+        json.loads(_tool_result(sent["body"]["content"]["id"], {"success": True, "message": "导入完成"}))
+    )
+    status = await task
+    assert "导入完成" in status
+
+
 def test_rule_validation_rejects_llm_chat_for_strong_pcb_request():
     adapter = _make_adapter()
 
@@ -975,6 +1180,27 @@ def test_rule_validation_rejects_llm_chat_for_strong_pcb_request():
     )
 
     assert decision.mode == "pcb"
+    assert decision.reason == "pcb_entry"
+    assert decision.bootstrap_get_project is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BGA逃逸",
+        "BGA扇出",
+        "逃逸布线",
+        "PCB布线",
+        "fanout",
+    ],
+)
+def test_short_pcb_commands_enter_fanout_flow(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-short-pcb-command", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_entry"
     assert decision.reason == "pcb_entry"
     assert decision.bootstrap_get_project is True
 

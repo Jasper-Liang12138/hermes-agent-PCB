@@ -92,6 +92,7 @@ python test_client/ws_test_client.py --host 127.0.0.1 --port 8765 --session-id s
 
 - `getProjectData`：返回一段简化的版图字符串
 - `route`：返回一个简化的布线结果对象
+- `importLines`：返回一个简化的导入成功对象
 - `GetSelectedElements`：返回一个简化的选择列表
 
 客户端回包格式如下：
@@ -119,8 +120,8 @@ python test_client/ws_test_client.py --host 127.0.0.1 --port 8765 --session-id s
 2. 再启动客户端：`python test_client/ws_test_client.py --project-id proj123 --content "请帮我做BGA逃逸"`
 3. 当服务端发出 `getProjectData` 时，直接回车使用默认 mock 数据
 4. 当服务端返回 `notice` 或 `fanout_params` 后，再根据提示输入下一条用户消息
-5. 当服务端发出 `route` 时，继续回车使用默认 mock 数据
-6. 观察最终 `routing_result` 的输出格式
+5. 当服务端发出 `importLines` 时，继续回车使用默认 mock 数据
+6. 观察最终 `routingResult` 和报告的输出格式
 
 ## 依赖
 

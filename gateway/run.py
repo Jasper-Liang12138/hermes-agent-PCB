@@ -7773,6 +7773,8 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _status_send_metadata = dict(_status_thread_metadata or {})
+        _status_send_metadata["is_final"] = False
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -7782,7 +7784,7 @@ class GatewayRunner:
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_status_thread_metadata,
+                        metadata=_status_send_metadata,
                     ),
                     _loop_for_step,
                 )
@@ -7916,7 +7918,7 @@ class GatewayRunner:
                         _status_adapter.send(
                             _status_chat_id,
                             text,
-                            metadata=_status_thread_metadata,
+                            metadata=_status_send_metadata,
                         ),
                         _loop_for_step,
                     )
@@ -7995,7 +7997,7 @@ class GatewayRunner:
                         _status_adapter.send(
                             _status_chat_id,
                             message,
-                            metadata=_status_thread_metadata,
+                            metadata=_status_send_metadata,
                         ),
                         _loop_for_step,
                     )
@@ -8141,7 +8143,7 @@ class GatewayRunner:
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=_status_send_metadata,
                         ),
                         _loop_for_step,
                     ).result(timeout=15)
@@ -8414,7 +8416,7 @@ class GatewayRunner:
                     await _notify_adapter.send(
                         source.chat_id,
                         f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
+                        metadata=_status_send_metadata,
                     )
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
@@ -8509,7 +8511,7 @@ class GatewayRunner:
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
                                     f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    metadata=_status_send_metadata,
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)

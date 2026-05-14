@@ -136,7 +136,7 @@ port = 7073
 7. Agent 调用前端 `deleteTracesById(ids)` 删除选中走线。
 8. Agent 调用 `getProjectData` 获取删除后的新版图数据。
 9. Agent 生成局部重布结果和检查报告。
-10. Agent 返回 `rerouteResult`、`checkReport`、`explanation`，如果生成了回填文件，还会返回 `routedBoardDataFilePath`。
+10. Agent 返回 `rerouteResult`、`checkReport`、`explanation`，如果 DRC 通过并生成了可导入文件，还会返回 `routedLayoutTxtFilePath`。
 
 推荐用户话术：
 
@@ -232,7 +232,7 @@ BGA 扇出布线输出：
 ```json
 {
   "rerouteResult": {...},
-  "routedBoardDataFilePath": "F:\\...\\.hermes_reroute\\xxx.kicad_pcb",
+  "routedLayoutTxtFilePath": "F:\\...\\.hermes_reroute\\txt\\xxx.txt",
   "checkReport": {...},
   "explanation": "..."
 }
@@ -250,4 +250,3 @@ BGA 扇出布线输出：
 ```powershell
 Get-Content .\logs\pcb_websocket_trace.jsonl -Tail 20
 ```
-

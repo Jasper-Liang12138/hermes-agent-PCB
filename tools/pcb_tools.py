@@ -26,6 +26,7 @@ import uuid
 import logging
 import re
 import tempfile
+import importlib.util
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import Future as ThreadFuture
 from typing import Dict, Any, Optional
@@ -1406,10 +1407,178 @@ def _read_board_file(path_text: str) -> tuple[str, str]:
         return "", str(path)
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _convert_module_path() -> Path:
+    configured = os.getenv("PCB_CONVERT_PY", "").strip()
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured)))
+    candidates = [
+        _repo_root() / "convert.py",
+    ]
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        bundle_path = Path(bundled_root)
+        candidates.insert(0, bundle_path / "convert.py")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _load_convert_module():
+    module_path = _convert_module_path()
+    if not module_path.is_file():
+        raise FileNotFoundError(f"convert.py not found: {module_path}")
+    spec = importlib.util.spec_from_file_location("_hermes_pcb_convert", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load convert.py from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_hermes_pcb_convert"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _looks_like_kicad_board_data(text: str) -> bool:
+    return bool(re.search(r"(?is)^\s*\(\s*kicad_pcb\b", text or ""))
+
+
+def _looks_like_layout_txt_data(text: str) -> bool:
+    return bool(re.search(r"(?is)^\s*\(\s*layout\b|Pcb-Design_Version|layermanager|conductives", text or ""))
+
+
+def _safe_reroute_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._")
+    return cleaned[:96] or "reroute"
+
+
+def _write_internal_board_data(
+    *,
+    board_data: str,
+    board_path: str,
+    output_dir: str,
+    session_id: str,
+    label: str,
+) -> tuple[str, str, list[str]]:
+    """
+    Normalize frontend PCB Builder txt/S-expression data into an internal KiCad file.
+
+    Public websocket fields must not expose the KiCad path. The returned path is
+    only used by reroute DRC/patch internals and output conversion.
+    """
+    notes: list[str] = []
+    if board_path and str(board_path).lower().endswith(".kicad_pcb"):
+        text, resolved = _read_board_file(board_path)
+        if text:
+            return text, resolved, notes
+
+    if _looks_like_kicad_board_data(board_data):
+        base_dir = Path(output_dir) / "_internal"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        path = base_dir / f"{_safe_reroute_name(session_id)}_{label}.kicad_pcb"
+        path.write_text(board_data, encoding="utf-8")
+        return board_data, str(path), notes
+
+    if not board_data:
+        return "", "", notes
+
+    if not _looks_like_layout_txt_data(board_data) and not board_path.lower().endswith(".txt"):
+        return board_data, "", notes
+
+    base_dir = Path(output_dir) / "_internal"
+    txt_dir = base_dir / "txt"
+    kicad_dir = base_dir / "kicad"
+    txt_dir.mkdir(parents=True, exist_ok=True)
+    kicad_dir.mkdir(parents=True, exist_ok=True)
+
+    if board_path and str(board_path).lower().endswith(".txt") and Path(board_path).is_file():
+        txt_path = Path(board_path)
+    else:
+        txt_path = txt_dir / f"{_safe_reroute_name(session_id)}_{label}.txt"
+        txt_path.write_text(board_data, encoding="utf-8")
+
+    convert_mod = _load_convert_module()
+    result = convert_mod.convert_one("txt_to_kicad", txt_path, kicad_dir, None)
+    output_path = Path(str(result.get("output") or ""))
+    if not output_path.is_file():
+        raise RuntimeError(f"txt_to_kicad did not create output for reroute input: {txt_path}")
+    notes.append(f"converted_input_txt_to_kicad:{txt_path}")
+    return output_path.read_text(encoding="utf-8"), str(output_path), notes
+
+
+def _convert_internal_kicad_to_public_txt(
+    *,
+    kicad_path: str,
+    output_dir: str,
+    session_id: str,
+) -> tuple[str, list[str]]:
+    if not kicad_path:
+        return "", []
+    path = Path(kicad_path)
+    if path.suffix.lower() == ".txt":
+        return str(path), []
+    if path.suffix.lower() != ".kicad_pcb" or not path.is_file():
+        return "", []
+
+    txt_dir = Path(output_dir) / "txt"
+    txt_dir.mkdir(parents=True, exist_ok=True)
+    convert_mod = _load_convert_module()
+    result = convert_mod.convert_one("kicad_to_txt", path, txt_dir, None)
+    output_path = Path(str(result.get("output") or ""))
+    if not output_path.is_file():
+        raise RuntimeError(f"kicad_to_txt did not create output for reroute result: {path}")
+    return str(output_path), [f"converted_output_kicad_to_txt:{output_path}"]
+
+
+_INTERNAL_REROUTE_PATH_KEYS = {
+    "routedBoardDataFilePath",
+    "originalBoardDataFilePath",
+    "droppedBoardDataFilePath",
+    "filledBoardDataFilePath",
+    "kicadPatch",
+    "kicad_patch",
+    "patchText",
+    "rawModelOutput",
+}
+
+_INTERNAL_KICAD_PATH_RE = re.compile(
+    r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)",
+    re.IGNORECASE,
+)
+
+
+def _strip_internal_reroute_paths(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_internal_reroute_paths(item)
+            for key, item in value.items()
+            if key not in _INTERNAL_REROUTE_PATH_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_internal_reroute_paths(item) for item in value]
+    if isinstance(value, str):
+        return _INTERNAL_KICAD_PATH_RE.sub("内部版图文件", value).replace(".kicad_pcb", "")
+    return value
+
+
+def _public_reroute_payload(payload: Dict[str, Any], public_txt_path: str) -> Dict[str, Any]:
+    result = _strip_internal_reroute_paths(payload)
+    if not isinstance(result, dict):
+        result = {}
+    if public_txt_path:
+        result["routedLayoutTxtFilePath"] = public_txt_path
+        reroute_result = dict(result.get("rerouteResult") or {})
+        reroute_result["routedLayoutTxtFilePath"] = public_txt_path
+        result["rerouteResult"] = reroute_result
+    return result
+
+
 def _extract_board_file_path_from_text(text: str) -> str:
     if not isinstance(text, str) or not text.strip():
         return ""
-    match = re.search(r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)", text)
+    match = re.search(r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.(?:kicad_pcb|txt)|/[^\s\"'，,;；]+\.(?:kicad_pcb|txt))", text)
     return match.group(1) if match else ""
 
 
@@ -1979,6 +2148,33 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
     constraints = user_data_obj.get("constraints") or {}
     max_drc_iterations = _get_max_drc_iterations(user_data_obj)
     output_dir = _resolve_reroute_output_dir(user_data_obj, str(original_board_path or ""), session_id or "")
+    conversion_notes: list[str] = []
+    internal_dropped_board_data, internal_dropped_board_path, notes = _write_internal_board_data(
+        board_data=dropped_board_data,
+        board_path=str(dropped_board_path or ""),
+        output_dir=output_dir,
+        session_id=session_id or "session",
+        label="dropped",
+    )
+    conversion_notes.extend(notes)
+    if internal_dropped_board_data:
+        dropped_board_data = internal_dropped_board_data
+        dropped_board_path = internal_dropped_board_path
+
+    internal_original_board_data, internal_original_board_path, notes = _write_internal_board_data(
+        board_data=original_board_data,
+        board_path=str(original_board_path or ""),
+        output_dir=output_dir,
+        session_id=session_id or "session",
+        label="original",
+    )
+    conversion_notes.extend(notes)
+    if internal_original_board_data:
+        original_board_data = internal_original_board_data
+        original_board_path = internal_original_board_path
+    elif dropped_board_data:
+        original_board_data = dropped_board_data
+        original_board_path = str(dropped_board_path or original_board_path or "")
 
     check_report = {
         "passed": bool(dropped_board_data),
@@ -2026,7 +2222,42 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
             regenerate=_regenerate,
         )
     payload = _append_reroute_explainability_content(payload)
-    return json.dumps(payload, ensure_ascii=False)
+    public_txt_path = ""
+    try:
+        routed_internal_path = str(payload.get("routedBoardDataFilePath") or "")
+        if not routed_internal_path and isinstance(payload.get("rerouteResult"), dict):
+            routed_internal_path = str(payload["rerouteResult"].get("routedBoardDataFilePath") or "")
+        drc_passed = True
+        if isinstance(payload.get("rerouteResult"), dict) and "drcPassed" in payload["rerouteResult"]:
+            drc_passed = bool(payload["rerouteResult"].get("drcPassed"))
+        if drc_passed:
+            public_txt_path, notes = _convert_internal_kicad_to_public_txt(
+                kicad_path=routed_internal_path,
+                output_dir=output_dir,
+                session_id=session_id or "session",
+            )
+            conversion_notes.extend(notes)
+    except Exception as exc:
+        logger.warning("Failed converting reroute result to public txt: %s", exc)
+        check_report = dict(payload.get("checkReport") or check_report)
+        checks = list(check_report.get("checks") or [])
+        checks.append({"name": "txt_output_conversion", "passed": False, "detail": str(exc)})
+        check_report["checks"] = checks
+        check_report["passed"] = False
+        payload["checkReport"] = check_report
+        payload["explanation"] = f"{payload.get('explanation', '')} 输出 txt 转换失败：{exc}".strip()
+    public_payload = _public_reroute_payload(payload, public_txt_path)
+    if public_txt_path:
+        _transport.set_pending_pcb_fields(
+            {
+                "rerouteResult": public_payload.get("rerouteResult") or {},
+                "routedLayoutTxtFilePath": public_txt_path,
+                "checkReport": public_payload.get("checkReport") or {},
+                "explanation": public_payload.get("explanation") or "",
+            },
+            session_id=session_id,
+        )
+    return json.dumps(public_payload, ensure_ascii=False)
 
 
 registry.register(

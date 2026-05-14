@@ -620,7 +620,46 @@ def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, t
     assert payload["rerouteResult"]["source"] == "fake_model"
 
 
-def test_reroute_drc_pass_returns_routed_board_path(monkeypatch, tmp_path):
+def test_reroute_converts_frontend_txt_input_internally(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-txt"
+    transport.set_session_mode("sess-pcb-reroute-txt", "pcb")
+    frontend_txt = "(layout (Pcb-Design_Version \"PCB Builder V1.0\"))"
+    transport.cache_reroute_context(
+        {
+            "selectedTraceIds": ["2386476278"],
+            "droppedBoardData": frontend_txt,
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-txt",
+    )
+    seen = {}
+
+    def _fake_internal_board_data(*, board_data, board_path, output_dir, session_id, label):
+        assert board_data == frontend_txt
+        assert label in {"dropped", "original"}
+        internal_path = tmp_path / f"{label}.kicad_pcb"
+        internal_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+        return "(kicad_pcb\n)\n", str(internal_path), []
+
+    def _fake_generate(**kwargs):
+        seen.update(kwargs)
+        return pcb_tools._build_fallback_reroute_payload(**kwargs)
+
+    monkeypatch.setattr(pcb_tools, "_write_internal_board_data", _fake_internal_board_data)
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+
+    result = pcb_tools.reroute(json.dumps({"maxDrcIterations": 0}, ensure_ascii=False), session_id="sess-pcb-reroute-txt")
+    payload = json.loads(result)
+
+    assert seen["dropped_board_data"].startswith("(kicad_pcb")
+    assert seen["dropped_board_path"].endswith("dropped.kicad_pcb")
+    assert "routedBoardDataFilePath" not in payload
+    assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-reroute-drc-pass"
     transport.set_session_mode("sess-pcb-reroute-drc-pass", "pcb")
@@ -654,15 +693,25 @@ def test_reroute_drc_pass_returns_routed_board_path(monkeypatch, tmp_path):
             drc_result={"ok": True, "pass": True},
         )
 
+    def _fake_convert(*, kicad_path, output_dir, session_id):
+        assert kicad_path == str(tmp_path / "routed.kicad_pcb")
+        txt_path = tmp_path / "routed.txt"
+        txt_path.write_text("(layout routed)", encoding="utf-8")
+        return str(txt_path), []
+
     monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+    monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", _fake_convert)
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-drc-pass")
     payload = json.loads(result)
 
     assert payload["rerouteResult"]["drcPassed"] is True
-    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(tmp_path / "routed.kicad_pcb")
-    assert payload["rerouteResult"]["originalBoardDataFilePath"] == str(original_path)
+    assert payload["rerouteResult"]["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
+    assert payload["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
+    assert "routedBoardDataFilePath" not in payload
+    assert "originalBoardDataFilePath" not in payload["rerouteResult"]
+    assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
     assert payload["checkReport"]["passed"] is True
 
 
@@ -722,7 +771,7 @@ def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):
     assert generate_history[1][0]["failureSummary"] == 'hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}'
 
 
-def test_reroute_drc_failure_returns_original_board_path(monkeypatch, tmp_path):
+def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-reroute-drc-fail"
     transport.set_session_mode("sess-pcb-reroute-drc-fail", "pcb")
@@ -751,13 +800,20 @@ def test_reroute_drc_failure_returns_original_board_path(monkeypatch, tmp_path):
             failure_summary=f"iteration {kwargs['iteration']} failed",
         )
 
+    def _fake_convert(**kwargs):
+        raise AssertionError("DRC failure must not export txt for importLines")
+
     monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+    monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", _fake_convert)
 
     result = pcb_tools.reroute(json.dumps({"maxDrcIterations": 2}, ensure_ascii=False), session_id="sess-pcb-reroute-drc-fail")
     payload = json.loads(result)
 
     assert payload["rerouteResult"]["drcPassed"] is False
-    assert payload["rerouteResult"]["routedBoardDataFilePath"] == str(original_path)
+    assert "routedLayoutTxtFilePath" not in payload["rerouteResult"]
+    assert "routedLayoutTxtFilePath" not in payload
+    assert "routedBoardDataFilePath" not in payload["rerouteResult"]
     assert payload["rerouteResult"]["drcFailureReasons"] == ["iteration 1 failed", "iteration 2 failed"]
+    assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
     assert payload["checkReport"]["passed"] is False

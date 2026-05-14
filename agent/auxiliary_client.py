@@ -41,6 +41,8 @@ Payment / credit exhaustion fallback:
 import json
 import logging
 import os
+import copy
+import re
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -921,6 +923,47 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
 def _current_custom_base_url() -> str:
     custom_base, _, _ = _resolve_custom_runtime()
     return custom_base or ""
+
+
+def _is_qwen3_no_think_endpoint(model: Optional[str], base_url: Optional[str]) -> bool:
+    if os.getenv("HERMES_QWEN3_AUTO_NO_THINK", "1").lower() in {"0", "false", "no", "off"}:
+        return False
+    model_lower = (model or "").lower()
+    base_lower = (base_url or "").lower()
+    return (
+        "qwen3" in model_lower
+        or "wishub-x5.ctyun.cn" in base_lower
+        or os.getenv("HERMES_QWEN3_FORCE_NO_THINK", "").lower() in {"1", "true", "yes", "on"}
+    )
+
+
+def _content_has_no_think_prefix(content: str) -> bool:
+    return bool(re.match(r"^\s*/no_think\b", content or "", flags=re.IGNORECASE))
+
+
+def _qwen3_add_no_think_to_messages(messages: list) -> list:
+    prepared = copy.deepcopy(messages)
+    for msg in reversed(prepared):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if not _content_has_no_think_prefix(content):
+                msg["content"] = "/no_think\n" + content
+            return prepared
+        if isinstance(content, list):
+            for index, part in enumerate(content):
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    if not _content_has_no_think_prefix(part["text"]):
+                        part["text"] = "/no_think\n" + part["text"]
+                    return prepared
+                if isinstance(part, str):
+                    if not _content_has_no_think_prefix(part):
+                        content[index] = "/no_think\n" + part
+                    return prepared
+            content.insert(0, {"type": "text", "text": "/no_think"})
+            return prepared
+    return prepared
 
 
 def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -2193,6 +2236,9 @@ def _build_call_kwargs(
     base_url: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    if _is_qwen3_no_think_endpoint(model, base_url):
+        messages = _qwen3_add_no_think_to_messages(messages)
+
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
