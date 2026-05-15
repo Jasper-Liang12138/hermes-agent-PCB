@@ -981,6 +981,7 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
 
         assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
         assert messages[0]["content"] == "你好"
 
     def test_qwen3_custom_endpoint_does_not_duplicate_no_think(self, agent):
@@ -992,6 +993,30 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
 
         assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_ctyun_qwen_endpoint_omits_tool_schemas(self, agent):
+        agent.base_url = "https://wishub-x5.ctyun.cn/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "sef59b42818743ca982cb821750beb3a"
+        messages = [{"role": "user", "content": "你好"}]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert "tools" not in kwargs
+        assert kwargs["messages"][0]["content"] == "/no_think\n你好"
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_ctyun_qwen_tool_schema_omit_can_be_disabled(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_CTYUN_OMIT_TOOL_SCHEMAS", "0")
+        agent.base_url = "https://wishub-x5.ctyun.cn/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "sef59b42818743ca982cb821750beb3a"
+        messages = [{"role": "user", "content": "你好"}]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert "tools" in kwargs
 
 
 class TestBuildAssistantMessage:
@@ -3478,6 +3503,31 @@ class TestStreamingApiCall:
 
         assert resp.choices[0].message.content == "Hello"
         assert resp.model == "gpt-4"
+
+    def test_qwen_stream_content_from_model_extra(self, agent):
+        chunks = [
+            SimpleNamespace(
+                model="PCB_Qwen3_32B",
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            tool_calls=None,
+                            model_extra={"content": "<think>\n\n</think>\n\nPCB阻抗控制是"},
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            ),
+            _make_chunk(content="通过控制线宽实现。", finish_reason="stop", model="PCB_Qwen3_32B"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        content = resp.choices[0].message.content
+        assert content == "<think>\n\n</think>\n\nPCB阻抗控制是通过控制线宽实现。"
+        assert agent._strip_think_blocks(content).strip() == "PCB阻抗控制是通过控制线宽实现。"
 
 
 # ===================================================================

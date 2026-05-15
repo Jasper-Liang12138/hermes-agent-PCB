@@ -4959,19 +4959,41 @@ class AIAgent:
                 if hasattr(chunk, "model") and chunk.model:
                     model_name = chunk.model
 
+                delta_extra = getattr(delta, "model_extra", None) or {}
+                if not isinstance(delta_extra, dict):
+                    delta_extra = {}
+
                 # Accumulate reasoning content
-                reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                reasoning_text = (
+                    getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                    or delta_extra.get("reasoning_content")
+                    or delta_extra.get("reasoning")
+                )
                 if reasoning_text:
                     reasoning_parts.append(reasoning_text)
                     _fire_first_delta()
                     self._fire_reasoning_delta(reasoning_text)
 
                 # Accumulate text content — fire callback only when no tool calls
-                if delta and delta.content:
-                    content_parts.append(delta.content)
+                delta_content = (
+                    getattr(delta, "content", None)
+                    or delta_extra.get("content")
+                    or delta_extra.get("text")
+                )
+                if self._is_qwen3_no_think_endpoint() and os.getenv("HERMES_DEBUG_QWEN_STREAM", "").lower() in {"1", "true", "yes", "on"}:
+                    logger.info(
+                        "Qwen stream chunk: content=%r reasoning=%r finish=%r extra_keys=%s",
+                        delta_content,
+                        reasoning_text,
+                        chunk.choices[0].finish_reason,
+                        sorted(delta_extra.keys()),
+                    )
+                if delta and delta_content:
+                    content_parts.append(delta_content)
                     if not tool_calls_acc:
                         _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
+                        self._fire_stream_delta(delta_content)
                         deltas_were_sent["yes"] = True
                     else:
                         # Tool calls suppress regular content streaming (avoids
@@ -4987,8 +5009,8 @@ class AIAgent:
                         # box is already closed (tool boundary flush).
                         if self.stream_delta_callback:
                             try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
+                                self.stream_delta_callback(delta_content)
+                                self._record_streamed_assistant_text(delta_content)
                             except Exception:
                                 pass
 
@@ -5864,6 +5886,16 @@ class AIAgent:
             or os.getenv("HERMES_QWEN3_FORCE_NO_THINK", "").lower() in {"1", "true", "yes", "on"}
         )
 
+    def _should_omit_tool_schemas_for_endpoint(self) -> bool:
+        """Return True when a known endpoint returns empty streaming chunks if tools are sent."""
+        if self.api_mode != "chat_completions":
+            return False
+        if os.getenv("HERMES_OMIT_TOOL_SCHEMAS", "").lower() in {"1", "true", "yes", "on"}:
+            return True
+        if os.getenv("HERMES_CTYUN_OMIT_TOOL_SCHEMAS", "1").lower() in {"0", "false", "no", "off"}:
+            return False
+        return "wishub-x5.ctyun.cn" in self._base_url_lower
+
     @staticmethod
     def _content_has_no_think_prefix(content: str) -> bool:
         return bool(re.match(r"^\s*/no_think\b", content or "", flags=re.IGNORECASE))
@@ -6132,7 +6164,7 @@ class AIAgent:
                 "sessionId": self.session_id or "hermes",
                 "promptId": str(uuid.uuid4()),
             }
-        if self.tools:
+        if self.tools and not self._should_omit_tool_schemas_for_endpoint():
             api_kwargs["tools"] = self.tools
 
         if self.max_tokens is not None:
@@ -6212,6 +6244,12 @@ class AIAgent:
 
         if self._is_qwen_portal():
             extra_body["vl_high_resolution_images"] = True
+        if self._is_qwen3_no_think_endpoint():
+            chat_template_kwargs = extra_body.get("chat_template_kwargs")
+            if not isinstance(chat_template_kwargs, dict):
+                chat_template_kwargs = {}
+            chat_template_kwargs["enable_thinking"] = False
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -8177,14 +8215,6 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
-                    elif self._is_qwen3_no_think_endpoint():
-                        # The deployed Qwen3/MindSpeed OpenAI-compatible gateway
-                        # supports non-streaming chat completions reliably, but
-                        # its SSE chunks may omit usable delta.content.  If we
-                        # stream it, the agent sees an empty final response even
-                        # though /v1/chat/completions returns content.
-                        _use_streaming = False
-
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
                             api_kwargs, on_first_delta=_stop_spinner
@@ -9945,6 +9975,21 @@ class AIAgent:
                         # content has inline <think> tags (model chose
                         # to reason, just no visible text).
                         _truly_empty = not final_response.strip()
+                        if _truly_empty:
+                            streamed_visible = self._strip_think_blocks(
+                                getattr(self, "_current_streamed_assistant_text", "") or ""
+                            ).strip()
+                            if streamed_visible:
+                                _turn_exit_reason = "streamed_text_fallback"
+                                logger.info(
+                                    "Final response object was empty, but %d streamed chars were delivered; "
+                                    "using streamed text as final response",
+                                    len(streamed_visible),
+                                )
+                                final_response = streamed_visible
+                                self._response_was_previewed = True
+                                self._empty_content_retries = 0
+                                break
                         if _truly_empty and not _has_structured and self._empty_content_retries < 3:
                             self._empty_content_retries += 1
                             logger.warning(
