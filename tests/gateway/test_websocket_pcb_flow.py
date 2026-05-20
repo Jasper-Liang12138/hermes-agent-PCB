@@ -92,6 +92,7 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
         "host": "127.0.0.1",
         "port": port,
         "route_intent_llm_enabled": False,
+        "fanout_param_llm_enabled": False,
         "trace_pcb_messages": False,
     }
     merged_extra.update(extra)
@@ -105,14 +106,14 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
 
     session_id = "sess-pcb-1"
     project_id = "proj-autotest-001"
-    observed_user_text: list[str] = []
 
     fanout_params = {
+        "selectedBGA": "U27",
         "routerType": "arc",
         "orderLines": [
             {"net": "GND", "layer": "SIG03", "order": 1},
-            {"net": "VCC", "layer": "SIG03", "order": 2},
-            {"net": "DDR_D0", "layer": "SIG04", "order": 3},
+            {"net": "VCC", "layer": "SIG04", "order": 2},
+            {"net": "DDR_D0", "layer": "SIG03", "order": 3},
         ],
         "constraints": {"LineWidth": 4, "LineSpacing": 3},
     }
@@ -121,57 +122,46 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
         "report": "布线连通率: 100%",
     }
     from tools import pcb_tools
+    from tools import pcb_chunking_tool
 
     def _fake_route_bga(user_data: str, session_id: str | None = None) -> str:
         assert session_id == "sess-pcb-1"
-        assert json.loads(user_data) == {**fanout_params, "selectedBGA": "U27"}
+        assert json.loads(user_data) == fanout_params
         return json.dumps(route_result, ensure_ascii=False)
 
+    def _fake_extract_bga(board_text: str, session_id: str | None = None) -> str:
+        assert board_text == "__CACHED_PROJECT_DATA__"
+        assert session_id == "sess-pcb-1"
+        return json.dumps(
+            {
+                "selection": [
+                    {"label": "U27", "detail": "BGA-256, 1.0mm pitch"},
+                    {"label": "U35", "detail": "BGA-484, 0.8mm pitch"},
+                ],
+                "boardSummary": {
+                    "stackupSummary": ["SIG03: signal", "SIG04: signal"],
+                    "packageHints": ["BGA-256 x1"],
+                    "netSummary": {
+                        "groundNets": ["GND"],
+                        "powerNets": ["VCC"],
+                        "clockNets": ["DDR_D0"],
+                        "signalNetCount": 0,
+                        "ncNetCount": 0,
+                    },
+                },
+                "fanoutContext": {
+                    "recommendedEscapeLayers": ["SIG03", "SIG04"],
+                    "recommendedLineWidth": 4,
+                    "recommendedLineSpacing": 3,
+                    "prioritySuggestion": ["ground", "power", "clock", "signal"],
+                },
+            },
+            ensure_ascii=False,
+        )
+
     monkeypatch.setattr(pcb_tools, "route_bga", _fake_route_bga)
-
-    async def handler(event):
-        observed_user_text.append(event.text)
-
-        if "帮我进行BGA逃逸布线" in event.text:
-            assert f"[projectid: {project_id}]" in event.text
-            assert "__CACHED_PROJECT_DATA__" in event.text
-            assert "不要再次调用 getProjectData" in event.text
-            return (
-                "已获取项目版图数据，请选择一个 BGA。\n\n"
-                "##PCB_FIELDS##\n"
-                '{"selection":[{"label":"U27","detail":"BGA-256, 1.0mm pitch"},'
-                '{"label":"U35","detail":"BGA-484, 0.8mm pitch"}]}\n'
-                "##PCB_FIELDS_END##"
-            )
-
-        if "routerType 已确定为 arc" in event.text:
-            return (
-                "已生成扇出参数，请确认。\n\n"
-                "##PCB_FIELDS##\n"
-                f'{json.dumps({"fanoutParams": fanout_params}, ensure_ascii=False)}\n'
-                "##PCB_FIELDS_END##"
-            )
-
-        if "确认" in event.text:
-            routed = await adapter.send_tool_call(
-                session_id=event.source.chat_id,
-                call_id="call_route",
-                tool_name="route",
-                arguments={"userData": json.dumps(fanout_params, ensure_ascii=False)},
-                timeout=3.0,
-            )
-            routed_obj = json.loads(routed) if isinstance(routed, str) else routed
-            assert routed_obj["routingResult"] == route_result["routingResult"]
-            return (
-                "布线完成。\n\n"
-                "##PCB_FIELDS##\n"
-                f'{json.dumps({"routingResult": routed_obj["routingResult"]}, ensure_ascii=False)}\n'
-                "##PCB_FIELDS_END##"
-            )
-
-        raise AssertionError(f"Unexpected user turn: {event.text}")
-
-    adapter.set_message_handler(handler)
+    monkeypatch.setattr(pcb_chunking_tool, "_extract_bga", _fake_extract_bga)
+    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
     await adapter.connect()
 
     try:
@@ -247,11 +237,6 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     finally:
         await adapter.disconnect()
 
-    assert len(observed_user_text) == 2
-    assert "帮我进行BGA逃逸布线" in observed_user_text[0]
-    assert "不要再次调用 getProjectData" in observed_user_text[0]
-    assert "routerType 已确定为 arc" in observed_user_text[1]
-
 
 def test_websocket_pcb_flow_round_trip(monkeypatch):
     asyncio.get_event_loop().run_until_complete(_run_websocket_pcb_flow_round_trip(monkeypatch))
@@ -319,10 +304,10 @@ def test_websocket_reroute_interrupts_pending_fanout_confirmation():
     assert session_id not in adapter._session_fanout_params
 
 
-def test_websocket_reroute_llm_intent_takes_priority_over_keyword_fallback():
+def test_websocket_explicit_reroute_overrides_bad_llm_chat_intent():
     adapter = _make_adapter()
 
-    chat_decision = adapter._decide_route(
+    decision = adapter._decide_route(
         "sess-reroute-llm-chat",
         "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
         llm_intent={
@@ -332,8 +317,13 @@ def test_websocket_reroute_llm_intent_takes_priority_over_keyword_fallback():
             "should_call_get_project_data": False,
         },
     )
-    assert chat_decision.mode == "chat"
-    assert chat_decision.intent == "chat"
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
+def test_websocket_reroute_llm_intent_handles_ambiguous_followup():
+    adapter = _make_adapter()
 
     reroute_decision = adapter._decide_route(
         "sess-reroute-llm-direct",
@@ -619,21 +609,7 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
 
     session_id = "sess-fsm-1"
     project_id = "proj-fsm-001"
-    handled_turns = []
-
-    async def handler(event):
-        handled_turns.append(event.text)
-        if "帮我进行BGA逃逸布线" in event.text:
-            assert "不要再次调用 getProjectData" in event.text
-            return (
-                "请选择 BGA 器件。\n\n"
-                "##PCB_FIELDS##\n"
-                '{"selection":[{"label":"U27","detail":"BGA-256"}]}\n'
-                "##PCB_FIELDS_END##"
-            )
-        raise AssertionError(f"Unexpected user turn passed to handler: {event.text}")
-
-    adapter.set_message_handler(handler)
+    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
     await adapter.connect()
 
     try:
@@ -661,8 +637,6 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
     finally:
         await adapter.disconnect()
 
-    assert len(handled_turns) == 1
-
 
 def test_websocket_selection_stage_fail_closed():
     asyncio.get_event_loop().run_until_complete(_run_websocket_selection_stage_fail_closed())
@@ -675,21 +649,7 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
 
     session_id = "sess-fsm-fpga"
     project_id = "proj-fsm-fpga"
-    handled_turns = []
-
-    async def handler(event):
-        handled_turns.append(event.text)
-        if "帮我进行BGA逃逸布线" in event.text:
-            assert "不要再次调用 getProjectData" in event.text
-            return (
-                "请选择 BGA 器件。\n\n"
-                "##PCB_FIELDS##\n"
-                '{"selection":[{"label":"FPGA1","detail":"BGA-1156"}]}\n'
-                "##PCB_FIELDS_END##"
-            )
-        raise AssertionError(f"Unexpected user turn passed to handler: {event.text}")
-
-    adapter.set_message_handler(handler)
+    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
     await adapter.connect()
 
     try:
@@ -717,10 +677,6 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
                 assert "请回复 `arc` 或 `135`" in second["body"]["content"]
     finally:
         await adapter.disconnect()
-
-    assert len(handled_turns) == 1
-    assert "帮我进行BGA逃逸布线" in handled_turns[0]
-    assert "不要再次调用 getProjectData" in handled_turns[0]
 
 
 def test_websocket_selection_accepts_non_u_refdes():
@@ -802,6 +758,111 @@ def test_direct_fanout_payload_is_sent_as_fanout_params():
     }
 
 
+def test_fanout_candidate_is_validated_and_never_routes_directly():
+    adapter = _make_adapter()
+    session_id = "sess-validate-fanout"
+    adapter._session_selection_labels[session_id] = ("U22",)
+
+    params = adapter._validate_or_build_fanout_params(
+        session_id=session_id,
+        candidate={
+            "selectedBGA": "U1",
+            "routerType": "pcb_fanout",
+            "routingResult": r"F:\fake\routing_input.txt",
+            "orderLines": [{"net": "GND", "layer": "Top", "order": "9"}],
+            "constraints": {"LineWidth": 4, "LineSpacing": 3},
+        },
+        selected_bga="U22",
+        router_type="135",
+        board_summary={"netSummary": {"groundNets": ["GND"], "powerNets": ["VCC"], "clockNets": []}},
+        fanout_context={"recommendedEscapeLayers": ["Top", "Art03"], "recommendedLineWidth": 4, "recommendedLineSpacing": 3},
+    )
+
+    assert params == {
+        "selectedBGA": "U22",
+        "routerType": "135",
+        "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+    assert "routingResult" not in params
+
+
+def test_fanout_candidate_rejects_model_invented_nets():
+    adapter = _make_adapter()
+    session_id = "sess-validate-fanout-net-whitelist"
+    adapter._session_selection_labels[session_id] = ("U22",)
+
+    params = adapter._validate_or_build_fanout_params(
+        session_id=session_id,
+        candidate={
+            "orderLines": [
+                {"net": "NET_U1_A10", "layer": "Top", "order": 1},
+                {"net": "GND", "layer": "Top", "order": 2},
+                {"net": "VCC", "layer": "Art03", "order": 3},
+            ],
+            "constraints": {"LineWidth": 4, "LineSpacing": 3},
+        },
+        selected_bga="U22",
+        router_type="135",
+        board_summary={"netSummary": {"groundNets": ["GND"], "powerNets": ["VCC"], "clockNets": []}},
+        fanout_context={"recommendedEscapeLayers": ["Top", "Art03"], "recommendedLineWidth": 4, "recommendedLineSpacing": 3},
+    )
+
+    assert params["orderLines"] == [
+        {"net": "GND", "layer": "Top", "order": 1},
+        {"net": "VCC", "layer": "Art03", "order": 2},
+    ]
+
+
+def test_fanout_candidate_falls_back_when_all_model_nets_are_invented():
+    adapter = _make_adapter()
+    session_id = "sess-validate-fanout-net-fallback"
+    adapter._session_selection_labels[session_id] = ("U22",)
+
+    params = adapter._validate_or_build_fanout_params(
+        session_id=session_id,
+        candidate={
+            "orderLines": [{"net": "NET_U1_A10", "layer": "Top", "order": 1}],
+            "constraints": {"LineWidth": 4, "LineSpacing": 3},
+        },
+        selected_bga="U22",
+        router_type="135",
+        board_summary={"netSummary": {"groundNets": ["GND"], "powerNets": ["VCC"], "clockNets": []}},
+        fanout_context={"recommendedEscapeLayers": ["Top", "Art03"], "recommendedLineWidth": 4, "recommendedLineSpacing": 3},
+    )
+
+    assert params["orderLines"] == [
+        {"net": "GND", "layer": "Top", "order": 1},
+        {"net": "VCC", "layer": "Art03", "order": 2},
+    ]
+
+
+def test_unconfirmed_routing_result_fields_are_dropped():
+    adapter = _make_adapter()
+    session_id = "sess-drop-model-route"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+
+    filtered = adapter._filter_unconfirmed_routing_fields(
+        session_id,
+        {
+            "routingResult": r"F:\fake\routing_input.txt",
+            "importLinesFilePath": r"F:\fake\line.out",
+            "report": "模型声称布线完成",
+            "fanoutParams": {"selectedBGA": "U22", "routerType": "135"},
+        },
+    )
+
+    assert "routingResult" not in filtered
+    assert "importLinesFilePath" not in filtered
+    assert "report" not in filtered
+    assert "fanoutParams" in filtered
+
+    adapter._set_flow_state(session_id, "routing")
+    routed_fields = {"routingResult": r"F:\router_work\routing_input.txt", "report": "布线完成"}
+    assert adapter._filter_unconfirmed_routing_fields(session_id, routed_fields) == routed_fields
+
+
 def test_routing_result_report_visible_fallback():
     content = WebSocketAdapter._fallback_visible_content_for_fields(
         "",
@@ -861,6 +922,7 @@ async def _run_pcb_outbound_trace_log(tmp_path) -> None:
     ws = _FakeWS()
     session_id = "sess-trace-routing"
     adapter._connections[session_id] = (ws, "proj-trace-001")
+    adapter._set_flow_state(session_id, "routing")
 
     result = await adapter.send(
         chat_id=session_id,
@@ -1141,7 +1203,10 @@ async def test_import_fanout_result_calls_import_lines():
         adapter._import_fanout_result(
             session_id,
             {"successPins": ["U27.B13"], "failedPins": ["U27.B27"]},
-            {"routingResult": r"F:\router_work\routing_input.txt"},
+            {
+                "routingResult": r"F:\router_work\routing_input.txt",
+                "importLinesFilePath": r"F:\router_work\ARC_output.txt",
+            },
         )
     )
     for _ in range(5):
@@ -1158,7 +1223,7 @@ async def test_import_fanout_result_calls_import_lines():
     assert sent["type"] == "tool-calls"
     assert sent["body"]["content"]["name"] == "importLines"
     assert sent["body"]["content"]["arguments"] == {
-        "filePath": r"F:\router_work\routing_input.txt",
+        "filePath": r"F:\router_work\ARC_output.txt",
         "successPins": ["U27.B13"],
         "failedPins": ["U27.B27"],
     }
@@ -1296,14 +1361,7 @@ async def test_pcb_entry_bootstrap_reads_project_data_file_path(monkeypatch, tmp
     adapter = _make_adapter(port)
     board_file = tmp_path / "board.txt"
     board_file.write_text('(pcb_data (component (name "FPGA1") (package "BGA-1156")))', encoding="utf-8")
-    seen = {}
-
-    async def handler(event):
-        seen["text"] = event.text
-        seen["options"] = event.raw_message.get("options", {})
-        return "ok"
-
-    adapter.set_message_handler(handler)
+    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
     await adapter.connect()
     try:
         uri = f"http://127.0.0.1:{port}"
@@ -1323,15 +1381,10 @@ async def test_pcb_entry_bootstrap_reads_project_data_file_path(monkeypatch, tmp
 
                 msg = await _recv_json(ws)
                 assert msg["type"] == "message"
-                assert msg["body"]["content"] == "ok"
+                assert msg["body"]["selection"] == [{"label": "FPGA1", "detail": "BGA-1156"}]
+                assert "请选择走线算法类型" in msg["body"]["content"]
     finally:
         await adapter.disconnect()
-
-    assert "FPGA1" not in seen["text"]
-    assert "__CACHED_PROJECT_DATA__" in seen["text"]
-    assert "不要再次调用 getProjectData" in seen["text"]
-    assert seen["options"]["route_mode"] == "pcb"
-    assert seen["options"]["pcb_bootstrap"]["project_data_loaded"] is True
 
 
 def test_bga_question_with_polite_phrase_stays_chat():

@@ -43,10 +43,17 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     assert result.startswith("布线完成")
     assert report in result
     assert str(routing_path) in result
-    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == {
+    pending = {
         "routingResult": str(routing_path),
         "report": report,
     }
+    arc_output = routing_path.parent / "ARC_output.txt"
+    line_output = routing_path.parent / "line.out"
+    if arc_output.exists():
+        pending["importLinesFilePath"] = str(arc_output.resolve())
+    elif line_output.exists():
+        pending["importLinesFilePath"] = str(line_output.resolve())
+    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == pending
 
 
 def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):

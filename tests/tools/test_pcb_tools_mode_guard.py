@@ -21,10 +21,17 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     assert result.startswith("布线完成")
     assert report in result
     assert str(routing_path) in result
-    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == {
+    pending = {
         "routingResult": str(routing_path),
         "report": report,
     }
+    arc_output = routing_path.parent / "ARC_output.txt"
+    line_output = routing_path.parent / "line.out"
+    if arc_output.exists():
+        pending["importLinesFilePath"] = str(arc_output.resolve())
+    elif line_output.exists():
+        pending["importLinesFilePath"] = str(line_output.resolve())
+    assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == pending
 
 
 @pytest.fixture(autouse=True)
@@ -657,6 +664,41 @@ def test_reroute_converts_frontend_txt_input_internally(monkeypatch, tmp_path):
     assert seen["dropped_board_path"].endswith("dropped.kicad_pcb")
     assert "routedBoardDataFilePath" not in payload
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_reroute_max_drc_iterations_zero_skips_validation(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-drc-zero"
+    transport.set_session_mode("sess-pcb-reroute-drc-zero", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-drc-zero",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{key: value for key, value in kwargs.items() if key not in {"drc_feedback", "drc_iteration_history"}}
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _should_not_validate(**kwargs):
+        raise AssertionError("maxDrcIterations=0 must skip DRC validation")
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _should_not_validate)
+
+    result = pcb_tools.reroute(json.dumps({"maxDrcIterations": 0}, ensure_ascii=False), session_id="sess-pcb-reroute-drc-zero")
+    payload = json.loads(result)
+
+    assert "drcPassed" not in payload["rerouteResult"]
+    assert "routedLayoutTxtFilePath" not in payload
 
 
 def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):

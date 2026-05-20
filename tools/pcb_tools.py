@@ -254,6 +254,16 @@ def _router_result_path(work_dir: Path) -> Path:
     return result_file.resolve()
 
 
+def _router_import_lines_path(work_dir: Path, router_type: str) -> Path:
+    """Return the router-native records file expected by EDA importLines."""
+    candidates = ("ARC_output.txt",) if router_type == "arc" else ("line.out",)
+    for filename in candidates:
+        path = work_dir / filename
+        if path.exists() and path.stat().st_size > 0:
+            return path.resolve()
+    raise FileNotFoundError(f"{router_type} 布线器未生成可导入 importLines 的原始记录文件")
+
+
 def _read_router_report(work_dir: Path, fallback: str = "布线完成（无详细报告）") -> str:
     report_file = work_dir / "data.txt"
     return _read_text_lossy(report_file) if report_file.exists() else fallback
@@ -1250,12 +1260,14 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
 
         # Step 6: 传递输出文件路径，避免通过 WebSocket 发送大块版图文本
         routing_result_path = _router_result_path(work_dir)
+        import_lines_path = _router_import_lines_path(work_dir, router_type)
         routing_result_size = routing_result_path.stat().st_size
         report = _read_router_report(work_dir)
         report_text = report.strip().rstrip("。")
         _transport.set_pending_pcb_fields(
             {
                 "routingResult": str(routing_result_path),
+                "importLinesFilePath": str(import_lines_path),
                 "report": report_text or "布线完成（无详细报告）",
             },
             session_id=session_id,
@@ -1264,7 +1276,8 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         return (
             f"{summary}。"
             f"完整布线数据已由系统通过 WebSocket 结构化字段发送给前端，"
-            f"数据文件 {routing_result_path}，大小 {routing_result_size} 字节；请不要在正文中复述布线数据。"
+            f"数据文件 {routing_result_path}，大小 {routing_result_size} 字节；"
+            f"EDA 导入使用布线器原始记录文件 {import_lines_path}；请不要在正文中复述布线数据。"
         )
 
     except subprocess.TimeoutExpired:
@@ -1934,12 +1947,14 @@ def _generate_reroute_with_model(
 
 
 def _get_max_drc_iterations(user_data_obj: Dict[str, Any]) -> int:
-    raw = (
-        user_data_obj.get("maxDrcIterations")
-        or user_data_obj.get("max_drc_iterations")
-        or os.getenv("PCB_REROUTE_MAX_DRC_ITERATIONS")
-        or 5
-    )
+    raw = None
+    for key in ("maxDrcIterations", "max_drc_iterations"):
+        if key in user_data_obj and user_data_obj.get(key) not in (None, ""):
+            raw = user_data_obj.get(key)
+            break
+    if raw is None:
+        env_value = os.getenv("PCB_REROUTE_MAX_DRC_ITERATIONS")
+        raw = env_value if env_value not in (None, "") else 5
     try:
         return max(0, min(20, int(raw)))
     except (TypeError, ValueError):

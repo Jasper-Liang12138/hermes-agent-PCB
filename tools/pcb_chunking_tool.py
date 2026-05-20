@@ -347,6 +347,24 @@ def _extract_text_bga_selection(board_text: str) -> list[dict[str, str]]:
         selection.append({"label": label, "detail": detail})
         seen.add(label)
 
+    named_component_matches = list(re.finditer(r'\(component\s+\(name\s+"([^"]+)"\)', board_text))
+    for index, match in enumerate(named_component_matches):
+        label = match.group(1).strip()
+        if not label or label in seen:
+            continue
+        end = _find_sexpr_end(board_text, match.start())
+        if end is None:
+            end = named_component_matches[index + 1].start() if index + 1 < len(named_component_matches) else len(board_text)
+        block = board_text[match.start():end]
+        package_match = re.search(r'\((?:package|part|footprint)\s+"([^"]+)"', block)
+        package_name = package_match.group(1).strip() if package_match else ""
+        if "bga" not in package_name.lower():
+            continue
+        pin_count = len(re.findall(r'(?m)\(\s*pin(?:\s|$)', block))
+        detail = f"{package_name} ({pin_count} pins)" if pin_count else package_name
+        selection.append({"label": label, "detail": detail})
+        seen.add(label)
+
     return selection
 
 

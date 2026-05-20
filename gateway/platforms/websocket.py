@@ -10,7 +10,7 @@
 结构化字段传递机制：
   Agent 在文本响应中嵌入特殊标记：
     ##PCB_FIELDS##
-    {"selection": [...], "fanoutParams": {...}, "routingResult": "...", "rerouteResult": {...}}
+    {"selection": [...], "fanoutParams": {...}, "routingResult": "...", "importLinesFilePath": "...", "rerouteResult": {...}}
     ##PCB_FIELDS_END##
   WebSocketAdapter.send() 解析并剥离这些标记，将字段放入 body。
 
@@ -52,6 +52,7 @@ _PCB_BODY_FIELD_KEYS = (
     "selection",
     "fanoutParams",
     "routingResult",
+    "importLinesFilePath",
     "report",
     "rerouteResult",
     "routedLayoutTxtFilePath",
@@ -81,6 +82,7 @@ _PCB_STRUCTURED_KEYS = frozenset(
         "constraints",
         "routedBoardDataFilePath",
         "routedLayoutTxtFilePath",
+        "importLinesFilePath",
     )
 )
 _PCB_STRUCTURED_KEY_RE = re.compile(
@@ -275,9 +277,16 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_selected_targets: Dict[str, str] = {}
         self._session_router_types: Dict[str, str] = {}
         self._session_fanout_params: Dict[str, Dict[str, Any]] = {}
+        self._session_bga_selection: Dict[str, Tuple[Dict[str, Any], ...]] = {}
+        self._session_board_summaries: Dict[str, Dict[str, Any]] = {}
+        self._session_fanout_contexts: Dict[str, Dict[str, Any]] = {}
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
+        self._fanout_param_llm_enabled = self._as_bool(
+            extra.get("fanout_param_llm_enabled", self._route_intent_llm_enabled)
+        )
+        self._fanout_param_llm_timeout = float(extra.get("fanout_param_llm_timeout", 10.0))
         self._bootstrap_get_project_enabled = self._as_bool(extra.get("bootstrap_get_project", True))
         self._dedicated_ws_thread = self._as_bool(extra.get("dedicated_ws_thread", False))
         self._trace_pcb_messages = self._as_bool(extra.get("trace_pcb_messages", True))
@@ -683,7 +692,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "fieldKeys": field_keys,
             "contentPreview": content[:240],
         }
-        for key in ("routingResult", "routedLayoutTxtFilePath"):
+        for key in ("routingResult", "importLinesFilePath", "routedLayoutTxtFilePath"):
             if key in body:
                 event[key] = body.get(key)
         if "report" in body:
@@ -800,6 +809,12 @@ class WebSocketAdapter(BasePlatformAdapter):
         if decision.reason == "confirm_route" and await self._run_cached_fanout_route(session_id):
             return
 
+        if decision.mode == _ROUTE_MODE_PCB and decision.intent != _INTENT_PCB_REROUTE_SELECTED:
+            if bootstrap_context and await self._run_direct_bga_analysis(session_id, bootstrap_context):
+                return
+            if decision.reason == "router_type_step" and await self._run_direct_fanout_param_step(session_id, user_text):
+                return
+
         if decision.reason == "router_type_step":
             router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
             selected = self._session_selected_targets.get(session_id)
@@ -848,6 +863,432 @@ class WebSocketAdapter(BasePlatformAdapter):
                     content=response,
                 )
 
+    async def _run_direct_bga_analysis(self, session_id: str, bootstrap_context: Dict[str, Any]) -> bool:
+        """Run the BGA analysis tool from the adapter layer instead of asking the LLM to tool-call it."""
+        if not bootstrap_context:
+            return False
+
+        try:
+            from tools import pcb_chunking_tool
+
+            raw_result = await asyncio.to_thread(
+                pcb_chunking_tool._extract_bga,
+                "__CACHED_PROJECT_DATA__",
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logger.exception("Direct pcb_extract_bga failed: session=%s", session_id)
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            await self.send(chat_id=session_id, content=f"PCB 版图分析失败：{exc}")
+            return True
+
+        analysis = self._parse_jsonish_object(str(raw_result or ""))
+        if not isinstance(analysis, dict):
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            await self.send(chat_id=session_id, content="PCB 版图分析未返回有效 JSON，请重试。")
+            return True
+
+        if analysis.get("error") and not any(key in analysis for key in ("selection", "boardSummary", "fanoutContext")):
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            await self.send(chat_id=session_id, content=f"PCB 版图分析失败：{analysis.get('error')}")
+            return True
+
+        fields = self._collect_pcb_fields(analysis)
+        self._remember_board_analysis(session_id, fields)
+        selection = fields.get("selection") if isinstance(fields.get("selection"), list) else []
+
+        if not selection:
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            await self.send(
+                chat_id=session_id,
+                content=(
+                    "未识别到可执行 BGA 逃逸布线的 BGA 器件。\n\n"
+                    "##PCB_FIELDS##\n"
+                    f"{json.dumps(fields, ensure_ascii=False)}\n"
+                    "##PCB_FIELDS_END##"
+                ),
+            )
+            return True
+
+        labels = self._selection_labels_from_items(selection)
+        if labels:
+            self._session_selection_labels[session_id] = tuple(labels)
+
+        if len(labels) == 1:
+            self._session_selected_targets[session_id] = labels[0]
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+            visible = self._router_type_prompt(session_id)
+        else:
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
+            visible = "已识别到多个 BGA 候选，请选择目标器件。"
+
+        await self.send(
+            chat_id=session_id,
+            content=(
+                f"{visible}\n\n"
+                "##PCB_FIELDS##\n"
+                f"{json.dumps(fields, ensure_ascii=False)}\n"
+                "##PCB_FIELDS_END##"
+            ),
+        )
+        return True
+
+    async def _run_direct_fanout_param_step(self, session_id: str, user_text: str) -> bool:
+        """Generate fanoutParams under adapter control; the LLM can only suggest a candidate."""
+        router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
+        if router_type not in {"arc", "135"}:
+            return False
+        self._session_router_types[session_id] = router_type
+
+        selected = self._session_selected_targets.get(session_id)
+        labels = self._known_bga_labels(session_id)
+        if not selected and len(labels) == 1:
+            selected = labels[0]
+            self._session_selected_targets[session_id] = selected
+        if not selected or (labels and selected not in labels):
+            await self.send(
+                chat_id=session_id,
+                content=f"缺少有效目标 BGA，请先回复“选择 {self._selection_example(session_id)}”。",
+            )
+            return True
+
+        fanout_context = self._session_fanout_contexts.get(session_id) or {}
+        board_summary = self._session_board_summaries.get(session_id) or {}
+        if not fanout_context and not board_summary:
+            await self.send(
+                chat_id=session_id,
+                content="缺少版图分析上下文，请重新发起 BGA 逃逸布线，让系统先获取并分析版图数据。",
+            )
+            return True
+
+        candidate: Dict[str, Any] = {}
+        if self._fanout_param_llm_enabled:
+            candidate = await self._generate_fanout_params_candidate(
+                session_id=session_id,
+                selected_bga=selected,
+                router_type=router_type,
+                board_summary=board_summary,
+                fanout_context=fanout_context,
+            )
+
+        fanout_params = self._validate_or_build_fanout_params(
+            session_id=session_id,
+            candidate=candidate,
+            selected_bga=selected,
+            router_type=router_type,
+            board_summary=board_summary,
+            fanout_context=fanout_context,
+        )
+        self._session_fanout_params[session_id] = dict(fanout_params)
+        self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+        self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
+
+        await self.send(
+            chat_id=session_id,
+            content=(
+                f"{self._fanout_confirmation_content(fanout_params)}\n\n"
+                "##PCB_FIELDS##\n"
+                f"{json.dumps({'fanoutParams': fanout_params}, ensure_ascii=False)}\n"
+                "##PCB_FIELDS_END##"
+            ),
+        )
+        return True
+
+    async def _generate_fanout_params_candidate(
+        self,
+        *,
+        session_id: str,
+        selected_bga: str,
+        router_type: str,
+        board_summary: Dict[str, Any],
+        fanout_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+            prompt = (
+                "请根据 PCB 版图摘要生成候选 fanoutParams。只输出 JSON 对象，不要 Markdown，不要解释。\n"
+                "禁止输出 routingResult、importLinesFilePath 或任何表示已完成布线的字段。\n"
+                f"selectedBGA 必须是 {selected_bga!r}，routerType 必须是 {router_type!r}。\n"
+                "JSON 格式：{\"fanoutParams\":{\"selectedBGA\":\"...\",\"routerType\":\"arc|135\","
+                "\"orderLines\":[{\"net\":\"...\",\"layer\":\"...\",\"order\":1}],"
+                "\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}}\n\n"
+                f"boardSummary={json.dumps(board_summary, ensure_ascii=False)}\n"
+                f"fanoutContext={json.dumps(fanout_context, ensure_ascii=False)}"
+            )
+            response = await async_call_llm(
+                provider="auto",
+                messages=[
+                    {"role": "system", "content": "你只生成 PCB fanoutParams 候选 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=768,
+                timeout=self._fanout_param_llm_timeout,
+            )
+            raw = extract_content_or_reasoning(response)
+            data = self._parse_jsonish_object(raw)
+            fields = self._collect_pcb_fields(data) if isinstance(data, dict) else {}
+            fanout_params = fields.get("fanoutParams")
+            if isinstance(fanout_params, dict):
+                return fanout_params
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.info("FanoutParams LLM candidate skipped: session=%s error=%s", session_id, exc)
+            return {}
+
+    def _validate_or_build_fanout_params(
+        self,
+        *,
+        session_id: str,
+        candidate: Dict[str, Any],
+        selected_bga: str,
+        router_type: str,
+        board_summary: Dict[str, Any],
+        fanout_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        fallback = self._build_deterministic_fanout_params(
+            selected_bga=selected_bga,
+            router_type=router_type,
+            board_summary=board_summary,
+            fanout_context=fanout_context,
+        )
+        known_labels = set(self._known_bga_labels(session_id))
+        if known_labels and selected_bga not in known_labels:
+            raise ValueError(f"selectedBGA {selected_bga!r} is not in detected BGA list")
+
+        raw = candidate.get("fanoutParams") if isinstance(candidate.get("fanoutParams"), dict) else candidate
+        if not isinstance(raw, dict):
+            raw = {}
+        allowed_nets = {
+            str(item.get("net") or "").strip().casefold()
+            for item in fallback.get("orderLines", [])
+            if isinstance(item, dict) and str(item.get("net") or "").strip()
+        }
+
+        normalized: Dict[str, Any] = {
+            "selectedBGA": selected_bga,
+            "routerType": router_type,
+            "orderLines": self._normalize_order_lines(
+                raw.get("orderLines"),
+                fallback.get("orderLines", []),
+                allowed_nets=allowed_nets,
+            ),
+            "constraints": self._normalize_constraints(raw.get("constraints"), fallback.get("constraints", {})),
+        }
+        if not normalized["orderLines"]:
+            normalized["orderLines"] = fallback["orderLines"]
+        if not normalized["constraints"]:
+            normalized["constraints"] = fallback["constraints"]
+        return normalized
+
+    def _build_deterministic_fanout_params(
+        self,
+        *,
+        selected_bga: str,
+        router_type: str,
+        board_summary: Dict[str, Any],
+        fanout_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        layers = self._fanout_layers(fanout_context, board_summary)
+        nets = self._fanout_nets(board_summary, fanout_context)
+        order_lines = [
+            {"net": net, "layer": layers[index % len(layers)], "order": index + 1}
+            for index, net in enumerate(nets)
+        ]
+        return {
+            "selectedBGA": selected_bga,
+            "routerType": router_type,
+            "orderLines": order_lines,
+            "constraints": {
+                "LineWidth": self._safe_positive_number(fanout_context.get("recommendedLineWidth"), 4),
+                "LineSpacing": self._safe_positive_number(fanout_context.get("recommendedLineSpacing"), 3),
+            },
+        }
+
+    @staticmethod
+    def _fanout_layers(fanout_context: Dict[str, Any], board_summary: Dict[str, Any]) -> list[str]:
+        layers = WebSocketAdapter._string_list(fanout_context.get("recommendedEscapeLayers"))
+        if not layers:
+            for item in WebSocketAdapter._string_list(board_summary.get("stackupSummary")):
+                layer = item.split(":", 1)[0].strip()
+                if layer:
+                    layers.append(layer)
+                if len(layers) >= 2:
+                    break
+        return layers or ["Top", "Art03"]
+
+    @staticmethod
+    def _fanout_nets(board_summary: Dict[str, Any], fanout_context: Dict[str, Any]) -> list[str]:
+        net_summary = board_summary.get("netSummary") if isinstance(board_summary.get("netSummary"), dict) else {}
+        ordered: list[str] = []
+        for key in ("groundNets", "powerNets", "clockNets", "signalNets", "candidateNets"):
+            source = net_summary.get(key)
+            if source is None:
+                source = fanout_context.get(key)
+            ordered.extend(WebSocketAdapter._string_list(source, limit=16))
+
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for net in ordered:
+            key = net.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(net)
+            if len(deduped) >= 32:
+                break
+        return deduped or ["GND", "VCC"]
+
+    @staticmethod
+    def _normalize_order_lines(
+        value: Any,
+        fallback: list[Dict[str, Any]],
+        *,
+        allowed_nets: Optional[set[str]] = None,
+    ) -> list[Dict[str, Any]]:
+        if isinstance(value, str) and value.strip():
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = None
+        if not isinstance(value, list):
+            value = fallback
+
+        normalized: list[Dict[str, Any]] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                continue
+            net = str(item.get("net") or "").strip()
+            layer = str(item.get("layer") or "").strip()
+            if not net or not layer:
+                continue
+            if allowed_nets and net.casefold() not in allowed_nets:
+                continue
+            try:
+                order = int(item.get("order", index + 1))
+            except (TypeError, ValueError):
+                order = index + 1
+            normalized.append({"net": net, "layer": layer, "order": max(1, order)})
+        normalized.sort(key=lambda item: item.get("order", 0))
+        for index, item in enumerate(normalized, start=1):
+            item["order"] = index
+        return normalized
+
+    @staticmethod
+    def _normalize_constraints(value: Any, fallback: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(value, str) and value.strip():
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = {}
+        if not isinstance(value, dict):
+            value = {}
+        return {
+            "LineWidth": WebSocketAdapter._safe_positive_number(value.get("LineWidth"), fallback.get("LineWidth", 4)),
+            "LineSpacing": WebSocketAdapter._safe_positive_number(value.get("LineSpacing"), fallback.get("LineSpacing", 3)),
+        }
+
+    @staticmethod
+    def _safe_positive_number(value: Any, default: Any) -> Any:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if number <= 0:
+            return default
+        return int(number) if number.is_integer() else number
+
+    @staticmethod
+    def _string_list(value: Any, limit: int = 32) -> list[str]:
+        if isinstance(value, str):
+            items = [value]
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            return []
+        result: list[str] = []
+        for item in items:
+            text = str(item or "").strip()
+            if text:
+                result.append(text)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _parse_jsonish_object(raw_text: str) -> Optional[Dict[str, Any]]:
+        raw = (raw_text or "").strip()
+        if not raw:
+            return None
+        raw = re.sub(
+            r"<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>[\s\S]*?</(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+        candidates = [raw]
+        candidates.extend(item.strip() for item in re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE))
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(raw[start:end + 1])
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    parsed = ast.literal_eval(candidate)
+                except (SyntaxError, ValueError):
+                    continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _remember_board_analysis(self, session_id: str, fields: Dict[str, Any]) -> None:
+        if not isinstance(fields, dict):
+            return
+        selection = fields.get("selection")
+        if isinstance(selection, list):
+            normalized_selection = tuple(item for item in selection if isinstance(item, dict))
+            self._session_bga_selection[session_id] = normalized_selection
+            labels = self._selection_labels_from_items(selection)
+            if labels:
+                self._session_selection_labels[session_id] = tuple(labels)
+        board_summary = fields.get("boardSummary")
+        if isinstance(board_summary, dict):
+            self._session_board_summaries[session_id] = dict(board_summary)
+        fanout_context = fields.get("fanoutContext")
+        if isinstance(fanout_context, dict):
+            self._session_fanout_contexts[session_id] = dict(fanout_context)
+
+    def _known_bga_labels(self, session_id: str) -> list[str]:
+        labels = list(self._session_selection_labels.get(session_id) or ())
+        if not labels:
+            labels = self._selection_labels_from_items(list(self._session_bga_selection.get(session_id) or ()))
+        return labels
+
+    @staticmethod
+    def _selection_labels_from_items(selection: Any) -> list[str]:
+        labels: list[str] = []
+        if not isinstance(selection, list):
+            return labels
+        for item in selection:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
     async def _run_cached_fanout_route(self, session_id: str) -> bool:
         fanout_params = self._session_fanout_params.get(session_id)
         if not isinstance(fanout_params, dict) or not fanout_params:
@@ -892,6 +1333,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             parsed = json.loads(visible)
             if isinstance(parsed, dict):
                 fields["routingResult"] = str(parsed.get("routingResult") or "")
+                if parsed.get("importLinesFilePath"):
+                    fields["importLinesFilePath"] = str(parsed.get("importLinesFilePath") or "")
                 report = str(parsed.get("report") or "").strip()
                 if report:
                     fields["report"] = report
@@ -928,17 +1371,17 @@ class WebSocketAdapter(BasePlatformAdapter):
         route_params: Dict[str, Any],
         fields: Dict[str, Any],
     ) -> str:
-        routing_result = str(fields.get("routingResult") or "").strip()
-        if not routing_result or routing_result.lstrip().startswith("("):
+        import_file = str(fields.get("importLinesFilePath") or fields.get("routingResult") or "").strip()
+        if not import_file or import_file.lstrip().startswith("("):
             return ""
 
         arguments = {
-            "filePath": routing_result,
+            "filePath": import_file,
             "successPins": self._first_pin_list(fields.get("successPins"), route_params.get("successPins")),
             "failedPins": self._first_pin_list(fields.get("failedPins"), route_params.get("failedPins")),
         }
         call_id = f"import_lines_{uuid.uuid4().hex[:8]}"
-        logger.info("正在导入版图: session=%s file=%s timeout=%.1fs", session_id, routing_result, _IMPORT_LINES_TIMEOUT_SECONDS)
+        logger.info("正在导入版图: session=%s file=%s timeout=%.1fs", session_id, import_file, _IMPORT_LINES_TIMEOUT_SECONDS)
         await self.send(
             chat_id=session_id,
             content="正在导入版图，请稍候...",
@@ -953,7 +1396,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 timeout=_IMPORT_LINES_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            logger.warning("importLines failed: session=%s file=%s error=%s", session_id, routing_result, exc)
+            logger.warning("importLines failed: session=%s file=%s error=%s", session_id, import_file, exc)
             return f"已生成布线结果，但调用 EDA 导入工具 importLines 失败：{exc}"
         return self._format_import_lines_status(result)
 
@@ -1302,9 +1745,12 @@ class WebSocketAdapter(BasePlatformAdapter):
             clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
             clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
             clean_content = self._dedupe_stream_restart_content(clean_content)
+            pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
         clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
         pcb_fields.update(extra_fields)
         clean_content = self._strip_stream_protocol_leak(clean_content)
+        if stream_is_final is None or stream_is_final:
+            pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
         if stream_is_final is not None and not stream_is_final and pcb_fields:
             self._remember_stream_pcb_fields(chat_id, pcb_fields)
             pcb_fields = {}
@@ -1424,9 +1870,11 @@ class WebSocketAdapter(BasePlatformAdapter):
             clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
             clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
             clean_content = self._dedupe_stream_restart_content(clean_content)
+            pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
             clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
             pcb_fields.update(extra_fields)
             clean_content = self._strip_stream_protocol_leak(clean_content)
+            pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
             pcb_fields = await self._prepare_final_pcb_fields_for_frontend(chat_id, pcb_fields)
             self._stream_content_buffers[chat_id] = clean_content
             emitted_fields = pcb_fields
@@ -1584,6 +2032,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_selected_targets.pop(session_id, None)
         self._session_router_types.pop(session_id, None)
         self._session_fanout_params.pop(session_id, None)
+        self._session_bga_selection.pop(session_id, None)
+        self._session_board_summaries.pop(session_id, None)
+        self._session_fanout_contexts.pop(session_id, None)
 
     @staticmethod
     def _as_bool(value: Any) -> bool:
@@ -1759,6 +2210,21 @@ class WebSocketAdapter(BasePlatformAdapter):
         guarded = self._strip_premature_execute_question(content)
         prompt = self._router_type_prompt(session_id)
         return f"{guarded}\n\n{prompt}".strip() if guarded else prompt
+
+    def _filter_unconfirmed_routing_fields(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(pcb_fields, dict) or "routingResult" not in pcb_fields:
+            return pcb_fields
+        if self._session_flow_states.get(session_id) == _FLOW_ROUTING:
+            return pcb_fields
+        filtered = dict(pcb_fields)
+        for key in ("routingResult", "importLinesFilePath", "report"):
+            filtered.pop(key, None)
+        logger.warning(
+            "Dropped unconfirmed routing fields from model-visible content: session=%s keys=%s",
+            session_id,
+            sorted(pcb_fields.keys()),
+        )
+        return filtered
 
     @staticmethod
     def _strip_leaked_fanout_json(content: str, pcb_fields: Dict[str, Any]) -> str:
@@ -2228,13 +2694,12 @@ class WebSocketAdapter(BasePlatformAdapter):
         if route_intent:
             if route_intent.intent == _INTENT_CANCEL:
                 return _INTENT_CANCEL
+            if _REROUTE_RE.search(text) and (_PCB_DOMAIN_RE.search(text) or in_pcb_context):
+                return _INTENT_PCB_REROUTE_SELECTED
             if (
                 route_intent.intent == _INTENT_CHAT
                 and route_intent.confidence >= 0.70
-                and (
-                    not self._is_strong_pcb_intent(text)
-                    or (_REROUTE_RE.search(text) and _PCB_DOMAIN_RE.search(text))
-                )
+                and not self._is_strong_pcb_intent(text)
             ):
                 return _INTENT_CHAT
             if route_intent.intent == _INTENT_PCB_ENTRY:
@@ -2630,6 +3095,7 @@ class WebSocketAdapter(BasePlatformAdapter):
     def _update_route_state_from_fields(self, session_id: str, pcb_fields: Dict[str, Any]) -> None:
         if not pcb_fields:
             return
+        self._remember_board_analysis(session_id, pcb_fields)
 
         if "routingResult" in pcb_fields or "rerouteResult" in pcb_fields:
             self._reset_flow(session_id)
