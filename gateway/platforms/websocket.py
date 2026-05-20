@@ -152,7 +152,10 @@ _PCB_SHORT_COMMAND_RE = re.compile(
 )
 _SELECTION_RE = re.compile(r"(选择\s*U?\d+|选\s*U?\d+|^U\d+$)", re.IGNORECASE)
 _SELECTION_PREFIX_RE = re.compile(r"^\s*(?:我\s*)?(?:选择|选)\s*(.+?)\s*$", re.IGNORECASE)
-_ROUTER_TYPE_RE = re.compile(r"^\s*(?:选择|选|用|使用)?\s*(arc|135|1|2|圆弧|弧形|折角|135\s*度)\s*$", re.IGNORECASE)
+_ROUTER_TYPE_RE = re.compile(
+    r"^\s*(?:选择|选|用|使用)?\s*(arc|135|rl|rl_arc|rl_135|1|2|3|4|圆弧|弧形|折角|135\s*度)\s*$",
+    re.IGNORECASE,
+)
 _CONFIRM_RE = re.compile(r"(确认|继续|执行|开始布线|开始|go|yes|ok)", re.IGNORECASE)
 _CANCEL_RE = re.compile(r"(取消|退出|中止|停止|cancel|abort|exit)", re.IGNORECASE)
 _CHAT_ONLY_RE = re.compile(
@@ -940,9 +943,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         return True
 
     async def _run_direct_fanout_param_step(self, session_id: str, user_text: str) -> bool:
-        """Generate fanoutParams under adapter control; the LLM can only suggest a candidate."""
+        """Generate fanoutParams under adapter control; prefer BJUT layer/order tools."""
         router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
-        if router_type not in {"arc", "135"}:
+        if router_type not in {"arc", "135", "rl", "rl_arc", "rl_135"}:
             return False
         self._session_router_types[session_id] = router_type
 
@@ -967,8 +970,31 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
             return True
 
-        candidate: Dict[str, Any] = {}
-        if self._fanout_param_llm_enabled:
+        bjut_fanout: Dict[str, Any] = {}
+        try:
+            from tools import pcb_tools
+            from tools.pcb_bjut_router import bjut_router_available, generate_fanout_params
+
+            project_data = pcb_tools._transport.get_cached_project_data(session_id=session_id)
+            if project_data and bjut_router_available(router_type):
+                work_dir = Path(os.getenv("ROUTER_WORK_DIR", ".")).resolve()
+                constraints = {
+                    "LineWidth": self._safe_positive_number(fanout_context.get("recommendedLineWidth"), 4),
+                    "LineSpacing": self._safe_positive_number(fanout_context.get("recommendedLineSpacing"), 3),
+                }
+                bjut_fanout = await asyncio.to_thread(
+                    generate_fanout_params,
+                    project_data=project_data,
+                    selected_bga=selected,
+                    router_type=router_type,
+                    work_dir=work_dir,
+                    constraints=constraints,
+                )
+        except Exception as exc:
+            logger.warning("BJUT fanoutParams generation failed: session=%s error=%s", session_id, exc)
+
+        candidate: Dict[str, Any] = dict(bjut_fanout)
+        if not candidate and self._fanout_param_llm_enabled:
             candidate = await self._generate_fanout_params_candidate(
                 session_id=session_id,
                 selected_bga=selected,
@@ -985,14 +1011,19 @@ class WebSocketAdapter(BasePlatformAdapter):
             board_summary=board_summary,
             fanout_context=fanout_context,
         )
+        if bjut_fanout.get("orderLines"):
+            fanout_params["orderLines"] = bjut_fanout["orderLines"]
+            if bjut_fanout.get("constraints"):
+                fanout_params["constraints"] = bjut_fanout["constraints"]
         self._session_fanout_params[session_id] = dict(fanout_params)
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
 
+        source_hint = "（北科大层分配/逃逸顺序工具生成）" if bjut_fanout else ""
         await self.send(
             chat_id=session_id,
             content=(
-                f"{self._fanout_confirmation_content(fanout_params)}\n\n"
+                f"{self._fanout_confirmation_content(fanout_params)}{source_hint}\n\n"
                 "##PCB_FIELDS##\n"
                 f"{json.dumps({'fanoutParams': fanout_params}, ensure_ascii=False)}\n"
                 "##PCB_FIELDS_END##"
@@ -2124,6 +2155,12 @@ class WebSocketAdapter(BasePlatformAdapter):
             return "arc"
         if value in {"135", "2", "折角", "135度"}:
             return "135"
+        if value in {"rl", "3"}:
+            return "rl"
+        if value in {"rl_arc", "4"}:
+            return "rl_arc"
+        if value == "rl_135":
+            return "rl_135"
         return None
 
     def _router_type_prompt(self, session_id: str) -> str:
@@ -2131,9 +2168,11 @@ class WebSocketAdapter(BasePlatformAdapter):
         prefix = f"已选择目标 BGA：{selected}。\n\n" if selected else ""
         return (
             f"{prefix}请选择走线算法类型：\n"
-            "1. `arc`：圆弧走线，更平滑，适合常规布局\n"
-            "2. `135`：135 度折角走线，更紧凑，适合密集区域\n\n"
-            "请回复 `arc` 或 `135`。"
+            "1. `arc`：圆弧走线（0518 北科大弧形走线器）\n"
+            "2. `135`：135 度折角走线（0518 北科大 135 走线器）\n"
+            "3. `rl` / `rl_135`：嘉栋 RL 135 布线器\n"
+            "4. `rl_arc`：嘉栋 RL 弧形布线器\n\n"
+            "请回复 `arc`、`135`、`rl` 或 `rl_arc`。"
         )
 
     @staticmethod

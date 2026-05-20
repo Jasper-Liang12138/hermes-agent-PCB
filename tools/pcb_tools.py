@@ -41,18 +41,9 @@ _ROUTE_MODE_PCB = "pcb"
 _PY_SCRIPT_LOCK = threading.RLock()
 
 def _normalize_router_type(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    normalized = value.strip().lower().replace("-", "_")
-    aliases = {
-        "arc": "arc",
-        "arc_linux": "arc",
-        "curve": "arc",
-        "135": "135",
-        "135_linux": "135",
-        "router135": "135",
-    }
-    return aliases.get(normalized, normalized)
+    from tools.pcb_bjut_router import normalize_router_type
+
+    return normalize_router_type(value)
 
 
 def _router_type_from_payload(user_data_obj: Any, route_params: Any) -> str:
@@ -68,15 +59,9 @@ def _router_type_from_payload(user_data_obj: Any, route_params: Any) -> str:
 
 
 def _router_profile_dir(router_type: str, work_dir: Path) -> Path:
-    env_by_type = {
-        "arc": ("ROUTER_ARC_DIR", "ARC_ROUTER_DIR"),
-        "135": ("ROUTER_135_DIR", "ROUTER135_DIR"),
-    }
-    for key in env_by_type.get(router_type, ()):
-        value = os.getenv(key, "").strip()
-        if value:
-            return Path(os.path.expandvars(os.path.expanduser(value)))
-    return work_dir
+    from tools.pcb_bjut_router import resolve_router_dir
+
+    return resolve_router_dir(router_type, work_dir=work_dir)
 
 
 def _copy_runtime_file(src_dir: Path, work_dir: Path, name: str) -> Path:
@@ -1218,12 +1203,14 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         if not router_type:
             return json.dumps({
                 "routingResult": "",
-                "report": "缺少 routerType，请选择布线器：arc 或 135",
+                "report": "缺少 routerType，请选择布线器：arc、135、rl、rl_arc、rl_135",
             }, ensure_ascii=False)
-        if router_type not in {"arc", "135"}:
+        from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_router
+
+        if router_type not in SUPPORTED_ROUTER_TYPES:
             return json.dumps({
                 "routingResult": "",
-                "report": f"未知布线器类型: {router_type}，可选值为 arc、135",
+                "report": f"未知布线器类型: {router_type}，可选值为 {', '.join(sorted(SUPPORTED_ROUTER_TYPES))}",
             }, ensure_ascii=False)
 
         # Step 1: 解析目标器件并清理旧中间文件，避免读取上一次布线缓存
@@ -1246,24 +1233,48 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
 
         # Step 5: 执行布线器
         logger.info("Resolved router profile: %s", router_type)
-        if router_type == "arc":
-            _run_arc_router(
-                work_dir,
-                _router_profile_dir("arc", work_dir),
-                component_refdes,
-                constraints,
-                order_lines,
-                project_data,
+        fanout_params = dict(route_params)
+        fanout_params.setdefault("selectedBGA", component_refdes)
+        fanout_params.setdefault("routerType", router_type)
+        fanout_params.setdefault("orderLines", order_lines)
+        fanout_params.setdefault("constraints", constraints or {})
+
+        if bjut_router_available(router_type, work_dir=work_dir):
+            bjut_outputs = run_bjut_route(
+                project_data=project_data,
+                fanout_params=fanout_params,
+                work_dir=work_dir,
             )
+            routing_result_path = bjut_outputs.routing_result_path
+            import_lines_path = bjut_outputs.import_lines_path
+            report = bjut_outputs.report
+        elif router_type in {"arc", "135"}:
+            if router_type == "arc":
+                _run_arc_router(
+                    work_dir,
+                    _router_profile_dir("arc", work_dir),
+                    component_refdes,
+                    constraints,
+                    order_lines,
+                    project_data,
+                )
+            else:
+                _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
+            routing_result_path = _router_result_path(work_dir)
+            import_lines_path = _router_import_lines_path(work_dir, router_type)
+            report = _read_router_report(work_dir)
         else:
-            _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
+            return json.dumps({
+                "routingResult": "",
+                "report": (
+                    f"{router_type} 布线器目录未配置或缺少 BJUT 可执行文件；"
+                    "请检查 config.ini 的 rl_*_dir 配置。"
+                ),
+            }, ensure_ascii=False)
 
         # Step 6: 传递输出文件路径，避免通过 WebSocket 发送大块版图文本
-        routing_result_path = _router_result_path(work_dir)
-        import_lines_path = _router_import_lines_path(work_dir, router_type)
         routing_result_size = routing_result_path.stat().st_size
-        report = _read_router_report(work_dir)
-        report_text = report.strip().rstrip("。")
+        report_text = str(report or "").strip().rstrip("。")
         _transport.set_pending_pcb_fields(
             {
                 "routingResult": str(routing_result_path),
@@ -1312,7 +1323,7 @@ registry.register(
                         '"selectedBGA": "U27", "routerType": "arc", '
                         '"constraints": {"LineWidth": 4, "LineSpacing": 3}}\n'
                         "orderLines 必填，selectedBGA 建议传入；"
-                        "routerType 必填，可选 arc/135；constraints 会按布线器 README 转换。"
+                        "routerType 必填，可选 arc/135/rl/rl_arc/rl_135；constraints 会按布线器 README 转换。"
                     ),
                 },
             },
