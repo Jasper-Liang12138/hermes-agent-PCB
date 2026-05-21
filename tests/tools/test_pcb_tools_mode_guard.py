@@ -35,7 +35,7 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
 
 
 @pytest.fixture(autouse=True)
-def _restore_transport_state():
+def _restore_transport_state(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     prev_session = transport.current_session_id
     prev_modes = dict(transport._session_modes)
@@ -44,6 +44,11 @@ def _restore_transport_state():
     prev_pending_fields = dict(transport._pending_pcb_fields)
     prev_adapter = transport._websocket_adapter
     prev_loop = transport._main_loop
+    monkeypatch.setattr(
+        pcb_tools,
+        "_call_ctyun_explain_chat",
+        lambda messages: "测试可解释性报告：来自天翼云 explain 模型。",
+    )
     yield
     transport.current_session_id = prev_session
     transport._session_modes = prev_modes
@@ -560,10 +565,12 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert payload["rerouteResult"]["type"] == "local_reroute"
     assert payload["rerouteResult"]["selectedNets"] == ["net13", "net17"]
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
-    assert payload["checkReport"]["passed"] is True
+    assert payload["checkReport"]["passed"] is False
+    assert "routedLayoutTxtFilePath" not in payload
+    assert "模型未生成可回填的重布 patch" in payload["explanation"]
     assert "局部重布" in payload["explanation"]
-    assert "可解释性分析报告" in payload["content"]
-    assert "布线较好概率: 0.984707" in payload["content"]
+    assert payload["content"] == "测试可解释性报告：来自天翼云 explain 模型。"
+    assert "布线较好概率: 0.984707" not in payload["content"]
 
 
 def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
@@ -591,7 +598,113 @@ def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
     assert payload["rerouteResult"]["mode"] == "selected_traces_after_delete"
     assert payload["rerouteResult"]["selectedTraceIds"] == ["2386476278", "3424247826"]
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_selected_traces"
-    assert payload["checkReport"]["passed"] is True
+    assert payload["checkReport"]["passed"] is False
+    assert "routedLayoutTxtFilePath" not in payload
+    assert "模型未生成可回填的重布 patch" in payload["explanation"]
+
+
+def test_extract_kicad_patch_from_non_json_model_text():
+    text = """
+    下面是重布结果：
+    (segment (start 1 1) (end 2 2) (width 0.2) (layer Top) (net 73))
+    (via (at 2 2) (size 0.45) (drill 0.2) (layers Top Bottom) (net 73))
+    (module SHOULD_NOT_BE_PATCH (layer Top))
+    """
+
+    patch = pcb_tools._extract_kicad_patch_from_model_text(text)
+
+    assert "(segment" in patch
+    assert "(via" in patch
+    assert "(module" not in patch
+
+
+def test_reroute_model_payload_ignores_model_report_fields():
+    fallback = pcb_tools._build_fallback_reroute_payload(
+        nets=["net13"],
+        dropped_board_data="(kicad_pcb)",
+        dropped_board_path="/tmp/dropped.kicad_pcb",
+        dropped_objects=[],
+        local_context={},
+        constraints={},
+        check_report={"passed": True, "checks": []},
+        original_board_path="/tmp/original.kicad_pcb",
+    )
+
+    payload = pcb_tools._normalize_reroute_model_payload(
+        {
+            "kicadPatch": "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))",
+            "content": "模型不应该生成报告",
+            "report": "模型不应该生成报告",
+            "explanation": "模型不应该覆盖系统 explanation",
+            "checkReport": {"passed": False},
+        },
+        fallback_payload=fallback,
+        context_stats={"chunkCount": 1},
+    )
+
+    assert payload["kicadPatch"].startswith("(segment")
+    assert "content" not in payload
+    assert "report" not in payload
+    assert payload["explanation"] == fallback["explanation"]
+    assert payload["checkReport"] == fallback["checkReport"]
+
+
+def test_explain_prompt_uses_board_content_without_internal_path(tmp_path):
+    board_path = tmp_path / "internal_board.kicad_pcb"
+    board_path.write_text("(kicad_pcb (segment (start 1 1) (end 2 2)))", encoding="utf-8")
+
+    messages = pcb_tools._build_explain_prompt(
+        internal_board_path=str(board_path),
+        payload={
+            "rerouteResult": {
+                "routedBoardDataFilePath": str(board_path),
+                "drcPassed": True,
+            },
+            "checkReport": {"passed": True, "checks": []},
+        },
+        public_txt_path=str(tmp_path / "routed.txt"),
+    )
+    serialized = json.dumps(messages, ensure_ascii=False)
+
+    assert "(kicad_pcb" in serialized
+    assert str(board_path) not in serialized
+
+
+def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-no-patch"
+    transport.set_session_mode("sess-pcb-reroute-no-patch", "pcb")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "droppedObjects": [],
+            "localContext": {},
+        },
+        session_id="sess-pcb-reroute-no-patch",
+    )
+
+    monkeypatch.setattr(
+        pcb_tools,
+        "_generate_reroute_with_model",
+        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    )
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-no-patch")
+    payload = json.loads(result)
+
+    assert payload["checkReport"]["passed"] is False
+    assert any(
+        check["name"] == "model_patch" and check["passed"] is False
+        for check in payload["checkReport"]["checks"]
+    )
+    assert "routedLayoutTxtFilePath" not in payload
+    assert "模型未生成可回填的重布 patch" in payload["explanation"]
+    pending = pcb_tools._transport.pop_pending_pcb_fields("sess-pcb-reroute-no-patch")
+    assert pending["rerouteResult"]["type"] == "local_reroute"
+    assert pending["checkReport"]["passed"] is False
+    assert "模型未生成可回填的重布 patch" in pending["explanation"]
+    assert pending["report"] == "测试可解释性报告：来自天翼云 explain 模型。"
 
 
 def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):
@@ -666,6 +779,50 @@ def test_reroute_converts_frontend_txt_input_internally(monkeypatch, tmp_path):
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
 
 
+def test_reroute_model_prompt_hides_internal_kicad_paths():
+    prompts = pcb_tools._build_reroute_generation_prompts(
+        nets=["net13"],
+        selected_trace_ids=["2386476278"],
+        dropped_board_path="/private/tmp/secret/after_drop.kicad_pcb",
+        original_board_path="/private/tmp/secret/original.kicad_pcb",
+        dropped_objects=[
+            {
+                "id": "2386476278",
+                "debugPath": "/private/tmp/secret/trace.kicad_pcb",
+            }
+        ],
+        local_context={
+            "originalBoardDataFilePath": "/private/tmp/secret/original.kicad_pcb",
+            "source": "getSelectedElements/deleteTracesById/getProjectData",
+        },
+        constraints={},
+        context_text="(kicad_pcb (segment (start 1 1) (end 2 2)))",
+        context_stats={"chunkCount": 1},
+    )
+
+    combined = json.dumps(prompts, ensure_ascii=False)
+
+    assert ".kicad_pcb" not in combined
+    assert "/private/tmp/secret" not in combined
+    assert "originalBoardDataFilePath" not in combined
+    assert "droppedBoardDataFilePath" not in combined
+    assert '"internalBoardPathHidden": true' in prompts["user"]
+
+
+def test_reroute_model_outputs_not_written_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("PCB_REROUTE_WRITE_MODEL_OUTPUTS", raising=False)
+
+    output = pcb_tools._write_reroute_debug_artifact(
+        output_dir=str(tmp_path),
+        session_id="sess-secret",
+        label="model_raw",
+        content="sensitive model output",
+    )
+
+    assert output == ""
+    assert not (tmp_path / "model_outputs").exists()
+
+
 def test_reroute_max_drc_iterations_zero_skips_validation(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-reroute-drc-zero"
@@ -699,6 +856,11 @@ def test_reroute_max_drc_iterations_zero_skips_validation(monkeypatch, tmp_path)
 
     assert "drcPassed" not in payload["rerouteResult"]
     assert "routedLayoutTxtFilePath" not in payload
+    assert payload["checkReport"]["passed"] is False
+    assert any(
+        check["name"] == "drc_validation" and check["passed"] is False
+        for check in payload["checkReport"]["checks"]
+    )
 
 
 def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
@@ -755,6 +917,57 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     assert "originalBoardDataFilePath" not in payload["rerouteResult"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
     assert payload["checkReport"]["passed"] is True
+
+
+def test_reroute_drc_pass_without_txt_marks_failure(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-no-txt"
+    transport.set_session_mode("sess-pcb-reroute-no-txt", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": "(kicad_pcb\n)\n",
+            "originalBoardDataFilePath": str(original_path),
+        },
+        session_id="sess-pcb-reroute-no-txt",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(
+            **{key: value for key, value in kwargs.items() if key not in {"drc_feedback", "drc_iteration_history"}}
+        )
+        payload["kicadPatch"] = "(segment (start 1 1) (end 2 2) (width 0.2) (layer F.Cu) (net 13))"
+        return payload
+
+    def _fake_validate(**kwargs):
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+    monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", lambda **kwargs: ("", []))
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-no-txt")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert "routedLayoutTxtFilePath" not in payload
+    assert payload["checkReport"]["passed"] is False
+    assert any(
+        check["name"] == "txt_output_conversion" and check["passed"] is False
+        for check in payload["checkReport"]["checks"]
+    )
+    pending = pcb_tools._transport.pop_pending_pcb_fields("sess-pcb-reroute-no-txt")
+    assert pending["rerouteResult"]["drcPassed"] is True
+    assert "routedLayoutTxtFilePath" not in pending
+    assert pending["checkReport"]["passed"] is False
+    assert "DRC 已通过，但未生成可导入 txt" in pending["explanation"]
 
 
 def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):

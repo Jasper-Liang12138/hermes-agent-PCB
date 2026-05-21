@@ -18,6 +18,9 @@ logs/
 data/
 .pytest_cache/
 tmp/
+share/
+kicad_data/
+.hermes_reroute/
 temp_vision_images/
 hermes-*/*
 examples/
@@ -88,4 +91,3 @@ source-*.txt
 *_stdout.log
 *-stderr.log
 *-stdout.log
-

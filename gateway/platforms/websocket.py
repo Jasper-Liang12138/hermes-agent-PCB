@@ -1450,9 +1450,22 @@ class WebSocketAdapter(BasePlatformAdapter):
             return "EDA 导入完成。"
         return f"EDA 导入结果：{str(parsed)[:240]}"
 
+    @staticmethod
+    def _reroute_drc_passed(fields: Dict[str, Any]) -> bool:
+        reroute_result = fields.get("rerouteResult")
+        check_report = fields.get("checkReport")
+        reroute_result = reroute_result if isinstance(reroute_result, dict) else {}
+        check_report = check_report if isinstance(check_report, dict) else {}
+
+        if reroute_result.get("drcPassed") is False or check_report.get("passed") is False:
+            return False
+        return reroute_result.get("drcPassed") is True or check_report.get("passed") is True
+
     async def _import_reroute_result(self, session_id: str, fields: Dict[str, Any]) -> str:
         txt_path = str(fields.get("routedLayoutTxtFilePath") or "").strip()
         if not txt_path:
+            return ""
+        if not self._reroute_drc_passed(fields):
             return ""
 
         call_id = f"import_reroute_{uuid.uuid4().hex[:8]}"
@@ -2251,6 +2264,14 @@ class WebSocketAdapter(BasePlatformAdapter):
     def _fallback_visible_content_for_fields(content: str, pcb_fields: Dict[str, Any]) -> str:
         if "fanoutParams" in pcb_fields:
             return WebSocketAdapter._fanout_confirmation_content(pcb_fields.get("fanoutParams"))
+        if "rerouteResult" in pcb_fields or "routedLayoutTxtFilePath" in pcb_fields:
+            reroute_content = WebSocketAdapter._reroute_content_for_frontend(pcb_fields)
+            if reroute_content and (
+                pcb_fields.get("report")
+                or not (content and content.strip())
+                or WebSocketAdapter._is_generic_reroute_content(content)
+            ):
+                return reroute_content
         if content and content.strip():
             return content
         if "routingResult" in pcb_fields:
@@ -2259,9 +2280,6 @@ class WebSocketAdapter(BasePlatformAdapter):
                 return report
             return "布线完成，结果已发送到前端。"
         if "rerouteResult" in pcb_fields or "routedLayoutTxtFilePath" in pcb_fields:
-            explanation = str(pcb_fields.get("explanation") or "").strip()
-            if explanation:
-                return explanation
             return "局部拆线重布已完成，结果已发送到前端。"
         if "selection" in pcb_fields:
             selection = pcb_fields.get("selection")
@@ -2276,9 +2294,46 @@ class WebSocketAdapter(BasePlatformAdapter):
             return "已完成版图分析。"
         return content
 
+    @staticmethod
+    def _is_generic_reroute_content(content: str) -> bool:
+        text = str(content or "").strip()
+        if not text:
+            return True
+        compact = re.sub(r"\s+", "", text)
+        generic_phrases = (
+            "局部拆线重布已完成",
+            "已完成局部拆线重布",
+            "拆线重布已完成",
+            "重布完成",
+        )
+        return any(phrase in compact for phrase in generic_phrases)
+
+    @staticmethod
+    def _reroute_content_for_frontend(pcb_fields: Dict[str, Any]) -> str:
+        payload: Dict[str, Any] = {}
+        report = str(pcb_fields.get("report") or "").strip()
+        if report:
+            payload["report"] = report
+
+        for key in ("rerouteResult", "routedLayoutTxtFilePath", "checkReport", "explanation"):
+            if key not in pcb_fields:
+                continue
+            value = pcb_fields.get(key)
+            if value is None or value == "" or value == {} or value == []:
+                continue
+            payload[key] = value
+
+        return json.dumps(payload, ensure_ascii=False, indent=2) if payload else ""
+
     async def _prepare_final_pcb_fields_for_frontend(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
         fields = self._sanitize_public_pcb_fields(pcb_fields)
         if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields:
+            return fields
+        if fields.get("routedLayoutTxtFilePath") and not self._reroute_drc_passed(fields):
+            fields.pop("routedLayoutTxtFilePath", None)
+            reroute_result = fields.get("rerouteResult")
+            if isinstance(reroute_result, dict):
+                reroute_result.pop("routedLayoutTxtFilePath", None)
             return fields
         import_status = await self._import_reroute_result(session_id, fields)
         if import_status:

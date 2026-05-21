@@ -359,6 +359,7 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
         "routedLayoutTxtFilePath": r"F:\public\routed.txt",
         "checkReport": {"passed": True, "checks": []},
         "explanation": "局部重布结果已生成",
+        "report": "局部拆线重布已完成，DRC 通过，已生成可导入 txt。",
     }
 
     async def handler(event):
@@ -418,6 +419,11 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
                 assert "routedBoardDataFilePath" not in msg["body"]
                 assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
                 assert "导入完成" in msg["body"]["explanation"]
+                content_payload = json.loads(msg["body"]["content"])
+                assert content_payload["report"] == reroute_fields["report"]
+                assert content_payload["rerouteResult"]["type"] == "local_reroute"
+                assert content_payload["checkReport"] == reroute_fields["checkReport"]
+                assert "导入完成" in content_payload["explanation"]
                 assert ".kicad_pcb" not in json.dumps(msg["body"], ensure_ascii=False)
     finally:
         await adapter.disconnect()
@@ -469,6 +475,48 @@ async def _run_websocket_failed_reroute_does_not_import() -> None:
 
 def test_websocket_failed_reroute_does_not_import():
     asyncio.get_event_loop().run_until_complete(_run_websocket_failed_reroute_does_not_import())
+
+
+async def _run_websocket_reroute_txt_with_failed_drc_skips_import() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-failed-txt-no-import"
+    adapter._connections[session_id] = (ws, "proj-reroute-failed-txt")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content=(
+            "局部拆线重布未通过 DRC。\n\n"
+            "##PCB_FIELDS##\n"
+            + json.dumps(
+                {
+                    "rerouteResult": {
+                        "type": "local_reroute",
+                        "drcPassed": False,
+                        "routedLayoutTxtFilePath": r"F:\public\failed.txt",
+                    },
+                    "routedLayoutTxtFilePath": r"F:\public\failed.txt",
+                    "checkReport": {"passed": False, "checks": []},
+                    "explanation": "DRC 未通过，不应调用 importLines。",
+                },
+                ensure_ascii=False,
+            )
+            + "\n##PCB_FIELDS_END##"
+        ),
+        metadata={"stream_is_final": True},
+    )
+
+    assert result.success is True
+    assert len(ws.sent) == 1
+    body = ws.sent[0]["body"]
+    assert body["rerouteResult"]["drcPassed"] is False
+    assert "routedLayoutTxtFilePath" not in body
+    assert "routedLayoutTxtFilePath" not in body["rerouteResult"]
+    assert body["explanation"] == "DRC 未通过，不应调用 importLines。"
+
+
+def test_websocket_reroute_txt_with_failed_drc_skips_import():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_txt_with_failed_drc_skips_import())
 
 
 async def _run_websocket_reroute_sends_skill_status() -> None:
@@ -874,6 +922,24 @@ def test_routing_result_report_visible_fallback():
 
     assert "布线连通率：98.44%" in content
     assert "通孔数量：126" in content
+
+
+def test_reroute_report_visible_fallback_serializes_frontend_content():
+    content = WebSocketAdapter._fallback_visible_content_for_fields(
+        "局部拆线重布已完成。",
+        {
+            "rerouteResult": {"type": "local_reroute", "drcPassed": True},
+            "checkReport": {"passed": True, "checks": []},
+            "explanation": "DRC 通过，已生成 txt。",
+            "report": "局部拆线重布已完成，DRC 通过，已生成可导入 txt。",
+        },
+    )
+
+    payload = json.loads(content)
+    assert payload["report"] == "局部拆线重布已完成，DRC 通过，已生成可导入 txt。"
+    assert payload["rerouteResult"]["type"] == "local_reroute"
+    assert payload["checkReport"]["passed"] is True
+    assert payload["explanation"] == "DRC 通过，已生成 txt。"
 
 
 async def _run_plain_send_defaults_to_final() -> None:
