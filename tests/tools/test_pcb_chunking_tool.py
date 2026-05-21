@@ -3,7 +3,16 @@ from __future__ import annotations
 import json
 import types
 
+import pytest
+
 from tools import pcb_chunking_tool
+from tools import pcb_model_runtime
+
+
+@pytest.fixture(autouse=True)
+def _disable_local_env_file(monkeypatch):
+    monkeypatch.setenv("PCB_MODEL_RUNTIME_DISABLE_DOTENV", "1")
+    pcb_model_runtime._LOCAL_ENV_LOADED = False
 
 
 def test_find_vendor_wheel_returns_latest_match(monkeypatch, tmp_path):
@@ -69,6 +78,7 @@ def test_resolve_model_runtime_config_prefers_project_config_ini(monkeypatch, tm
     )
     monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
     fake_config_module = types.SimpleNamespace(
         load_config=lambda: {
@@ -88,6 +98,123 @@ def test_resolve_model_runtime_config_prefers_project_config_ini(monkeypatch, tm
         "base_url": "https://example.com/v1",
         "api_key": "sk-local-key",
     }
+
+
+def test_resolve_model_runtime_config_reads_ctyun_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        pcb_chunking_tool,
+        "_candidate_project_config_paths",
+        lambda: [tmp_path / "missing-config.ini"],
+    )
+    monkeypatch.setitem(
+        pcb_chunking_tool.sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(load_config=lambda: {}),
+    )
+    monkeypatch.setenv("CTYUN_MODEL", "ctyun-reroute-model")
+    monkeypatch.setenv("CTYUN_BASE_URL", "https://wishub-x5.ctyun.cn/v1/chat/completions")
+    monkeypatch.setenv("CTYUN_APP_KEY", "ctyun-secret-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    runtime = pcb_chunking_tool._resolve_model_runtime_config()
+
+    assert runtime == {
+        "model": "ctyun-reroute-model",
+        "base_url": "https://wishub-x5.ctyun.cn/v1",
+        "api_key": "ctyun-secret-key",
+    }
+
+
+def test_resolve_model_runtime_config_falls_back_to_model_doc(monkeypatch, tmp_path):
+    project_cfg = tmp_path / "config.ini"
+    share_dir = tmp_path / "share"
+    share_dir.mkdir()
+    (share_dir / "天翼云部署模型使用说明.md").write_text(
+        "base_url = https://wishub-x5.ctyun.cn/v1\n"
+        "model = reroute-doc-model\n"
+        "| App Key | local-doc-secret-value | keep local |\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pcb_chunking_tool,
+        "_candidate_project_config_paths",
+        lambda: [project_cfg],
+    )
+    monkeypatch.setitem(
+        pcb_chunking_tool.sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(load_config=lambda: {}),
+    )
+    monkeypatch.delenv("CTYUN_MODEL", raising=False)
+    monkeypatch.delenv("CTYUN_BASE_URL", raising=False)
+    monkeypatch.delenv("CTYUN_APP_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    runtime = pcb_chunking_tool._resolve_model_runtime_config()
+
+    assert runtime == {
+        "model": "reroute-doc-model",
+        "base_url": "https://wishub-x5.ctyun.cn/v1",
+        "api_key": "local-doc-secret-value",
+    }
+
+
+def test_ctyun_adapter_disables_thinking_and_strips_think_blocks(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "id": "resp-1",
+                    "choices": [{"message": {"content": "<think>hidden</think>{\"ok\": true}"}}],
+                    "usage": {"total_tokens": 12},
+                }
+            ).encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        captured["authorization"] = req.headers.get("Authorization")
+        return _FakeResponse()
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+    adapter = pcb_chunking_tool._make_openai_compatible_chat_adapter(
+        base_url="https://wishub-x5.ctyun.cn/v1",
+        model="ctyun-reroute-model",
+        api_key="secret",
+        timeout_s=123,
+    )
+
+    text, meta = adapter.generate(
+        types.SimpleNamespace(system="sys", user="你好"),
+        types.SimpleNamespace(max_new_tokens=4096, temperature=0.1),
+    )
+
+    assert text == '{"ok": true}'
+    assert meta["response_id"] == "resp-1"
+    assert captured["url"] == "https://wishub-x5.ctyun.cn/v1/chat/completions"
+    assert captured["timeout"] == 123
+    assert captured["authorization"] == "Bearer secret"
+    assert captured["payload"]["max_tokens"] == 4096
+    assert captured["payload"]["messages"][1]["content"].startswith("/no_think\n")
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_extract_first_json_object_strips_qwen_thinking():
+    payload = pcb_chunking_tool._extract_first_json_object('<think>hidden</think>{"ok": true}')
+
+    assert payload == {"ok": True}
 
 
 def test_extract_bga_prefers_long_context_analysis(monkeypatch):

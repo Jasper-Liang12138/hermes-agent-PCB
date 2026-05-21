@@ -29,6 +29,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
+from tools import pcb_model_runtime
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,13 @@ def _load_project_config_ini() -> configparser.ConfigParser | None:
         except Exception as exc:
             logger.warning("Failed reading project config.ini from %s: %s", path, exc)
     return None
+
+
+def _candidate_model_doc_paths() -> list[Path]:
+    paths: list[Path] = []
+    for config_path in _candidate_project_config_paths():
+        paths.append(config_path.parent / "share" / "天翼云部署模型使用说明.md")
+    return paths
 
 
 def _find_vendor_wheel() -> Optional[Path]:
@@ -145,6 +153,94 @@ _render_context_chunks = getattr(_chunker, "render_context_chunks", None)
 _pack_objects = getattr(_chunker, "_pack_objects", None)
 _limit_chunks = getattr(_chunker, "_limit_chunks", None)
 _GLOBAL_KINDS = set(getattr(_chunker, "GLOBAL_KINDS", set()))
+
+
+def _normalize_openai_base_url(value: str) -> str:
+    return pcb_model_runtime.normalize_openai_base_url(value)
+
+
+def _extract_model_runtime_config_from_doc() -> dict[str, str]:
+    return pcb_model_runtime.extract_stage_runtime_config_from_doc(
+        pcb_model_runtime.STAGE_REROUTE,
+        project_config_paths=_candidate_project_config_paths(),
+    )
+
+
+def _env_first(*names: str) -> str:
+    return pcb_model_runtime._env_first(*names)
+
+
+def _runtime_disables_thinking(base_url: str) -> bool:
+    return pcb_model_runtime.runtime_disables_thinking(pcb_model_runtime.STAGE_REROUTE, base_url)
+
+
+def _ensure_no_think_prefix(text: str) -> str:
+    return pcb_model_runtime.ensure_no_think_prefix(text)
+
+
+def _strip_model_thinking(text: str) -> str:
+    return pcb_model_runtime.strip_think_blocks(text)
+
+
+class _HermesOpenAICompatibleChatAdapter:
+    name = "openai-compatible"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str = "",
+        timeout_s: int = 300,
+        token_counter: Any = None,
+    ) -> None:
+        self.base_url = _normalize_openai_base_url(base_url)
+        self.model = model
+        self.api_key = api_key
+        self.timeout_s = timeout_s
+        if token_counter is not None:
+            self._token_counter = token_counter
+        elif _OpenAICompatibleChatAdapter is not None:
+            self._token_counter = _OpenAICompatibleChatAdapter(
+                base_url=self.base_url,
+                model=self.model,
+                api_key=self.api_key,
+                timeout_s=self.timeout_s,
+            ).get_token_counter()
+        else:
+            self._token_counter = None
+
+    def get_token_counter(self) -> Any:
+        return self._token_counter
+
+    def generate(self, prompt_bundle: Any, generation_config: Any) -> tuple[str, dict[str, Any]]:
+        return pcb_model_runtime.chat_completion_text(
+            stage=pcb_model_runtime.STAGE_REROUTE,
+            runtime={"base_url": self.base_url, "model": self.model, "api_key": self.api_key},
+            messages=[
+                {"role": "system", "content": prompt_bundle.system},
+                {"role": "user", "content": prompt_bundle.user},
+            ],
+            max_tokens=generation_config.max_new_tokens,
+            temperature=generation_config.temperature,
+            timeout_s=self.timeout_s,
+        )
+
+
+def _make_openai_compatible_chat_adapter(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str = "",
+    timeout_s: int = 300,
+):
+    return _HermesOpenAICompatibleChatAdapter(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        timeout_s=timeout_s,
+    )
+
 
 _POWER_NET_RE = re.compile(
     r"(?:^|[_/-])(vcc|vdd|vss|vin|vout|vbat|avdd|dvdd|pvdd|pp\d*|pwr|power)(?:$|[_/-])",
@@ -588,51 +684,10 @@ def _build_board_context(board_text: str, token_counter: Any = None) -> dict[str
 
 
 def _resolve_model_runtime_config() -> dict[str, str]:
-    base_url = ""
-    api_key = ""
-    model = ""
-
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config() or {}
-        model_config = config.get("model", {}) if isinstance(config, dict) else {}
-        if isinstance(model_config, dict):
-            model = str(model_config.get("default") or model_config.get("model") or "").strip()
-            base_url = str(model_config.get("base_url") or base_url).strip()
-            api_key = str(model_config.get("api_key") or api_key).strip()
-    except Exception:
-        pass
-
-    env_base_url = os.getenv("OPENAI_BASE_URL", "").strip()
-    env_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if env_base_url:
-        base_url = env_base_url
-    if env_api_key:
-        api_key = env_api_key
-
-    local_cfg = _load_project_config_ini()
-    if local_cfg and local_cfg.has_section("model"):
-        local_model = local_cfg.get("model", "model", fallback="").strip()
-        local_base_url = local_cfg.get("model", "base_url", fallback="").strip()
-        local_api_key = local_cfg.get("model", "api_key", fallback="").strip()
-        if local_model:
-            model = local_model
-        if local_base_url:
-            base_url = local_base_url
-        if local_api_key:
-            api_key = local_api_key
-
-    if not model:
-        raise RuntimeError("model.default is not configured for pcb long-context analysis")
-    if not base_url:
-        raise RuntimeError("OPENAI_BASE_URL/model.base_url is not configured for pcb long-context analysis")
-
-    return {
-        "model": model,
-        "base_url": base_url,
-        "api_key": api_key,
-    }
+    return pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_REROUTE,
+        project_config_paths=_candidate_project_config_paths(),
+    )
 
 
 def _build_board_analysis_prompt(
@@ -668,7 +723,7 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
     if not text or not text.strip():
         raise ValueError("model returned empty response")
 
-    cleaned = text.strip()
+    cleaned = _strip_model_thinking(text)
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -840,7 +895,7 @@ def _analyze_board_with_model(board_text: str) -> dict[str, Any]:
     parser_hints = _summarize_board_model(board_text)
     runtime = _resolve_model_runtime_config()
 
-    adapter = _OpenAICompatibleChatAdapter(
+    adapter = _make_openai_compatible_chat_adapter(
         base_url=runtime["base_url"],
         model=runtime["model"],
         api_key=runtime["api_key"],

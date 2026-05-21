@@ -32,6 +32,7 @@ from concurrent.futures import Future as ThreadFuture
 from typing import Dict, Any, Optional
 from pathlib import Path
 
+from tools import pcb_model_runtime
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -1478,6 +1479,23 @@ def _safe_reroute_name(value: str) -> str:
     return cleaned[:96] or "reroute"
 
 
+def _write_reroute_debug_artifact(
+    *,
+    output_dir: str,
+    session_id: str,
+    label: str,
+    content: str,
+) -> str:
+    if os.getenv("PCB_REROUTE_WRITE_MODEL_OUTPUTS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return ""
+    if not output_dir or not content:
+        return ""
+    path = Path(output_dir) / "model_outputs" / f"{_safe_reroute_name(session_id)}_{_safe_reroute_name(label)}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return str(path)
+
+
 def _write_internal_board_data(
     *,
     board_data: str,
@@ -1565,14 +1583,14 @@ _INTERNAL_REROUTE_PATH_KEYS = {
     "kicad_patch",
     "patchText",
     "rawModelOutput",
+    "modelRawOutputFilePath",
+    "extractedPatchFilePath",
 }
 
 _INTERNAL_KICAD_PATH_RE = re.compile(
     r"([A-Za-z]:[\\/][^\s\"'，,;；]+\.kicad_pcb|/[^\s\"'，,;；]+\.kicad_pcb)",
     re.IGNORECASE,
 )
-
-
 def _strip_internal_reroute_paths(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -1597,6 +1615,153 @@ def _public_reroute_payload(payload: Dict[str, Any], public_txt_path: str) -> Di
         reroute_result["routedLayoutTxtFilePath"] = public_txt_path
         result["rerouteResult"] = reroute_result
     return result
+
+
+def _pending_reroute_fields_for_frontend(public_payload: Dict[str, Any], public_txt_path: str) -> Dict[str, Any]:
+    if not isinstance(public_payload, dict) or not public_payload:
+        return {}
+
+    fields: Dict[str, Any] = {}
+    reroute_result = public_payload.get("rerouteResult")
+    if isinstance(reroute_result, dict):
+        fields["rerouteResult"] = reroute_result
+    if public_txt_path:
+        fields["routedLayoutTxtFilePath"] = public_txt_path
+    check_report = public_payload.get("checkReport")
+    if isinstance(check_report, dict):
+        fields["checkReport"] = check_report
+    explanation = str(public_payload.get("explanation") or "").strip()
+    if explanation:
+        fields["explanation"] = explanation
+    report = _nested_text_value(public_payload, "content", "report")
+    if report:
+        fields["report"] = report
+    return fields
+
+
+def _normalize_openai_base_url(value: str) -> str:
+    return pcb_model_runtime.normalize_openai_base_url(value)
+
+
+def _env_first(*names: str) -> str:
+    return pcb_model_runtime._env_first(*names)
+
+
+def _looks_like_real_secret(value: str) -> bool:
+    return pcb_model_runtime._looks_like_real_secret(value)
+
+
+def _extract_explain_runtime_config_from_doc() -> Dict[str, str]:
+    return pcb_model_runtime.extract_stage_runtime_config_from_doc(
+        pcb_model_runtime.STAGE_EXPLAIN,
+        doc_paths=[_repo_root() / "share" / "天翼云部署模型使用说明.md"],
+    )
+
+
+def _resolve_explain_runtime_config() -> Dict[str, str]:
+    return pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_EXPLAIN,
+        doc_paths=[_repo_root() / "share" / "天翼云部署模型使用说明.md"],
+        require_api_key=True,
+    )
+
+
+def _strip_think_blocks(text: str) -> str:
+    clean = pcb_model_runtime.strip_think_blocks(text)
+    clean = re.sub(r"(?is)^```(?:text|markdown|md)?\s*", "", clean.strip())
+    clean = re.sub(r"(?is)\s*```$", "", clean.strip())
+    return clean.strip()
+
+
+def _safe_json_for_explain(value: Any) -> Any:
+    return _strip_internal_reroute_paths(value)
+
+
+def _read_board_excerpt_for_explain(board_path: str, *, max_chars: int | None = None) -> Dict[str, Any]:
+    raw_limit = os.getenv("PCB_EXPLAIN_MAX_BOARD_CHARS", "").strip()
+    if max_chars is None:
+        try:
+            max_chars = int(raw_limit) if raw_limit else 24000
+        except ValueError:
+            max_chars = 24000
+    max_chars = max(2000, min(120000, max_chars))
+    board_text, _resolved = _read_board_file(board_path)
+    if not board_text:
+        return {"format": ".kicad_pcb", "available": False, "chars": 0, "content": ""}
+    if len(board_text) <= max_chars:
+        excerpt = board_text
+        truncated = False
+    else:
+        head_chars = max_chars // 2
+        tail_chars = max_chars - head_chars
+        excerpt = (
+            board_text[:head_chars]
+            + "\n\n...<中间内容已截断，供可解释性模型使用>...\n\n"
+            + board_text[-tail_chars:]
+        )
+        truncated = True
+    return {
+        "format": ".kicad_pcb",
+        "available": True,
+        "chars": len(board_text),
+        "truncated": truncated,
+        "content": excerpt,
+    }
+
+
+def _build_explain_prompt(
+    *,
+    internal_board_path: str,
+    payload: Dict[str, Any],
+    public_txt_path: str,
+) -> list[Dict[str, str]]:
+    explain_input = {
+        "boardFile": _read_board_excerpt_for_explain(internal_board_path),
+        "rerouteResult": _safe_json_for_explain((payload.get("rerouteResult") or {}) if isinstance(payload, dict) else {}),
+        "checkReport": _safe_json_for_explain((payload.get("checkReport") or {}) if isinstance(payload, dict) else {}),
+        "txtGenerated": bool(public_txt_path),
+        "importPolicy": "DRC 通过才允许 importLines；DRC 失败不导入。",
+    }
+    system_prompt = (
+        "你是 PCB 布线结果分析助手。请根据输入的内部 KiCad 版图内容、重布线结果和 DRC 检查结果，"
+        "生成简洁中文可解释性报告。不要输出 JSON，不要编造未给出的文件路径，不要暴露任何 .kicad_pcb 路径。"
+    )
+    user_prompt = (
+        "生成拆线重布后的可解释性报告。\n"
+        "报告只解释当前重布结果、DRC 结论和是否可导入，不要复述内部路径。\n\n"
+        f"{json.dumps(explain_input, ensure_ascii=False, indent=2)}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"/no_think\n{user_prompt}"},
+    ]
+
+
+def _call_ctyun_explain_chat(messages: list[Dict[str, str]]) -> str:
+    timeout_raw = os.getenv("CTYUN_EXPLAIN_TIMEOUT", os.getenv("PCB_EXPLAIN_TIMEOUT", "180")).strip()
+    max_tokens_raw = os.getenv("CTYUN_EXPLAIN_MAX_TOKENS", os.getenv("PCB_EXPLAIN_MAX_TOKENS", "2048")).strip()
+    try:
+        timeout = max(10.0, float(timeout_raw))
+    except ValueError:
+        timeout = 180.0
+    try:
+        max_tokens = max(256, min(8192, int(max_tokens_raw)))
+    except ValueError:
+        max_tokens = 2048
+
+    content, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_EXPLAIN,
+        runtime=_resolve_explain_runtime_config(),
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        timeout_s=timeout,
+        require_api_key=True,
+    )
+    content = _strip_think_blocks(str(content or ""))
+    if not content:
+        raise RuntimeError("explain model returned empty content")
+    return str(_strip_internal_reroute_paths(content)).strip()
 
 
 def _extract_board_file_path_from_text(text: str) -> str:
@@ -1739,6 +1904,7 @@ def _build_fallback_reroute_payload(
     explanation_suffix: str = "",
     original_board_path: str = "",
     selected_trace_ids: list[str] | None = None,
+    **_ignored: Any,
 ) -> Dict[str, Any]:
     selected_trace_ids = selected_trace_ids or []
     reroute_result = {
@@ -1770,27 +1936,26 @@ def _build_fallback_reroute_payload(
     return {"rerouteResult": reroute_result, "checkReport": check_report, "explanation": explanation}
 
 
-_REROUTE_EXPLAINABILITY_REPORT = """================
-可解释性分析报告
-================
-
-层数: 6
-
-预测结果: 布线较好
-布线较好概率: 0.984707
-当前预测置信度: 0.984707
-
-结论：该文件对应的布线结果整体较好。该板在层间图像特征、整体布线形态和版面表现上较为稳定。这类结果可用于 PCB 后续任务中的方案筛选、结果归档、质量评估或自动化流程中的优先候选。"""
-
-
-def _append_reroute_explainability_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _append_explainability_report(
+    payload: Dict[str, Any],
+    *,
+    internal_board_path: str,
+    public_txt_path: str,
+) -> Dict[str, Any]:
     result = dict(payload)
-    content = result.get("content")
-    if not isinstance(content, str) or not content.strip():
-        content = "局部拆线重布已完成。"
-    if _REROUTE_EXPLAINABILITY_REPORT not in content:
-        content = f"{content.strip()}\n\n{_REROUTE_EXPLAINABILITY_REPORT}"
-    result["content"] = content
+    try:
+        messages = _build_explain_prompt(
+            internal_board_path=internal_board_path,
+            payload=result,
+            public_txt_path=public_txt_path,
+        )
+        report = _call_ctyun_explain_chat(messages)
+    except Exception as exc:
+        logger.warning("Tianyi explain report generation failed: %s", exc)
+        result["content"] = f"可解释性模型调用失败：{exc}"
+        return result
+
+    result["content"] = str(_strip_internal_reroute_paths(report)).strip()
     return result
 
 
@@ -1801,24 +1966,61 @@ def _normalize_reroute_model_payload(
     context_stats: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     result = dict(fallback_payload)
-    if isinstance(model_payload.get("rerouteResult"), dict):
-        merged_result = dict(result["rerouteResult"])
-        merged_result.update(model_payload["rerouteResult"])
-        if context_stats:
-            merged_result.setdefault("contextStats", context_stats)
-        result["rerouteResult"] = merged_result
-    if isinstance(model_payload.get("checkReport"), dict):
-        result["checkReport"] = model_payload["checkReport"]
-    if isinstance(model_payload.get("explanation"), str) and model_payload["explanation"].strip():
-        result["explanation"] = model_payload["explanation"].strip()
-    if isinstance(model_payload.get("content"), str) and model_payload["content"].strip():
-        result["content"] = model_payload["content"].strip()
+    if context_stats and isinstance(result.get("rerouteResult"), dict):
+        result["rerouteResult"] = {**result["rerouteResult"], "contextStats": context_stats}
     for source_key in ("kicadPatch", "kicad_patch", "rawModelOutput"):
         target_key = "kicadPatch" if source_key == "kicad_patch" else source_key
         value = model_payload.get(source_key)
         if isinstance(value, str) and value.strip():
             result[target_key] = value.strip()
     return result
+
+
+def _extract_balanced_sexpr_blocks(text: str, head: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    blocks: list[str] = []
+    pattern = re.compile(rf"\(\s*{re.escape(head)}\b", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(match.start(), len(text)):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "(":
+                depth += 1
+                continue
+            if char == ")":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[match.start():pos + 1].strip())
+                    break
+    return blocks
+
+
+def _extract_kicad_patch_from_model_text(text: str) -> str:
+    blocks = []
+    for head in ("segment", "via"):
+        blocks.extend(_extract_balanced_sexpr_blocks(text, head))
+    seen: set[str] = set()
+    unique = []
+    for block in blocks:
+        if block in seen:
+            continue
+        seen.add(block)
+        unique.append(block)
+    return "\n".join(unique).strip()
 
 
 def _format_drc_iteration_history_for_prompt(history: list[Dict[str, Any]]) -> str:
@@ -1856,19 +2058,28 @@ def _build_reroute_generation_prompts(
 ) -> Dict[str, str]:
     system_prompt = (
         "你是一名 PCB 局部拆线重布助手。只输出 JSON，不要输出 Markdown、解释性段落或代码块。\n"
-        "必须生成 rerouteResult、checkReport、explanation，并尽量生成可回填 .kicad_pcb 的 kicadPatch。"
+        "必须生成可回填 KiCad S-expression 的 kicadPatch。\n"
+        "kicadPatch 只能包含新增重布对象 `(segment ...)` 和 `(via ...)`，不要输出 `(module)/(pad)/(net)/(layers)`。\n"
+        "不要生成 content、report、explanation 或 checkReport；DRC、报告和前端消息由系统工具链生成。"
     )
+    safe_local_context = _strip_internal_reroute_paths(local_context)
+    safe_dropped_objects = _strip_internal_reroute_paths(dropped_objects)
+    board_input_state = {
+        "frontendInputConvertedToKiCad": bool(dropped_board_path),
+        "originalBoardAvailable": bool(original_board_path),
+        "internalBoardPathHidden": True,
+    }
     user_prompt = (
         f"selectedNets:\n{json.dumps(nets, ensure_ascii=False, indent=2)}\n\n"
         f"selectedTraceIds:\n{json.dumps(selected_trace_ids or [], ensure_ascii=False, indent=2)}\n\n"
         f"constraints:\n{json.dumps(constraints, ensure_ascii=False, indent=2)}\n\n"
-        f"droppedObjects:\n{json.dumps(dropped_objects, ensure_ascii=False, indent=2)}\n\n"
-        f"localContext:\n{json.dumps(local_context, ensure_ascii=False, indent=2)}\n\n"
-        f"originalBoardDataFilePath: {original_board_path or ''}\n\n"
-        f"droppedBoardDataFilePath: {dropped_board_path or ''}\n\n"
+        f"droppedObjects:\n{json.dumps(safe_dropped_objects, ensure_ascii=False, indent=2)}\n\n"
+        f"localContext:\n{json.dumps(safe_local_context, ensure_ascii=False, indent=2)}\n\n"
+        f"boardInputState:\n{json.dumps(board_input_state, ensure_ascii=False, indent=2)}\n\n"
         f"chunkStats:\n{json.dumps(context_stats, ensure_ascii=False, indent=2)}\n\n"
         f"历史 DRC 迭代:\n{_format_drc_iteration_history_for_prompt(drc_iteration_history or [])}\n\n"
         f"上一轮 DRC 失败反馈:\n{json.dumps(drc_feedback or [], ensure_ascii=False, indent=2)}\n\n"
+        "输出要求：`kicadPatch` 只放 `(segment ...)/(via ...)`，不要复制 footprint、module、pad、net 表或整板内容。\n\n"
         f"拆线后版图分块上下文:\n{context_text}\n"
     )
     return {"system": system_prompt, "user": user_prompt}
@@ -1887,6 +2098,9 @@ def _generate_reroute_with_model(
     drc_feedback: list[str] | None = None,
     drc_iteration_history: list[Dict[str, Any]] | None = None,
     selected_trace_ids: list[str] | None = None,
+    debug_output_dir: str = "",
+    debug_label: str = "initial",
+    session_id: str = "session",
 ) -> Dict[str, Any]:
     fallback_payload = _build_fallback_reroute_payload(
         nets=nets,
@@ -1906,7 +2120,10 @@ def _generate_reroute_with_model(
         from tools import pcb_chunking_tool as chunking
 
         runtime = chunking._resolve_model_runtime_config()
-        adapter = chunking._OpenAICompatibleChatAdapter(
+        adapter_factory = getattr(chunking, "_make_openai_compatible_chat_adapter", None)
+        if adapter_factory is None:
+            adapter_factory = chunking._OpenAICompatibleChatAdapter
+        adapter = adapter_factory(
             base_url=runtime["base_url"],
             model=runtime["model"],
             api_key=runtime["api_key"],
@@ -1932,10 +2149,40 @@ def _generate_reroute_with_model(
         prompt_bundle = chunking._PromptBundle(system=prompts["system"], user=prompts["user"])
         raw_text, _model_meta = adapter.generate(
             prompt_bundle,
-            chunking._GenerationConfig(max_new_tokens=1600, temperature=0.1),
+            chunking._GenerationConfig(max_new_tokens=_get_reroute_model_max_tokens(), temperature=0.1),
         )
-        model_payload = chunking._extract_first_json_object(raw_text)
+        raw_output_path = _write_reroute_debug_artifact(
+            output_dir=debug_output_dir,
+            session_id=session_id,
+            label=f"{debug_label}_model_raw",
+            content=raw_text,
+        )
+        try:
+            model_payload = chunking._extract_first_json_object(raw_text)
+        except Exception:
+            extracted_patch = _extract_kicad_patch_from_model_text(raw_text)
+            if not extracted_patch:
+                raise
+            model_payload = {
+                "kicadPatch": extracted_patch,
+            }
+        else:
+            if not _model_patch_text(model_payload):
+                extracted_patch = _extract_kicad_patch_from_model_text(raw_text)
+                if extracted_patch:
+                    model_payload["kicadPatch"] = extracted_patch
+        patch_text = _model_patch_text(model_payload)
+        patch_output_path = _write_reroute_debug_artifact(
+            output_dir=debug_output_dir,
+            session_id=session_id,
+            label=f"{debug_label}_extracted_patch",
+            content=patch_text,
+        )
         model_payload.setdefault("rawModelOutput", raw_text)
+        if raw_output_path:
+            model_payload.setdefault("modelRawOutputFilePath", raw_output_path)
+        if patch_output_path:
+            model_payload.setdefault("extractedPatchFilePath", patch_output_path)
         return _normalize_reroute_model_payload(
             model_payload,
             fallback_payload=fallback_payload,
@@ -1972,12 +2219,19 @@ def _get_max_drc_iterations(user_data_obj: Dict[str, Any]) -> int:
         return 5
 
 
+def _get_reroute_model_max_tokens() -> int:
+    raw = os.getenv("PCB_REROUTE_MAX_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else 4096
+    except ValueError:
+        value = 4096
+    return max(512, min(32768, value))
+
+
 def _resolve_reroute_output_dir(user_data_obj: Dict[str, Any], original_board_path: str, session_id: str) -> str:
     explicit = user_data_obj.get("routedBoardOutputDir") or user_data_obj.get("outputDir")
     if explicit:
         return str(Path(str(explicit)).expanduser())
-    if original_board_path:
-        return str(Path(original_board_path).expanduser().parent / ".hermes_reroute")
     return str(Path(tempfile.gettempdir()) / "hermes_pcb_reroute" / (session_id or "session"))
 
 
@@ -1987,6 +2241,26 @@ def _model_patch_text(payload: Dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _append_reroute_check(
+    payload: Dict[str, Any],
+    *,
+    name: str,
+    passed: bool,
+    detail: str,
+) -> Dict[str, Any]:
+    result = dict(payload)
+    check_report = dict(result.get("checkReport") or {})
+    checks = list(check_report.get("checks") or [])
+    checks.append({"name": name, "passed": bool(passed), "detail": detail})
+    check_report["checks"] = checks
+    check_report["passed"] = bool(check_report.get("passed", True)) and bool(passed)
+    result["checkReport"] = check_report
+    if not passed and detail:
+        explanation = str(result.get("explanation") or "").strip()
+        result["explanation"] = f"{explanation} {detail}".strip() if explanation else detail
+    return result
 
 
 def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any, original_board_path: str) -> Dict[str, Any]:
@@ -2221,8 +2495,33 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         constraints=constraints,
         check_report=check_report,
         original_board_path=str(original_board_path or ""),
+        debug_output_dir=output_dir,
+        debug_label="initial",
+        session_id=session_id or "session",
     )
-    if max_drc_iterations > 0 and original_board_data and _model_patch_text(payload):
+    patch_text = _model_patch_text(payload)
+    if max_drc_iterations <= 0:
+        payload = _append_reroute_check(
+            payload,
+            name="drc_validation",
+            passed=False,
+            detail="DRC 校验已被配置跳过，未生成可导入 txt。",
+        )
+    elif not original_board_data:
+        payload = _append_reroute_check(
+            payload,
+            name="drc_validation",
+            passed=False,
+            detail="缺少原始版图数据，无法执行 DRC 校验，也不会导入重布结果。",
+        )
+    elif not patch_text:
+        payload = _append_reroute_check(
+            payload,
+            name="model_patch",
+            passed=False,
+            detail="模型未生成可回填的重布 patch，无法执行 DRC 校验，也不会导入重布结果。",
+        )
+    else:
         def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
             return _generate_reroute_with_model(
                 nets=nets,
@@ -2236,6 +2535,9 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
                 original_board_path=str(original_board_path or ""),
                 drc_feedback=feedback,
                 drc_iteration_history=iteration_history,
+                debug_output_dir=output_dir,
+                debug_label=f"drc_retry_{len(iteration_history) + 2}",
+                session_id=session_id or "session",
             )
 
         payload = _run_reroute_drc_iterations(
@@ -2247,15 +2549,15 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
             max_iterations=max_drc_iterations,
             regenerate=_regenerate,
         )
-    payload = _append_reroute_explainability_content(payload)
     public_txt_path = ""
+    routed_internal_path = ""
     try:
         routed_internal_path = str(payload.get("routedBoardDataFilePath") or "")
         if not routed_internal_path and isinstance(payload.get("rerouteResult"), dict):
             routed_internal_path = str(payload["rerouteResult"].get("routedBoardDataFilePath") or "")
-        drc_passed = True
+        drc_passed = False
         if isinstance(payload.get("rerouteResult"), dict) and "drcPassed" in payload["rerouteResult"]:
-            drc_passed = bool(payload["rerouteResult"].get("drcPassed"))
+            drc_passed = payload["rerouteResult"].get("drcPassed") is True
         if drc_passed:
             public_txt_path, notes = _convert_internal_kicad_to_public_txt(
                 kicad_path=routed_internal_path,
@@ -2263,26 +2565,31 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
                 session_id=session_id or "session",
             )
             conversion_notes.extend(notes)
+            if not public_txt_path:
+                payload = _append_reroute_check(
+                    payload,
+                    name="txt_output_conversion",
+                    passed=False,
+                    detail="DRC 已通过，但未生成可导入 txt，因此不会调用 importLines。",
+                )
     except Exception as exc:
         logger.warning("Failed converting reroute result to public txt: %s", exc)
-        check_report = dict(payload.get("checkReport") or check_report)
-        checks = list(check_report.get("checks") or [])
-        checks.append({"name": "txt_output_conversion", "passed": False, "detail": str(exc)})
-        check_report["checks"] = checks
-        check_report["passed"] = False
-        payload["checkReport"] = check_report
-        payload["explanation"] = f"{payload.get('explanation', '')} 输出 txt 转换失败：{exc}".strip()
-    public_payload = _public_reroute_payload(payload, public_txt_path)
-    if public_txt_path:
-        _transport.set_pending_pcb_fields(
-            {
-                "rerouteResult": public_payload.get("rerouteResult") or {},
-                "routedLayoutTxtFilePath": public_txt_path,
-                "checkReport": public_payload.get("checkReport") or {},
-                "explanation": public_payload.get("explanation") or "",
-            },
-            session_id=session_id,
+        payload = _append_reroute_check(
+            payload,
+            name="txt_output_conversion",
+            passed=False,
+            detail=f"输出 txt 转换失败：{exc}",
         )
+    explain_board_path = routed_internal_path or str(original_board_path or dropped_board_path or "")
+    payload = _append_explainability_report(
+        payload,
+        internal_board_path=explain_board_path,
+        public_txt_path=public_txt_path,
+    )
+    public_payload = _public_reroute_payload(payload, public_txt_path)
+    pending_fields = _pending_reroute_fields_for_frontend(public_payload, public_txt_path)
+    if pending_fields:
+        _transport.set_pending_pcb_fields(pending_fields, session_id=session_id)
     return json.dumps(public_payload, ensure_ascii=False)
 
 
