@@ -29,7 +29,7 @@ metadata:
 |--------|------|------|
 | `getProjectData` | WebSocket 代理 | 获取 PCB 项目 S 表达式数据 |
 | `pcb_extract_bga` | 本地分析 | 从缓存版图中提取 BGA 列表、板级摘要和扇出上下文 |
-| `route` | 本地 adapter 调用 | 执行 BGA 扇出布线，根据 `routerType` 选择 `arc` 或 `135`，返回 `routingResult` 文件路径和报告，不向前端发送 `route` 工具调用 |
+| `route` | 本地 adapter 调用 | 执行 BGA 扇出布线，根据 `routerType` 选择 `arc` / `135` / `rl` / `rl_arc` / `rl_135`，返回 `routingResult`、`importLinesFilePath` 和 `report`，不向前端发送 `route` 工具调用 |
 
 ## Agent 工作流程（系统提示词控制，方案 A）
 
@@ -74,10 +74,10 @@ Step 8: 布线完成，返回 routingResult 文件路径 + 报告
 1. 调用 getProjectData() 获取版图数据
 2. 调用 `pcb_extract_bga(board_text)` 作为主链路，获取 `selection`、`boardSummary`、`fanoutContext`
 3. 若存在多个 BGA，返回选择列表（见输出格式）；若只有一个 BGA，可直接沿用该工具返回的板级摘要与 fanout 上下文进入算法选择步骤
-4. 目标 BGA 确定后，先询问走线算法类型（`arc` 或 `135`）；如果用户已经明确指定算法，可跳过此步。禁止在算法未确定时询问是否执行布线
-5. 只有在 `routerType` 已确定为 `"arc"` 或 `"135"` 后，才根据 `boardSummary` 与 `fanoutContext` 生成扇出参数
-6. 返回扇出参数供用户确认（用户可修改）；此时 `fanoutParams.routerType` 必须是 `"arc"` 或 `"135"`，禁止为 `null`
-7. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入；`route` 在 Agent 本地通过 adapter 调用 `arc` 或 `135` Windows 布线器，不经前端）
+4. 目标 BGA 确定后，先询问走线算法类型（`arc`、`135`、`rl`、`rl_arc`）；如果用户已经明确指定算法，可跳过此步。禁止在算法未确定时询问是否执行布线
+5. 只有在 `routerType` 已确定后，系统会优先调用北科大 `layer_assign_cpp` + `escape_order_cpp` 生成 `fanoutParams`；若工具不可用再回退到 LLM/规则生成
+6. 返回扇出参数供用户确认（用户可修改）；此时 `fanoutParams.routerType` 必须等于已选布线器，禁止为 `null`
+7. 用户确认后，调用 route(userData) 执行布线（projectData 由系统自动从缓存获取，无需传入；`route` 在 Agent 本地通过 BJUT adapter 调用布线器，不经前端）
 8. 返回布线结果和报告
 
 ## 输出格式（关键）
