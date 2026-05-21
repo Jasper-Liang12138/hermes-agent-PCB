@@ -223,13 +223,23 @@ def write_component_input(work_dir: Path, component_refdes: str) -> Path:
     return path
 
 
-def write_order_input(work_dir: Path, order_lines: list[dict[str, Any]], component_refdes: str) -> Path:
+def write_order_input(
+    work_dir: Path,
+    order_lines: list[dict[str, Any]],
+    component_refdes: str,
+    constraints: Any | None = None,
+) -> Path:
     body = "\n".join(
         f"{item['net']} {item['layer']} {item['order']}"
         for item in order_lines
         if item.get("net") and item.get("layer")
     )
-    text = f"{body}\n\n{component_refdes.strip()}"
+    line_width = 4
+    line_spacing = 3
+    if isinstance(constraints, dict):
+        line_width = constraints.get("LineWidth") or constraints.get("lineWidth") or line_width
+        line_spacing = constraints.get("LineSpacing") or constraints.get("lineSpacing") or line_spacing
+    text = f"{component_refdes.strip()}\n{line_width}\n{line_spacing}\n{body}\n"
     path = work_dir / "order_input.txt"
     path.write_text(text, encoding="utf-8")
     return path
@@ -263,8 +273,12 @@ def parse_order_input_text(text: str) -> dict[str, Any]:
     if not lines:
         return {"selectedBGA": "", "orderLines": [], "constraints": {}}
 
-    selected_bga = lines[0]
-    index = 1
+    selected_bga = ""
+    index = 0
+    first_parts = lines[0].split()
+    if len(first_parts) < 3:
+        selected_bga = lines[0]
+        index = 1
     constraints: dict[str, Any] = {}
     while index < len(lines):
         parts = lines[index].split()
@@ -362,6 +376,11 @@ def _run_router_main(work_dir: Path, router_dir: Path, router_type: str, layout_
 def _read_report(work_dir: Path) -> str:
     report_path = work_dir / "data.txt"
     if report_path.is_file():
+        for encoding in ("utf-8", "gbk", "gb18030"):
+            try:
+                return report_path.read_text(encoding=encoding).strip()
+            except UnicodeDecodeError:
+                continue
         return report_path.read_text(encoding="utf-8", errors="replace").strip()
     return "布线完成（无详细报告）"
 
@@ -502,11 +521,12 @@ def run_bjut_route(
 
     layout_path = write_layout_inputs(work_dir, project_data)
     write_component_input(work_dir, selected_bga)
-    write_order_input(work_dir, order_lines, selected_bga)
     constraints = fanout_params.get("constraints") or {}
     if router_execution_family(router_type) == "arc":
         write_arc_constrain(work_dir, constraints)
 
+    _run_layer_assign(work_dir, router_dir, router_type, layout_path.name, "component_input.txt")
+    _run_escape_order(work_dir, router_dir, layout_path.name)
     _run_router_main(work_dir, router_dir, router_type, layout_path.name)
 
     routing_result = _resolve_routing_result_path(work_dir, router_type, router_dir, layout_path)
