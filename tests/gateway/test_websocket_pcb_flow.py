@@ -674,7 +674,7 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
                 assert "已选择目标 BGA：FPGA1" in second["body"]["content"]
-                assert "请回复 `arc` 或 `135`" in second["body"]["content"]
+                assert "请回复 `arc`、`135`、`rl` 或 `rl_arc`" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 

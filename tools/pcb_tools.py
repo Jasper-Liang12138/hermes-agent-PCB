@@ -1205,7 +1205,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
                 "routingResult": "",
                 "report": "缺少 routerType，请选择布线器：arc、135、rl、rl_arc、rl_135",
             }, ensure_ascii=False)
-        from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_router
+        from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_route
 
         if router_type not in SUPPORTED_ROUTER_TYPES:
             return json.dumps({
