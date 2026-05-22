@@ -33,6 +33,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 from tools import pcb_model_runtime
+from tools.pcb_explain_report import generate_explain_report
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -1933,15 +1934,14 @@ def _append_explainability_report(
 ) -> Dict[str, Any]:
     result = dict(payload)
     try:
-        messages = _build_explain_prompt(
-            internal_board_path=internal_board_path,
-            payload=result,
-            public_txt_path=public_txt_path,
+        report = generate_explain_report(
+            board_file_path=internal_board_path,
+            reroute_result=(result.get("rerouteResult") or {}) if isinstance(result.get("rerouteResult"), dict) else {},
+            check_report=(result.get("checkReport") or {}) if isinstance(result.get("checkReport"), dict) else {},
         )
-        report = _call_ctyun_explain_chat(messages)
     except Exception as exc:
-        logger.warning("Tianyi explain report generation failed: %s", exc)
-        result["content"] = f"可解释性模型调用失败：{exc}"
+        logger.warning("Local explain report generation failed: %s", exc)
+        result["content"] = f"可解释性报告生成失败：{_strip_internal_reroute_paths(str(exc))}"
         return result
 
     result["content"] = str(_strip_internal_reroute_paths(report)).strip()

@@ -21,6 +21,7 @@ tmp/
 share/
 kicad_data/
 .hermes_reroute/
+inference_runs/
 temp_vision_images/
 hermes-*/*
 examples/

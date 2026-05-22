@@ -24,6 +24,13 @@ parallel-web>=0.4.2
 # Image generation
 fal-client
 
+# Optional: For local PCB explain classifier reports
+# torch
+# torchvision
+# pillow
+# matplotlib
+# numpy
+
 # Text-to-speech (Edge TTS is free, no API key needed)
 edge-tts
 

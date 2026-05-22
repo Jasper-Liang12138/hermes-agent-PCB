@@ -46,8 +46,8 @@ def _restore_transport_state(monkeypatch):
     prev_loop = transport._main_loop
     monkeypatch.setattr(
         pcb_tools,
-        "_call_ctyun_explain_chat",
-        lambda messages: "测试可解释性报告：来自天翼云 explain 模型。",
+        "generate_explain_report",
+        lambda **kwargs: "测试可解释性报告：来自本地 explain 分类模型。",
     )
     yield
     transport.current_session_id = prev_session
@@ -569,7 +569,7 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert "routedLayoutTxtFilePath" not in payload
     assert "模型未生成可回填的重布 patch" in payload["explanation"]
     assert "局部重布" in payload["explanation"]
-    assert payload["content"] == "测试可解释性报告：来自天翼云 explain 模型。"
+    assert payload["content"] == "测试可解释性报告：来自本地 explain 分类模型。"
     assert "布线较好概率: 0.984707" not in payload["content"]
 
 
@@ -704,7 +704,7 @@ def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
     assert pending["rerouteResult"]["type"] == "local_reroute"
     assert pending["checkReport"]["passed"] is False
     assert "模型未生成可回填的重布 patch" in pending["explanation"]
-    assert pending["report"] == "测试可解释性报告：来自天翼云 explain 模型。"
+    assert pending["report"] == "测试可解释性报告：来自本地 explain 分类模型。"
 
 
 def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):
