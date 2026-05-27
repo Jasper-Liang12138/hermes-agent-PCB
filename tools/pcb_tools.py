@@ -240,9 +240,12 @@ def _router_result_path(work_dir: Path) -> Path:
     return result_file.resolve()
 
 
-def _router_import_lines_path(work_dir: Path, router_type: str) -> Path:
+def _router_import_lines_path(work_dir: Path, router_type: str, constraints: Any = None) -> Path:
     """Return the router-native records file expected by EDA importLines."""
-    candidates = ("ARC_output.txt",) if router_type == "arc" else ("line.out",)
+    from tools.pcb_bjut_router import router_execution_family
+
+    family = router_execution_family(router_type)
+    candidates = ("line.out",) if family == "135" else ("ARC_output.txt", "arc_output.txt")
     for filename in candidates:
         path = work_dir / filename
         if path.exists() and path.stat().st_size > 0:
@@ -1262,7 +1265,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
             else:
                 _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
             routing_result_path = _router_result_path(work_dir)
-            import_lines_path = _router_import_lines_path(work_dir, router_type)
+            import_lines_path = _router_import_lines_path(work_dir, router_type, constraints)
             report = _read_router_report(work_dir)
         else:
             return json.dumps({
@@ -1289,7 +1292,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
             f"{summary}。"
             f"完整布线数据已由系统通过 WebSocket 结构化字段发送给前端，"
             f"数据文件 {routing_result_path}，大小 {routing_result_size} 字节；"
-            f"EDA 导入使用布线器原始记录文件 {import_lines_path}；请不要在正文中复述布线数据。"
+            f"EDA 导入使用布线器原始记录文件 {import_lines_path}。"
         )
 
     except subprocess.TimeoutExpired:

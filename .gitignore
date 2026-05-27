@@ -78,6 +78,9 @@ exit-code-capture.txt
 tmp_*.py
 tmp_*.json
 tmp_*.txt
+tmp_*/
+demo_package_staging*/
+hermes-agent-PCB-Demo-v*.zip
 source-*.log
 source-*.txt
 # Logs and captured process output

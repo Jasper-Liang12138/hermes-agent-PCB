@@ -279,6 +279,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_selection_labels: Dict[str, Tuple[str, ...]] = {}
         self._session_selected_targets: Dict[str, str] = {}
         self._session_router_types: Dict[str, str] = {}
+        self._session_route_algorithms: Dict[str, str] = {}
+        self._session_fanout_modules: Dict[str, str] = {}
         self._session_fanout_params: Dict[str, Dict[str, Any]] = {}
         self._session_bga_selection: Dict[str, Tuple[Dict[str, Any], ...]] = {}
         self._session_board_summaries: Dict[str, Dict[str, Any]] = {}
@@ -297,6 +299,11 @@ class WebSocketAdapter(BasePlatformAdapter):
             extra.get("pcb_trace_log_path")
             or os.getenv("PCB_WEBSOCKET_TRACE_LOG")
             or Path("logs") / "pcb_websocket_trace.jsonl"
+        )
+        self._pcb_full_trace_log_path = str(
+            extra.get("pcb_full_trace_log_path")
+            or os.getenv("PCB_WEBSOCKET_FULL_TRACE_LOG")
+            or Path(self._pcb_trace_log_path).parent / "pcb_websocket_full.jsonl"
         )
 
     # -------------------------------------------------------------------------
@@ -441,10 +448,17 @@ class WebSocketAdapter(BasePlatformAdapter):
                     try:
                         data = json.loads(msg.data)
                     except json.JSONDecodeError:
+                        self._trace_ws_full(
+                            {"rawText": msg.data},
+                            direction="inbound",
+                            delivered=True,
+                            reason="invalid_json",
+                        )
                         logger.error("Invalid JSON: %s", msg.data[:200])
                         continue
 
                     msg_type = data.get("type")
+                    self._trace_ws_full(data, direction="inbound", delivered=True, reason="received")
 
                     if msg_type == "message":
                         session_id, project_id = self._resolve_ws_context(ws, data)
@@ -637,10 +651,12 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not ws_info:
             self._pending_outbound.setdefault(session_id, []).append(message)
             logger.info("Queued websocket payload for disconnected session=%s type=%s", session_id, message.get("type"))
+            self._trace_ws_full(message, direction="outbound", delivered=False, reason="disconnected")
             self._trace_pcb_outbound(message, delivered=False, reason="disconnected")
             return False
         try:
             await self._send_json_on_websocket_loop(ws_info[0], message)
+            self._trace_ws_full(message, direction="outbound", delivered=True, reason="sent")
             self._trace_pcb_outbound(message, delivered=True, reason="sent")
             return True
         except (ConnectionResetError, RuntimeError, OSError, aiohttp.ClientConnectionError) as exc:
@@ -655,7 +671,41 @@ class WebSocketAdapter(BasePlatformAdapter):
                 message.get("type"),
                 exc,
             )
+            self._trace_ws_full(message, direction="outbound", delivered=False, reason=f"send_failed:{type(exc).__name__}")
             return False
+
+    def _trace_ws_full(
+        self,
+        message: Dict[str, Any],
+        *,
+        direction: str,
+        delivered: bool,
+        reason: str,
+    ) -> None:
+        """Persist every PCB websocket JSON payload without summary truncation."""
+        if not self._trace_pcb_messages:
+            return
+        event = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "direction": direction,
+            "delivered": delivered,
+            "reason": reason,
+            "type": message.get("type") if isinstance(message, dict) else "",
+            "sessionId": message.get("sessionId") if isinstance(message, dict) else "",
+            "projectid": (
+                message.get("projectid") or message.get("projectId")
+                if isinstance(message, dict)
+                else ""
+            ),
+            "message": message,
+        }
+        try:
+            path = Path(self._pcb_full_trace_log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to write PCB websocket full trace log: %s", exc)
 
     def _trace_pcb_outbound(self, message: Dict[str, Any], *, delivered: bool, reason: str) -> None:
         if not self._trace_pcb_messages:
@@ -694,14 +744,16 @@ class WebSocketAdapter(BasePlatformAdapter):
             "isFinal": body.get("isFinal"),
             "fieldKeys": field_keys,
             "contentPreview": content[:240],
+            "body": body,
+            "message": message,
         }
         for key in ("routingResult", "importLinesFilePath", "routedLayoutTxtFilePath"):
             if key in body:
                 event[key] = body.get(key)
         if "report" in body:
             event["reportPreview"] = str(body.get("report") or "")[:240]
-        if "fanoutParams" in body and isinstance(body.get("fanoutParams"), dict):
-            fanout_params = body["fanoutParams"]
+        fanout_params = WebSocketAdapter._body_fanout_params(body.get("fanoutParams"))
+        if fanout_params:
             event["fanoutSummary"] = {
                 "selectedBGA": fanout_params.get("selectedBGA") or "",
                 "routerType": fanout_params.get("routerType") or "",
@@ -819,13 +871,17 @@ class WebSocketAdapter(BasePlatformAdapter):
                 return
 
         if decision.reason == "router_type_step":
-            router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
+            router_type = self._session_router_types.get(session_id) or self._extract_complete_router_choice(session_id, user_text)
             selected = self._session_selected_targets.get(session_id)
             target_line = f"目标 BGA 已确定为 {selected}。\n" if selected else ""
+            algorithm = self._router_algorithm_from_type(router_type or "")
+            module = self._fanout_module_from_type(router_type or "")
             user_text = (
-                "[SYSTEM: 用户已选择 PCB BGA 逃逸布线器。\n"
+                "[SYSTEM: 用户已选择 PCB BGA 逃逸布线配置。\n"
                 f"{target_line}"
-                f"routerType 已确定为 {router_type}。\n"
+                f"走线算法已确定为 {algorithm or router_type}。\n"
+                f"层分配和逃逸顺序生成模块已确定为 {module or '未指定'}。\n"
+                f"内部 routerType 已确定为 {router_type}。\n"
                 "下一步必须基于已缓存的 boardSummary/fanoutContext 或当前上下文生成 fanoutParams；"
                 "fanoutParams.routerType 必须等于该 routerType，禁止为 null，禁止使用 pcb_fanout。]\n\n"
                 f"用户原始回复：\n{user_text}"
@@ -944,7 +1000,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     async def _run_direct_fanout_param_step(self, session_id: str, user_text: str) -> bool:
         """Generate fanoutParams under adapter control; prefer BJUT layer/order tools."""
-        router_type = self._session_router_types.get(session_id) or self._extract_router_type(user_text)
+        router_type = self._session_router_types.get(session_id) or self._extract_complete_router_choice(session_id, user_text)
         if router_type not in {"arc", "135", "rl", "rl_arc", "rl_135"}:
             return False
         self._session_router_types[session_id] = router_type
@@ -1011,6 +1067,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             board_summary=board_summary,
             fanout_context=fanout_context,
         )
+        module = self._fanout_module_from_type(router_type)
         if bjut_fanout.get("orderLines"):
             fanout_params["orderLines"] = bjut_fanout["orderLines"]
             if bjut_fanout.get("constraints"):
@@ -1019,7 +1076,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
 
-        source_hint = "（北科大层分配/逃逸顺序工具生成）" if bjut_fanout else ""
+        source_hint = f"（{module} 层分配/逃逸顺序生成模块）" if module and bjut_fanout else ""
         await self.send(
             chat_id=session_id,
             content=(
@@ -1047,7 +1104,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 "请根据 PCB 版图摘要生成候选 fanoutParams。只输出 JSON 对象，不要 Markdown，不要解释。\n"
                 "禁止输出 routingResult、importLinesFilePath 或任何表示已完成布线的字段。\n"
                 f"selectedBGA 必须是 {selected_bga!r}，routerType 必须是 {router_type!r}。\n"
-                "JSON 格式：{\"fanoutParams\":{\"selectedBGA\":\"...\",\"routerType\":\"arc|135\","
+                "JSON 格式：{\"fanoutParams\":{\"selectedBGA\":\"...\",\"routerType\":\"arc|135|rl|rl_arc\","
                 "\"orderLines\":[{\"net\":\"...\",\"layer\":\"...\",\"order\":1}],"
                 "\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}}\n\n"
                 f"boardSummary={json.dumps(board_summary, ensure_ascii=False)}\n"
@@ -1378,9 +1435,23 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         pending_fields = self._pop_pending_pcb_fields(session_id)
         fields.update(pending_fields)
-        import_status = await self._import_fanout_result(session_id, route_params, fields)
+        routed_layout_path = str(fields.get("routingResult") or "").strip()
+        import_lines_path = str(fields.get("importLinesFilePath") or "").strip()
+        if routed_layout_path and import_lines_path:
+            fields.setdefault("routedLayoutTxtFilePath", routed_layout_path)
+            fields["routingResult"] = import_lines_path
+        import_status = ""
+        if fields.get("importLinesFilePath") or fields.get("routingResult"):
+            import_status = await self._import_fanout_result(session_id, route_params, fields)
+        if fields.get("report"):
+            visible = str(fields.get("report") or "").strip() or visible
+        if fields.get("routingResult"):
+            visible = (
+                f"{visible.rstrip()}。\n"
+                "布线结果已生成并发送给前端。"
+            ).strip()
         if import_status:
-            visible = f"{visible.rstrip()}\n\n{import_status}".strip()
+            visible = f"{visible.rstrip()}\n{import_status}".strip()
         if fields:
             visible = (
                 f"{visible}\n\n"
@@ -1405,6 +1476,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         import_file = str(fields.get("importLinesFilePath") or fields.get("routingResult") or "").strip()
         if not import_file or import_file.lstrip().startswith("("):
             return ""
+        if Path(import_file).name.lower() in {"routing_input.txt", "routinginput.txt"}:
+            return f"已生成布线结果，但导入文件不是布线器导入记录格式，已跳过 importLines：{import_file}"
 
         arguments = {
             "filePath": import_file,
@@ -1596,10 +1669,12 @@ class WebSocketAdapter(BasePlatformAdapter):
             "请下一步调用 pcb_extract_bga，board_text 参数传 __CACHED_PROJECT_DATA__ 或留空，"
             "工具会从 session 缓存读取完整版图并分析，"
             "提取 BGA selection、boardSummary 和 fanoutContext。\n"
-            "布线器只有两个可选值：arc（圆弧走线）和 135（135 度折角走线）。禁止使用或声称存在 pcb_fanout 等其他布线器名称。\n"
+            "走线算法只有两个可选值：arc（圆弧走线）和 135（135 度折角走线）。\n"
+            "层分配和逃逸顺序生成模块只有两个可选值：RL 和 北科大。\n"
+            "禁止使用或声称存在 pcb_fanout 等其他布线器名称。\n"
             "如果提取到多个 BGA，请通过 ##PCB_FIELDS## 返回 selection，让用户先选 BGA。\n"
-            "如果只提取到一个 BGA，也不要直接询问是否执行布线；必须先让用户选择走线算法类型 arc 或 135。\n"
-            "在用户明确选择 arc 或 135 之前，禁止输出 fanoutParams，禁止调用 route，禁止询问“是否现在执行”。]\n\n"
+            "如果只提取到一个 BGA，也不要直接询问是否执行布线；必须先让用户选择走线算法类型和层分配/逃逸顺序生成模块。\n"
+            "在用户明确选择走线算法和层分配/逃逸顺序生成模块之前，禁止输出 fanoutParams，禁止调用 route，禁止询问“是否现在执行”。]\n\n"
             f"用户原始请求：\n{user_text}"
         )
 
@@ -1663,8 +1738,24 @@ class WebSocketAdapter(BasePlatformAdapter):
             logger.warning("tool-results missing id: %s", data)
             return
 
+        tool_name = self._pending_tool_names.get(call_id, "")
+        self._trace_tool_result(
+            data=data,
+            call_id=call_id,
+            tool_name=tool_name,
+            stage="raw",
+            result=result,
+        )
+
         # 文件路径模式：getProjectData 返回文件路径，读取内容后再传给 Agent
         result = self._maybe_read_file_result(call_id, result)
+        self._trace_tool_result(
+            data=data,
+            call_id=call_id,
+            tool_name=tool_name,
+            stage="resolved",
+            result=result,
+        )
         logger.info("Resolved tool result: call_id=%s", call_id)
 
         future = self._pending_tool_calls.pop(call_id, None)
@@ -1706,6 +1797,57 @@ class WebSocketAdapter(BasePlatformAdapter):
         except OSError as e:
             logger.warning("Failed to read getProjectData file %s: %s", result, e)
             return result
+
+    def _trace_tool_result(
+        self,
+        *,
+        data: Dict[str, Any],
+        call_id: str,
+        tool_name: str,
+        stage: str,
+        result: Any,
+    ) -> None:
+        """Persist complete frontend tool-results for debugging PCB data flow."""
+        try:
+            result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            result_text = repr(result)
+
+        capture_file = ""
+        try:
+            capture_dir = Path(self._pcb_trace_log_path).parent / "pcb_captures"
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            safe_tool = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name or "unknown")
+            safe_call = re.sub(r"[^A-Za-z0-9_.-]+", "_", call_id or "unknown")
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            capture_path = capture_dir / f"{stamp}_{safe_tool}_{safe_call}_{stage}.txt"
+            capture_path.write_text(result_text, encoding="utf-8", errors="replace")
+            capture_file = str(capture_path)
+        except Exception as exc:
+            logger.debug("Failed writing PCB tool-result capture file: %s", exc)
+
+        event = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "direction": "inbound",
+            "type": "tool-results",
+            "stage": stage,
+            "sessionId": data.get("sessionId") or "",
+            "projectid": data.get("projectid") or data.get("projectId") or "",
+            "callId": call_id,
+            "toolName": tool_name,
+            "resultType": type(result).__name__,
+            "resultLength": len(result_text),
+            "captureFile": capture_file,
+            "result": result_text,
+            "message": data,
+        }
+        try:
+            trace_path = Path(self._pcb_trace_log_path).parent / "pcb_websocket_tool_results.jsonl"
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with trace_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+        except Exception as exc:
+            logger.debug("Failed writing PCB tool-result trace log: %s", exc)
 
     # -------------------------------------------------------------------------
     # 发送消息给 PCB 客户端
@@ -1815,7 +1957,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         # 注入 PCB 结构化字段
         for key in _PCB_BODY_FIELD_KEYS:
             if key in pcb_fields:
-                body[key] = pcb_fields[key]
+                body[key] = self._format_pcb_body_field(key, pcb_fields[key])
 
         self._update_route_state_from_fields(chat_id, pcb_fields)
         if stream_is_final:
@@ -1943,7 +2085,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         for key in _PCB_BODY_FIELD_KEYS:
             if key in emitted_fields:
-                body[key] = emitted_fields[key]
+                body[key] = self._format_pcb_body_field(key, emitted_fields[key])
 
         if emitted_fields:
             self._update_route_state_from_fields(chat_id, emitted_fields)
@@ -2043,7 +2185,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         }
         try:
             await ws.send_json(payload)
+            self._trace_ws_full(payload, direction="outbound", delivered=True, reason="sent")
         except Exception as e:
+            self._trace_ws_full(payload, direction="outbound", delivered=False, reason=f"send_failed:{type(e).__name__}")
             logger.error("Failed to send error message: %s", e)
 
     # -------------------------------------------------------------------------
@@ -2075,6 +2219,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_selection_labels.pop(session_id, None)
         self._session_selected_targets.pop(session_id, None)
         self._session_router_types.pop(session_id, None)
+        self._session_route_algorithms.pop(session_id, None)
+        self._session_fanout_modules.pop(session_id, None)
         self._session_fanout_params.pop(session_id, None)
         self._session_bga_selection.pop(session_id, None)
         self._session_board_summaries.pop(session_id, None)
@@ -2161,9 +2307,7 @@ class WebSocketAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_router_type(text: str) -> Optional[str]:
         match = _ROUTER_TYPE_RE.match(text or "")
-        if not match:
-            return None
-        value = re.sub(r"\s+", "", match.group(1).lower())
+        value = re.sub(r"\s+", "", match.group(1).lower()) if match else ""
         if value in {"arc", "1", "圆弧", "弧形"}:
             return "arc"
         if value in {"135", "2", "折角", "135度"}:
@@ -2176,16 +2320,110 @@ class WebSocketAdapter(BasePlatformAdapter):
             return "rl_135"
         return None
 
+    @staticmethod
+    def _router_algorithm_from_type(router_type: str) -> str:
+        normalized = str(router_type or "").strip().lower()
+        if normalized in {"arc", "rl_arc"}:
+            return "arc"
+        if normalized in {"135", "rl", "rl_135"}:
+            return "135"
+        return ""
+
+    @staticmethod
+    def _fanout_module_from_type(router_type: str) -> str:
+        normalized = str(router_type or "").strip().lower()
+        if normalized in {"rl", "rl_135", "rl_arc"}:
+            return "RL"
+        if normalized in {"arc", "135"}:
+            return "北科大"
+        return ""
+
+    @staticmethod
+    def _extract_route_algorithm(text: str) -> Optional[str]:
+        text = str(text or "").strip()
+        compact = re.sub(r"\s+", "", text.lower())
+        if compact in {"arc", "1", "圆弧", "弧形"}:
+            return "arc"
+        if compact in {"135", "2", "折角", "135度", "135度折角"}:
+            return "135"
+        if re.search(r"(?<![A-Za-z0-9_])arc(?![A-Za-z0-9_])|圆弧|弧形", text, re.IGNORECASE):
+            return "arc"
+        if re.search(r"(?<!\d)135(?!\d)|折角", text, re.IGNORECASE):
+            return "135"
+        return None
+
+    @staticmethod
+    def _extract_fanout_module(text: str) -> Optional[str]:
+        text = str(text or "").strip()
+        compact = re.sub(r"\s+", "", text.lower())
+        if compact in {"rl", "3"}:
+            return "RL"
+        if compact in {"北科大", "北科", "bjut", "bk", "4"}:
+            return "北科大"
+        if re.search(r"(?<![A-Za-z0-9_])rl(?![A-Za-z0-9_])", text, re.IGNORECASE):
+            return "RL"
+        if re.search(r"北科大|北科|bjut|bk", text, re.IGNORECASE):
+            return "北科大"
+        return None
+
+    @staticmethod
+    def _compose_router_type(route_algorithm: str, fanout_module: str) -> Optional[str]:
+        algorithm = str(route_algorithm or "").strip().lower()
+        module = str(fanout_module or "").strip().lower()
+        if algorithm not in {"135", "arc"}:
+            return None
+        if module in {"rl"}:
+            return "rl_arc" if algorithm == "arc" else "rl"
+        if module in {"北科大", "bjut", "bk"}:
+            return algorithm
+        return None
+
+    def _extract_complete_router_choice(self, session_id: str, text: str) -> Optional[str]:
+        legacy = self._extract_router_type(text)
+        if legacy in {"rl_135", "rl_arc"} or (legacy == "rl" and not self._session_route_algorithms.get(session_id)):
+            self._session_route_algorithms[session_id] = self._router_algorithm_from_type(legacy)
+            self._session_fanout_modules[session_id] = "RL"
+            return legacy
+
+        algorithm = self._extract_route_algorithm(text)
+        module = self._extract_fanout_module(text)
+        if algorithm:
+            self._session_route_algorithms[session_id] = algorithm
+        if module:
+            self._session_fanout_modules[session_id] = module
+
+        algorithm = self._session_route_algorithms.get(session_id) or ""
+        module = self._session_fanout_modules.get(session_id) or ""
+        router_type = self._compose_router_type(algorithm, module)
+        if router_type:
+            self._session_router_types[session_id] = router_type
+        return router_type
+
+    def _router_choice_followup_prompt(self, session_id: str) -> str:
+        algorithm = self._session_route_algorithms.get(session_id)
+        module = self._session_fanout_modules.get(session_id)
+        if algorithm and not module:
+            return (
+                f"已选择走线算法：`{algorithm}`。\n\n"
+                "请选择层分配和逃逸顺序生成模块：`RL` 或 `北科大`。\n"
+                "请回复 `RL` 或 `北科大`。"
+            )
+        if module and not algorithm:
+            return (
+                f"已选择层分配和逃逸顺序生成模块：`{module}`。\n\n"
+                "请选择走线算法类型：`135` 或 `arc`。\n"
+                "请回复 `135` 或 `arc`。"
+            )
+        return self._router_type_prompt(session_id)
+
     def _router_type_prompt(self, session_id: str) -> str:
         selected = self._session_selected_targets.get(session_id)
         prefix = f"已选择目标 BGA：{selected}。\n\n" if selected else ""
         return (
-            f"{prefix}请选择走线算法类型：\n"
-            "1. `arc`：圆弧走线（0518 北科大弧形走线器）\n"
-            "2. `135`：135 度折角走线（0518 北科大 135 走线器）\n"
-            "3. `rl` / `rl_135`：嘉栋 RL 135 布线器\n"
-            "4. `rl_arc`：嘉栋 RL 弧形布线器\n\n"
-            "请回复 `arc`、`135`、`rl` 或 `rl_arc`。"
+            f"{prefix}请选择走线算法类型和层分配/逃逸顺序生成模块：\n"
+            "- 走线算法类型：`135` 或 `arc`\n"
+            "- 层分配和逃逸顺序生成模块：`RL` 或 `北科大`\n\n"
+            "请回复例如：`135 + RL`、`arc + 北科大`。"
         )
 
     @staticmethod
@@ -2303,6 +2541,13 @@ class WebSocketAdapter(BasePlatformAdapter):
     def _fallback_visible_content_for_fields(content: str, pcb_fields: Dict[str, Any]) -> str:
         if "fanoutParams" in pcb_fields:
             return WebSocketAdapter._fanout_confirmation_content(pcb_fields.get("fanoutParams"))
+        if "routingResult" in pcb_fields:
+            if content and content.strip():
+                return content
+            report = str(pcb_fields.get("report") or "").strip()
+            if report:
+                return report
+            return "布线完成，结果已发送到前端。"
         if "rerouteResult" in pcb_fields or "routedLayoutTxtFilePath" in pcb_fields:
             reroute_content = WebSocketAdapter._reroute_content_for_frontend(pcb_fields)
             if reroute_content and (
@@ -2313,11 +2558,6 @@ class WebSocketAdapter(BasePlatformAdapter):
                 return reroute_content
         if content and content.strip():
             return content
-        if "routingResult" in pcb_fields:
-            report = str(pcb_fields.get("report") or "").strip()
-            if report:
-                return report
-            return "布线完成，结果已发送到前端。"
         if "rerouteResult" in pcb_fields or "routedLayoutTxtFilePath" in pcb_fields:
             return "局部拆线重布已完成，结果已发送到前端。"
         if "selection" in pcb_fields:
@@ -2366,6 +2606,8 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     async def _prepare_final_pcb_fields_for_frontend(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
         fields = self._sanitize_public_pcb_fields(pcb_fields)
+        if "routingResult" in fields:
+            return fields
         if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields:
             return fields
         if fields.get("routedLayoutTxtFilePath") and not self._reroute_drc_passed(fields):
@@ -2426,42 +2668,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _fanout_confirmation_content(fanout_params: Any) -> str:
-        if not isinstance(fanout_params, dict):
-            return "已生成扇出参数，请回复“确认”执行布线，或说明需要修改的参数。"
-
-        selected_bga = str(fanout_params.get("selectedBGA") or "").strip()
-        router_type = str(fanout_params.get("routerType") or "").strip()
-        constraints = fanout_params.get("constraints") if isinstance(fanout_params.get("constraints"), dict) else {}
-        line_width = constraints.get("LineWidth")
-        line_spacing = constraints.get("LineSpacing")
-
-        layers: list[str] = []
-        order_lines = fanout_params.get("orderLines")
-        if isinstance(order_lines, list):
-            for item in order_lines:
-                if not isinstance(item, dict):
-                    continue
-                layer = str(item.get("layer") or "").strip()
-                if layer and layer not in layers:
-                    layers.append(layer)
-
-        lines = ["已生成扇出参数，请确认："]
-        if selected_bga:
-            lines.append(f"- 目标 BGA：{selected_bga}")
-        if router_type:
-            label = "135 度折角走线" if router_type == "135" else "圆弧走线" if router_type == "arc" else router_type
-            lines.append(f"- 走线算法：{router_type}（{label}）")
-        if layers:
-            lines.append(f"- 逃逸层：{'、'.join(layers)}")
-        if line_width is not None or line_spacing is not None:
-            width_text = f"{line_width} mil" if line_width is not None else "未指定"
-            spacing_text = f"{line_spacing} mil" if line_spacing is not None else "未指定"
-            lines.append(f"- 线宽/间距：{width_text} / {spacing_text}")
-        if isinstance(order_lines, list) and order_lines:
-            lines.append(f"- 布线顺序：按 order 字段执行，共 {len(order_lines)} 条网络")
-        lines.append("")
-        lines.append("请回复“确认”执行布线，或说明需要修改的参数。")
-        return "\n".join(lines)
+        return "已完成逃逸参数配置，请确认"
 
     @staticmethod
     def _dedupe_stream_restart_content(content: str) -> str:
@@ -2692,7 +2899,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
             "- 如果用户既要求解释又要求执行，以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
-            "- flow_state=wait_router_type 时，用户回复 arc/135/1/2 判 pcb_followup。\n"
+            "- flow_state=wait_router_type 时，用户回复 arc/135/RL/北科大 或组合如 135 + RL，判 pcb_followup。\n"
             "- flow_state=wait_confirm 时，确认/开始/执行/继续判 pcb_confirm_route。\n"
             "- 取消、退出、中止当前流程判 cancel。\n"
             "输出字段：intent, route_mode, confidence, target_refdes, operation, "
@@ -2709,8 +2916,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 不要解释，直接开始PCB BGA逃逸布线 => pcb_entry, route_mode=pcb\n"
             "- 不要布线，只解释一下逃逸布线原理 => chat, route_mode=chat\n"
             "- 选择 FPGA1（wait_selection）=> pcb_select_target, route_mode=pcb\n"
-            "- arc（wait_router_type）=> pcb_followup, route_mode=pcb\n"
-            "- 135（wait_router_type）=> pcb_followup, route_mode=pcb\n"
+            "- arc + 北科大（wait_router_type）=> pcb_followup, route_mode=pcb\n"
+            "- 135 + RL（wait_router_type）=> pcb_followup, route_mode=pcb\n"
             "- 确认，开始布线（wait_confirm）=> pcb_confirm_route, route_mode=pcb\n"
             "- 删除我框选的线重新布线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
             "- 把我选中的 traces 删除后重新走线 => pcb_reroute_selected, route_mode=pcb, should_call_get_project_data=false\n"
@@ -2783,7 +2990,11 @@ class WebSocketAdapter(BasePlatformAdapter):
             return _INTENT_CHAT
 
         in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
-        if flow_state == _FLOW_WAIT_ROUTER_TYPE and self._extract_router_type(text):
+        if flow_state == _FLOW_WAIT_ROUTER_TYPE and (
+            self._extract_router_type(text)
+            or self._extract_route_algorithm(text)
+            or self._extract_fanout_module(text)
+        ):
             return _INTENT_PCB_FOLLOWUP
         if route_intent:
             if route_intent.intent == _INTENT_CANCEL:
@@ -2821,6 +3032,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             if (
                 _CONFIRM_RE.search(text)
                 or self._extract_router_type(text)
+                or self._extract_route_algorithm(text)
+                or self._extract_fanout_module(text)
                 or self._extract_selected_label(session_id, text)
                 or _SELECTION_RE.search(text)
                 or _PCB_DOMAIN_RE.search(text)
@@ -2898,18 +3111,31 @@ class WebSocketAdapter(BasePlatformAdapter):
                 bootstrap_get_project=False,
             )
 
-        router_type = self._extract_router_type(text)
+        router_type = self._extract_complete_router_choice(session_id, text)
         if flow_state == _FLOW_IDLE and mode == _ROUTE_MODE_PCB and router_type:
             self._session_router_types[session_id] = router_type
             self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="router_type_step", intent=_INTENT_PCB_FOLLOWUP)
+        if flow_state == _FLOW_IDLE and mode == _ROUTE_MODE_PCB and (
+            self._extract_route_algorithm(text) or self._extract_fanout_module(text)
+        ):
+            self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            return _RouteDecision(
+                mode=_ROUTE_MODE_PCB,
+                immediate_reply=self._router_choice_followup_prompt(session_id),
+                reason="partial_router_choice",
+                intent=_INTENT_PCB_FOLLOWUP,
+            )
 
         if flow_state == _FLOW_WAIT_SELECTION:
             selected_label = self._extract_selected_label(session_id, text)
             if selected_label:
                 self._session_selected_targets[session_id] = selected_label
                 self._session_router_types.pop(session_id, None)
+                self._session_route_algorithms.pop(session_id, None)
+                self._session_fanout_modules.pop(session_id, None)
                 self._set_session_mode(session_id, _ROUTE_MODE_PCB)
                 self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
                 return _RouteDecision(
@@ -2943,10 +3169,18 @@ class WebSocketAdapter(BasePlatformAdapter):
                 self._session_router_types[session_id] = router_type
                 self._set_session_mode(session_id, _ROUTE_MODE_PCB)
                 return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="router_type_step", intent=_INTENT_PCB_FOLLOWUP)
+            if self._extract_route_algorithm(text) or self._extract_fanout_module(text):
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                return _RouteDecision(
+                    mode=_ROUTE_MODE_PCB,
+                    immediate_reply=self._router_choice_followup_prompt(session_id),
+                    reason="partial_router_choice",
+                    intent=_INTENT_PCB_FOLLOWUP,
+                )
             if _CONFIRM_RE.search(text):
                 return _RouteDecision(
                     mode=_ROUTE_MODE_PCB,
-                    immediate_reply="执行布线前必须先选择布线器。请回复 `arc` 或 `135`。",
+                    immediate_reply="执行布线前必须先选择走线算法和层分配/逃逸顺序生成模块。请回复例如 `135 + RL`。",
                     reason="confirm_before_router_type",
                     intent=_INTENT_PCB_CONFIRM_ROUTE,
                 )
@@ -3204,6 +3438,12 @@ class WebSocketAdapter(BasePlatformAdapter):
                 router_type = self._extract_router_type(str(fanout_params.get("routerType") or ""))
             if router_type:
                 self._session_router_types[session_id] = router_type
+                algorithm = self._router_algorithm_from_type(router_type)
+                module = self._fanout_module_from_type(router_type)
+                if algorithm:
+                    self._session_route_algorithms[session_id] = algorithm
+                if module:
+                    self._session_fanout_modules[session_id] = module
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
             return
@@ -3221,6 +3461,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             self._session_selection_labels[session_id] = tuple(labels)
             self._session_selected_targets.pop(session_id, None)
             self._session_router_types.pop(session_id, None)
+            self._session_route_algorithms.pop(session_id, None)
+            self._session_fanout_modules.pop(session_id, None)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             if len(labels) == 1:
                 self._session_selected_targets[session_id] = labels[0]
@@ -3512,13 +3754,56 @@ class WebSocketAdapter(BasePlatformAdapter):
             except json.JSONDecodeError:
                 parsed = None
             if isinstance(parsed, dict):
+                nested = parsed.get("fanoutParams")
+                if isinstance(nested, dict):
+                    return nested
                 return parsed
 
-        keys = ("selectedBGA", "routerType", "orderLines", "constraints")
+        keys = ("selectedBGA", "routerType", "routeAlgorithm", "fanoutModule", "orderLines", "constraints")
         if not any(key in data for key in keys):
             return {}
         fanout_params = {key: data[key] for key in keys if key in data}
         return fanout_params if any(key in fanout_params for key in ("routerType", "orderLines")) else {}
+
+    @staticmethod
+    def _format_pcb_body_field(key: str, value: Any) -> Any:
+        if key == "fanoutParams":
+            return WebSocketAdapter._fanout_params_json_string(value)
+        return value
+
+    @staticmethod
+    def _fanout_params_json_string(value: Any) -> str:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, dict) and isinstance(parsed.get("fanoutParams"), dict):
+                return json.dumps(parsed["fanoutParams"], ensure_ascii=False)
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False)
+            return text
+        if isinstance(value, dict) and isinstance(value.get("fanoutParams"), dict):
+            return json.dumps(value["fanoutParams"], ensure_ascii=False)
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _body_fanout_params(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            nested = value.get("fanoutParams")
+            return nested if isinstance(nested, dict) else value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(parsed, dict):
+                nested = parsed.get("fanoutParams")
+                return nested if isinstance(nested, dict) else parsed
+        return {}
 
     @staticmethod
     def _has_pcb_structured_data(data: Any) -> bool:

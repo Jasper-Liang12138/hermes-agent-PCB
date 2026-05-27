@@ -385,7 +385,7 @@ def _read_report(work_dir: Path) -> str:
     return "布线完成（无详细报告）"
 
 
-def _resolve_import_lines_path(work_dir: Path, router_type: str) -> Path:
+def _resolve_import_lines_path(work_dir: Path, router_type: str, constraints: Any | None = None) -> Path:
     family = router_execution_family(router_type)
     candidates = ("line.out",) if family == "135" else ("ARC_output.txt", "arc_output.txt")
     for name in candidates:
@@ -393,6 +393,16 @@ def _resolve_import_lines_path(work_dir: Path, router_type: str) -> Path:
         if path.is_file() and path.stat().st_size > 0:
             return path.resolve()
     raise FileNotFoundError(f"{router_type} 布线器未生成可导入 importLines 的原始记录文件")
+
+
+def _read_text_lossy(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8", "gbk", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _resolve_routing_result_path(work_dir: Path, router_type: str, router_dir: Path, layout_path: Path) -> Path:
@@ -530,7 +540,7 @@ def run_bjut_route(
     _run_router_main(work_dir, router_dir, router_type, layout_path.name)
 
     routing_result = _resolve_routing_result_path(work_dir, router_type, router_dir, layout_path)
-    import_lines = _resolve_import_lines_path(work_dir, router_type)
+    import_lines = _resolve_import_lines_path(work_dir, router_type, constraints)
     report = _read_report(work_dir)
     return RouterRunOutputs(
         routing_result_path=routing_result,
