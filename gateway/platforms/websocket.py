@@ -1435,11 +1435,6 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         pending_fields = self._pop_pending_pcb_fields(session_id)
         fields.update(pending_fields)
-        routed_layout_path = str(fields.get("routingResult") or "").strip()
-        import_lines_path = str(fields.get("importLinesFilePath") or "").strip()
-        if routed_layout_path and import_lines_path:
-            fields.setdefault("routedLayoutTxtFilePath", routed_layout_path)
-            fields["routingResult"] = import_lines_path
         import_status = ""
         if fields.get("importLinesFilePath") or fields.get("routingResult"):
             import_status = await self._import_fanout_result(session_id, route_params, fields)
@@ -3768,7 +3763,7 @@ class WebSocketAdapter(BasePlatformAdapter):
     @staticmethod
     def _format_pcb_body_field(key: str, value: Any) -> Any:
         if key == "fanoutParams":
-            return WebSocketAdapter._fanout_params_json_string(value)
+            return WebSocketAdapter._body_fanout_params(value) or value
         return value
 
     @staticmethod

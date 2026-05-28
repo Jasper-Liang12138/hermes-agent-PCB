@@ -119,6 +119,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     }
     route_result = {
         "routingResult": r"F:\router_work\routing_input.txt",
+        "importLinesFilePath": r"F:\router_work\ARC_output.txt",
         "report": "布线连通率: 100%",
     }
     from tools import pcb_tools
@@ -194,7 +195,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 assert router_msg["type"] == "message"
                 assert "请选择走线算法类型" in router_msg["body"]["content"]
 
-                await ws.send_str(_user_message(session_id, project_id, "arc"))
+                await ws.send_str(_user_message(session_id, project_id, "arc + 北科大"))
                 fanout_msg = await _recv_json(ws)
                 assert fanout_msg["type"] == "message"
                 assert fanout_msg["body"]["fanoutParams"] == fanout_params
@@ -216,7 +217,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 assert routed_msg["type"] == "tool-calls"
                 assert routed_msg["body"]["content"]["name"] == "importLines"
                 assert routed_msg["body"]["content"]["arguments"] == {
-                    "filePath": route_result["routingResult"],
+                    "filePath": route_result["importLinesFilePath"],
                     "successPins": [],
                     "failedPins": [],
                 }
@@ -681,7 +682,7 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
-                assert "执行布线前必须先选择布线器" in second["body"]["content"]
+                assert "执行布线前必须先选择走线算法和层分配/逃逸顺序生成模块" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 
@@ -722,7 +723,7 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
                 assert "已选择目标 BGA：FPGA1" in second["body"]["content"]
-                assert "请回复 `arc`、`135`、`rl` 或 `rl_arc`" in second["body"]["content"]
+                assert "请回复例如：`135 + RL`、`arc + 北科大`" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 
@@ -749,7 +750,7 @@ def test_router_type_followup_recovers_when_flow_state_was_lost():
     adapter._set_session_mode(session_id, "pcb", lock_seconds=0.0)
     adapter._set_flow_state(session_id, "idle")
 
-    decision = adapter._decide_route(session_id, "135")
+    decision = adapter._decide_route(session_id, "135 + 北科大")
 
     assert decision.mode == "pcb"
     assert decision.reason == "router_type_step"
@@ -780,12 +781,7 @@ def test_fanout_params_visible_content_is_normalized():
         {"fanoutParams": fanout_params},
     )
 
-    assert normalized.count("已生成扇出参数，请确认") == 1
-    assert "请已生成" not in normalized
-    assert "目标 BGA：U22" in normalized
-    assert "走线算法：135（135 度折角走线）" in normalized
-    assert "逃逸层：Top、Art03" in normalized
-    assert "请回复“确认”执行布线" in normalized
+    assert normalized == "已完成逃逸参数配置，请确认"
 
 
 def test_direct_fanout_payload_is_sent_as_fanout_params():

@@ -31,4 +31,4 @@ def test_pcb_reroute_documents_selected_trace_flow():
     assert "Do not call `route`" in content
     assert "Do not ask the user to choose `arc` or `135`" in content
     assert "rerouteResult" in content
-    assert "routedBoardDataFilePath" in content
+    assert "routedLayoutTxtFilePath" in content

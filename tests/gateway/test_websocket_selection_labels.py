@@ -17,7 +17,7 @@ def test_wait_selection_accepts_non_u_candidate_label():
 
     assert decision.mode == "pcb"
     assert decision.reason == "selection_step_wait_router_type"
-    assert "请回复 `arc` 或 `135`" in (decision.immediate_reply or "")
+    assert "请回复例如：`135 + RL`、`arc + 北科大`" in (decision.immediate_reply or "")
     assert adapter._session_selected_targets[session_id] == "FPGA1"
 
 
@@ -34,7 +34,7 @@ def test_wait_selection_accepts_label_embedded_in_route_request():
 
     assert decision.mode == "pcb"
     assert decision.reason == "selection_step_wait_router_type"
-    assert "请回复 `arc` 或 `135`" in (decision.immediate_reply or "")
+    assert "请回复例如：`135 + RL`、`arc + 北科大`" in (decision.immediate_reply or "")
     assert adapter._session_selected_targets[session_id] == "U27"
 
 
