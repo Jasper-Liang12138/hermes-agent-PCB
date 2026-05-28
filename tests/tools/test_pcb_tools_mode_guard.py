@@ -553,11 +553,17 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
         },
         session_id="sess-pcb-reroute",
     )
-    monkeypatch.setattr(
-        pcb_tools,
-        "_generate_reroute_with_model",
-        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    model_failure = (
+        "模型输出中未找到合法的 `(segment ...)` 或 `(via ...)` 走线对象，"
+        "因此无法回填版图，DRC 未执行，也不会生成 txt 或调用 importLines。"
     )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(**kwargs)
+        payload["rerouteResult"]["modelGenerationFailure"] = model_failure
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute")
     payload = json.loads(result)
@@ -567,9 +573,13 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
     assert payload["checkReport"]["passed"] is False
     assert "routedLayoutTxtFilePath" not in payload
-    assert "模型未生成可回填的重布 patch" in payload["explanation"]
+    assert model_failure in payload["explanation"]
     assert "局部重布" in payload["explanation"]
-    assert payload["content"] == "测试可解释性报告：来自本地 explain 分类模型。"
+    assert "DRC 分析" in payload["content"]
+    assert "DRC 状态: 未执行" in payload["content"]
+    assert model_failure in payload["content"]
+    assert "Explain 模型可解释性报告" in payload["content"]
+    assert "测试可解释性报告：来自本地 explain 分类模型。" in payload["content"]
     assert "布线较好概率: 0.984707" not in payload["content"]
 
 
@@ -586,11 +596,17 @@ def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
         },
         session_id="sess-pcb-reroute-traces",
     )
-    monkeypatch.setattr(
-        pcb_tools,
-        "_generate_reroute_with_model",
-        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    model_failure = (
+        "模型输出中未找到合法的 `(segment ...)` 或 `(via ...)` 走线对象，"
+        "因此无法回填版图，DRC 未执行，也不会生成 txt 或调用 importLines。"
     )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(**kwargs)
+        payload["rerouteResult"]["modelGenerationFailure"] = model_failure
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-traces")
     payload = json.loads(result)
@@ -600,7 +616,7 @@ def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
     assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_selected_traces"
     assert payload["checkReport"]["passed"] is False
     assert "routedLayoutTxtFilePath" not in payload
-    assert "模型未生成可回填的重布 patch" in payload["explanation"]
+    assert model_failure in payload["explanation"]
 
 
 def test_extract_kicad_patch_from_non_json_model_text():
@@ -684,11 +700,17 @@ def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
         session_id="sess-pcb-reroute-no-patch",
     )
 
-    monkeypatch.setattr(
-        pcb_tools,
-        "_generate_reroute_with_model",
-        lambda **kwargs: pcb_tools._build_fallback_reroute_payload(**kwargs),
+    model_failure = (
+        "模型输出中未找到合法的 `(segment ...)` 或 `(via ...)` 走线对象，"
+        "因此无法回填版图，DRC 未执行，也不会生成 txt 或调用 importLines。"
     )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_fallback_reroute_payload(**kwargs)
+        payload["rerouteResult"]["modelGenerationFailure"] = model_failure
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-no-patch")
     payload = json.loads(result)
@@ -699,12 +721,19 @@ def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
         for check in payload["checkReport"]["checks"]
     )
     assert "routedLayoutTxtFilePath" not in payload
-    assert "模型未生成可回填的重布 patch" in payload["explanation"]
+    assert model_failure in payload["explanation"]
     pending = pcb_tools._transport.pop_pending_pcb_fields("sess-pcb-reroute-no-patch")
     assert pending["rerouteResult"]["type"] == "local_reroute"
     assert pending["checkReport"]["passed"] is False
-    assert "模型未生成可回填的重布 patch" in pending["explanation"]
-    assert pending["report"] == "测试可解释性报告：来自本地 explain 分类模型。"
+    assert pending["rerouteResult"]["modelGenerationFailure"] == model_failure
+    assert model_failure in pending["explanation"]
+    assert "DRC 分析" in pending["report"]
+    assert "DRC 状态: 未执行" in pending["report"]
+    assert model_failure in pending["report"]
+    assert "txt 输出: 未生成" in pending["report"]
+    assert "importLines: 不允许" in pending["report"]
+    assert "Explain 模型可解释性报告" in pending["report"]
+    assert "测试可解释性报告：来自本地 explain 分类模型。" in pending["report"]
 
 
 def test_reroute_invokes_model_generation_with_dropped_board_file(monkeypatch, tmp_path):
@@ -807,6 +836,55 @@ def test_reroute_model_prompt_hides_internal_kicad_paths():
     assert "originalBoardDataFilePath" not in combined
     assert "droppedBoardDataFilePath" not in combined
     assert '"internalBoardPathHidden": true' in prompts["user"]
+
+
+def test_reroute_prompt_uses_single_shot_answer_contract_and_endpoint_summary():
+    board_text = """
+    (kicad_pcb
+      (net 73 "NET_U1_B7")
+      (module BGA_BENCHMARK (layer Top)
+        (at 50.800000 50.800000)
+        (fp_text reference U1 (at 0 16 0))
+        (pad B7 smd circle (at -3.5 11.5) (layers Top F.Paste F.Mask) (net 73 "NET_U1_B7"))
+      )
+      (module TP (layer Top)
+        (at 47.300000 68.300000)
+        (fp_text reference TP27 (at 0 -1 0))
+        (pad 1 smd circle (at 0 0) (layers Top F.Paste F.Mask) (net 73 "NET_U1_B7"))
+      )
+    )
+    """
+    task_description, task_stats = pcb_tools._build_missing_route_description(
+        board_text=board_text,
+        nets=[],
+        dropped_objects=[{"id": "2386476278", "net": "NET_U1_B7"}],
+        local_context={},
+        selected_trace_ids=["2386476278"],
+    )
+    context = pcb_tools._build_single_shot_reroute_context(
+        board_text=board_text,
+        task_description=task_description,
+        selected_trace_ids=["2386476278"],
+        nets=[],
+    )
+    prompts = pcb_tools._build_reroute_generation_prompts(
+        nets=[],
+        selected_trace_ids=["2386476278"],
+        dropped_board_path="/private/tmp/secret/after_drop.kicad_pcb",
+        original_board_path="/private/tmp/secret/original.kicad_pcb",
+        dropped_objects=[{"id": "2386476278", "net": "NET_U1_B7"}],
+        local_context={},
+        constraints={},
+        context_text=context["contextText"],
+        context_stats={**context["stats"], **task_stats},
+        task_description=task_description,
+    )
+
+    assert "请先规划，再在 <answer> 中只输出合法 KiCad 走线对象" in prompts["system"]
+    assert "最终答案必须放在 <answer>" in prompts["user"]
+    assert "47.30, 62.30" in prompts["user"]
+    assert "47.30, 68.30" in prompts["user"]
+    assert "只输出 JSON" not in prompts["system"]
 
 
 def test_reroute_model_outputs_not_written_by_default(monkeypatch, tmp_path):
@@ -917,6 +995,12 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     assert "originalBoardDataFilePath" not in payload["rerouteResult"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
     assert payload["checkReport"]["passed"] is True
+    assert "DRC 分析" in payload["content"]
+    assert "DRC 状态: 通过" in payload["content"]
+    assert "txt 输出: 已生成" in payload["content"]
+    assert "importLines: 允许" in payload["content"]
+    assert "Explain 模型可解释性报告" in payload["content"]
+    assert "测试可解释性报告：来自本地 explain 分类模型。" in payload["content"]
 
 
 def test_reroute_drc_pass_without_txt_marks_failure(monkeypatch, tmp_path):
@@ -1072,3 +1156,9 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     assert payload["rerouteResult"]["drcFailureReasons"] == ["iteration 1 failed", "iteration 2 failed"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
     assert payload["checkReport"]["passed"] is False
+    assert "DRC 分析" in payload["content"]
+    assert "DRC 状态: 未通过" in payload["content"]
+    assert "iteration 2 failed" in payload["content"]
+    assert "txt 输出: 未生成" in payload["content"]
+    assert "importLines: 不允许" in payload["content"]
+    assert "Explain 模型可解释性报告" in payload["content"]

@@ -36,6 +36,16 @@ def _clear_model_env(monkeypatch):
         "OPENROUTER_BASE_URL",
         "PCB_OPENROUTER_QWEN_MODEL",
         "PCB_DISABLE_OPENROUTER_QWEN",
+        "PCB_REROUTE_DISABLE_THINKING_KWARGS",
+        "PCB_EXPLAIN_DISABLE_THINKING_KWARGS",
+        "PCB_MODEL_DISABLE_THINKING_KWARGS",
+        "PCB_REROUTE_USE_NO_THINK_PREFIX",
+        "PCB_EXPLAIN_USE_NO_THINK_PREFIX",
+        "PCB_MODEL_USE_NO_THINK_PREFIX",
+        "PCB_REROUTE_TOKEN_PARAMETER",
+        "PCB_EXPLAIN_TOKEN_PARAMETER",
+        "PCB_MODEL_TOKEN_PARAMETER",
+        "PCB_FORCE_OPENROUTER_QWEN",
         "PCB_MODEL_RUNTIME_DISABLE_DOTENV",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -237,4 +247,38 @@ def test_chat_completion_text_sends_stage_specific_payload(monkeypatch):
     assert captured["authorization"] == "Bearer explain-secret-value"
     assert captured["payload"]["model"] == "explain-stage-model"
     assert captured["payload"]["messages"][0]["content"].startswith("/no_think\n")
+    assert "chat_template_kwargs" not in captured["payload"]
+
+
+def test_chat_completion_text_can_opt_into_disable_thinking_kwargs(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"id": "resp-1", "choices": [{"message": {"content": '{"ok": true}'}}]}).encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setenv("PCB_REROUTE_DISABLE_THINKING_KWARGS", "1")
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={
+            "model": "reroute-stage-model",
+            "base_url": "https://wishub-x5.ctyun.cn/v1",
+            "api_key": "secret",
+        },
+        messages=[{"role": "user", "content": "生成 patch"}],
+    )
+
+    assert text == '{"ok": true}'
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}

@@ -12,6 +12,13 @@ from tools import pcb_model_runtime
 @pytest.fixture(autouse=True)
 def _disable_local_env_file(monkeypatch):
     monkeypatch.setenv("PCB_MODEL_RUNTIME_DISABLE_DOTENV", "1")
+    for name in (
+        "PCB_REROUTE_USE_NO_THINK_PREFIX",
+        "PCB_MODEL_USE_NO_THINK_PREFIX",
+        "PCB_REROUTE_TOKEN_PARAMETER",
+        "PCB_MODEL_TOKEN_PARAMETER",
+    ):
+        monkeypatch.delenv(name, raising=False)
     pcb_model_runtime._LOCAL_ENV_LOADED = False
 
 
@@ -206,9 +213,9 @@ def test_ctyun_adapter_disables_thinking_and_strips_think_blocks(monkeypatch):
     assert captured["url"] == "https://wishub-x5.ctyun.cn/v1/chat/completions"
     assert captured["timeout"] == 123
     assert captured["authorization"] == "Bearer secret"
-    assert captured["payload"]["max_tokens"] == 4096
-    assert captured["payload"]["messages"][1]["content"].startswith("/no_think\n")
-    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["payload"]["max_completion_tokens"] == 4096
+    assert not captured["payload"]["messages"][1]["content"].startswith("/no_think\n")
+    assert "chat_template_kwargs" not in captured["payload"]
 
 
 def test_extract_first_json_object_strips_qwen_thinking():

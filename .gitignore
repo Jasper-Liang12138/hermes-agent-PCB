@@ -92,3 +92,9 @@ source-*.txt
 *_stdout.log
 *-stderr.log
 *-stdout.log
+
+# Local explain-model scratch files; keep source scripts addable, but never upload board samples or caches.
+models/**/*.kicad_pcb
+models/**/__pycache__/
+models/**/*.pyc
+models/**/.DS_Store

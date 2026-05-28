@@ -336,8 +336,9 @@ def resolve_model_runtime(
             runtime[key] = doc_config[key]
 
     disable_openrouter = _env_first("PCB_DISABLE_OPENROUTER_QWEN").lower() in ("1", "true", "yes", "on")
+    force_openrouter = _env_first("PCB_FORCE_OPENROUTER_QWEN").lower() in ("1", "true", "yes", "on")
     openrouter_runtime = _runtime_from_openrouter_env()
-    if openrouter_runtime and not disable_openrouter:
+    if openrouter_runtime and not disable_openrouter and (force_openrouter or not runtime.get("model") or not runtime.get("api_key")):
         _merge_config(runtime, openrouter_runtime)
     elif not disable_openrouter and not runtime.get("model") and not runtime.get("api_key"):
         _merge_config(runtime, _runtime_from_builtin_openrouter())
@@ -364,6 +365,45 @@ def runtime_disables_thinking(stage: str, base_url: str) -> bool:
         return override not in ("0", "false", "no", "off")
     normalized = str(base_url or "").lower()
     return "ctyun.cn" in normalized or "wishub-x5" in normalized
+
+
+def runtime_sends_disable_thinking_kwargs(stage: str) -> bool:
+    stage_env = (
+        "PCB_EXPLAIN_DISABLE_THINKING_KWARGS"
+        if stage == STAGE_EXPLAIN
+        else "PCB_REROUTE_DISABLE_THINKING_KWARGS"
+    )
+    override = _env_first(stage_env, "PCB_MODEL_DISABLE_THINKING_KWARGS").lower()
+    return override in ("1", "true", "yes", "on")
+
+
+def runtime_uses_no_think_prefix(stage: str, base_url: str) -> bool:
+    stage_env = (
+        "PCB_EXPLAIN_USE_NO_THINK_PREFIX"
+        if stage == STAGE_EXPLAIN
+        else "PCB_REROUTE_USE_NO_THINK_PREFIX"
+    )
+    override = _env_first(stage_env, "PCB_MODEL_USE_NO_THINK_PREFIX").lower()
+    if override:
+        return override in ("1", "true", "yes", "on")
+    if stage == STAGE_REROUTE:
+        return False
+    return runtime_disables_thinking(stage, base_url)
+
+
+def runtime_token_parameter(stage: str, base_url: str) -> str:
+    stage_env = (
+        "PCB_EXPLAIN_TOKEN_PARAMETER"
+        if stage == STAGE_EXPLAIN
+        else "PCB_REROUTE_TOKEN_PARAMETER"
+    )
+    override = _env_first(stage_env, "PCB_MODEL_TOKEN_PARAMETER").strip()
+    if override in ("max_tokens", "max_completion_tokens"):
+        return override
+    normalized = str(base_url or "").lower()
+    if stage == STAGE_REROUTE and ("ctyun.cn" in normalized or "wishub-x5" in normalized):
+        return "max_completion_tokens"
+    return "max_tokens"
 
 
 def ensure_no_think_prefix(text: str) -> str:
@@ -397,6 +437,7 @@ def chat_completion_text(
     runtime: dict[str, str] | None = None,
     max_tokens: int = 2048,
     temperature: float | None = 0.2,
+    top_p: float | None = None,
     timeout_s: float = 180,
     stream: bool = False,
     require_api_key: bool = False,
@@ -407,17 +448,23 @@ def chat_completion_text(
         raise RuntimeError(f"{env_hint} is not configured")
     base_url = normalize_openai_base_url(resolved["base_url"])
     disable_thinking = runtime_disables_thinking(stage, base_url)
-    outgoing_messages = _normalize_message_content_for_no_think(messages) if disable_thinking else messages
+    outgoing_messages = (
+        _normalize_message_content_for_no_think(messages)
+        if runtime_uses_no_think_prefix(stage, base_url)
+        else messages
+    )
 
     payload: dict[str, Any] = {
         "model": resolved["model"],
         "messages": outgoing_messages,
-        "max_tokens": max_tokens,
         "stream": stream,
     }
+    payload[runtime_token_parameter(stage, base_url)] = max_tokens
     if temperature is not None:
         payload["temperature"] = temperature
-    if disable_thinking:
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if disable_thinking and runtime_sends_disable_thinking_kwargs(stage):
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     headers = {"Content-Type": "application/json"}
