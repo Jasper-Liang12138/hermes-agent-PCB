@@ -223,6 +223,7 @@ class _HermesOpenAICompatibleChatAdapter:
             ],
             max_tokens=generation_config.max_new_tokens,
             temperature=generation_config.temperature,
+            top_p=getattr(generation_config, "top_p", None),
             timeout_s=self.timeout_s,
         )
 
