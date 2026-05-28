@@ -67,6 +67,8 @@ PCB-AGENT\
   template-config.yaml
   template.env
   VERSION.txt
+  model\
+    best.pt
   routers\
   skills\
   logs\
@@ -77,10 +79,14 @@ PCB-AGENT\
 
 1. 从 `dist\agent-gateway\` 复制 `agent.exe` 和 `_internal\` 到 `PCB-AGENT\`。
 2. 从上一版交付包复制 `routers\`、`skills\`、安装脚本和模板配置文件。
-3. `logs\` 和 `router_work\` 只保留空目录，不要放测试日志或布线输出。
-4. 检查 `config.ini`：
+3. 复制可解释性模型权重到 `PCB-AGENT\model\best.pt`。当前权重可从本地模型目录或交付负责人提供的位置复制。
+4. `logs\` 和 `router_work\` 只保留空目录，不要放测试日志或布线输出。
+5. 检查 `config.ini`：
 
 ```ini
+[explain]
+checkpoint_path = model/best.pt
+
 [router]
 work_dir = .\router_work
 arc_dir = .\routers\arc_windows_0519
