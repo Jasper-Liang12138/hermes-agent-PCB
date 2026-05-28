@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
-import asyncio
 from typing import Any
 
 import aiohttp
@@ -12,6 +12,15 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.websocket import WebSocketAdapter
+
+
+def _fanout_params_body(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value.get("fanoutParams") if isinstance(value.get("fanoutParams"), dict) else value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        return parsed.get("fanoutParams") if isinstance(parsed.get("fanoutParams"), dict) else parsed
+    raise AssertionError(f"unexpected fanoutParams type: {type(value).__name__}")
 
 
 _INTERIM_STATUS_CONTENTS = {
@@ -198,7 +207,7 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 await ws.send_str(_user_message(session_id, project_id, "arc + 北科大"))
                 fanout_msg = await _recv_json(ws)
                 assert fanout_msg["type"] == "message"
-                assert fanout_msg["body"]["fanoutParams"] == fanout_params
+                assert _fanout_params_body(fanout_msg["body"]["fanoutParams"]) == fanout_params
 
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 routed_msg = await _recv_json(ws)

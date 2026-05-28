@@ -3763,7 +3763,7 @@ class WebSocketAdapter(BasePlatformAdapter):
     @staticmethod
     def _format_pcb_body_field(key: str, value: Any) -> Any:
         if key == "fanoutParams":
-            return WebSocketAdapter._body_fanout_params(value) or value
+            return WebSocketAdapter._fanout_params_json_string(value)
         return value
 
     @staticmethod
