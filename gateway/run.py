@@ -405,6 +405,34 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
     return resolved
 
+
+def _auto_skill_names(auto_skill: Any) -> List[str]:
+    if not auto_skill:
+        return []
+    if isinstance(auto_skill, str):
+        return [auto_skill]
+    try:
+        return [str(item) for item in auto_skill if str(item).strip()]
+    except TypeError:
+        return [str(auto_skill)]
+
+
+def _should_inject_auto_skill_for_turn(
+    *,
+    is_new_session: bool,
+    auto_skill: Any,
+    source: SessionSource,
+) -> bool:
+    if not auto_skill:
+        return False
+    if is_new_session:
+        return True
+    skill_names = _auto_skill_names(auto_skill)
+    return (
+        source.platform == Platform.WEBSOCKET
+        and "hardware/pcb-reroute" in skill_names
+    )
+
 logger = logging.getLogger(__name__)
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -3304,11 +3332,17 @@ class GatewayRunner:
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Most bindings inject only on new sessions because the skill remains in
+        # history.  WebSocket reroute is intentionally turn-scoped: a user can
+        # request selected-trace reroute after an earlier generic PCB/chat turn,
+        # so the critical drop_net -> reroute instructions must be injected then.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
-            _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
+        if _should_inject_auto_skill_for_turn(
+            is_new_session=_is_new_session,
+            auto_skill=_auto,
+            source=source,
+        ):
+            _skill_names = _auto_skill_names(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
                 _combined_parts: list[str] = []

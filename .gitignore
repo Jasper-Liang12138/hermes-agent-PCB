@@ -80,6 +80,7 @@ tmp_*.py
 tmp_*.json
 tmp_*.txt
 tmp_*/
+real_data/
 demo_package_staging*/
 hermes-agent-PCB-Demo-v*.zip
 source-*.log
