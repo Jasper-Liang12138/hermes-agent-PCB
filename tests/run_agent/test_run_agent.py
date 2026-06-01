@@ -213,6 +213,59 @@ def test_pcb_tool_call_shim_forces_extract_after_project_data(agent):
     assert json.loads(calls[0].function.arguments) == {"board_text": "__CACHED_PROJECT_DATA__"}
 
 
+def test_pcb_tool_call_shim_allows_temporary_chat_after_project_data(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "getProjectData", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "getProjectData", "content": "(pcb_data)"},
+        {"role": "user", "content": "解释一下 RL 是什么意思"},
+    ])
+
+    assert calls is None
+
+
+def test_pcb_tool_call_shim_allows_explicit_no_operation_chat(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {"role": "user", "content": "不要布线，只解释一下逃逸层是什么意思"},
+    ])
+
+    assert calls is None
+
+
+def test_pcb_tool_call_shim_keeps_negative_router_preference_as_action(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {
+            "role": "tool",
+            "name": "pcb_extract_bga",
+            "content": json.dumps({"selection": [{"label": "U22", "detail": "BGA-400"}]}, ensure_ascii=False),
+        },
+        {"role": "user", "content": "不要用 RL，用北科大 arc 给 U22 布线"},
+    ])
+
+    assert calls[0].function.name == "generateFanoutParams"
+    assert json.loads(calls[0].function.arguments) == {"selectedBGA": "U22", "routerType": "arc"}
+
+
 def test_pcb_tool_call_shim_requires_pcb_loop_context_for_initial_project_data(agent):
     agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
     agent.tools = _make_tool_defs(*agent.valid_tool_names)
@@ -262,6 +315,8 @@ def test_pcb_tool_call_shim_forces_generate_after_selection(agent):
         ("135 + RL", "rl"),
         ("135 + 北科大", "135"),
         ("arc + 北科大", "arc"),
+        ("不要用 RL，用北科大 arc", "arc"),
+        ("不用北科大，用 RL 135", "rl"),
     ],
 )
 def test_pcb_tool_call_shim_router_type_combinations(agent, text, router_type):

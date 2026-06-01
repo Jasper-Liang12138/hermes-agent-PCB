@@ -2079,16 +2079,20 @@ class AIAgent:
         if re.search(r"\brl[_\s-]*arc\b", lowered):
             return "rl_arc"
         if re.search(r"\brl[_\s-]*135\b", lowered):
-            return "rl_135"
+            return "rl"
         algorithm = ""
         module = ""
         if re.search(r"\barc\b|圆弧|弧形", lowered):
             algorithm = "arc"
         elif re.search(r"\b135\b|135\s*度|折角", lowered):
             algorithm = "135"
-        if re.search(r"\brl\b", lowered):
+        negates_rl = bool(re.search(r"(?:不要|不用|别|不使用|禁用|不是)\s*(?:用|使用)?\s*\brl\b", lowered))
+        negates_bjut = bool(
+            re.search(r"(?:不要|不用|别|不使用|禁用|不是)\s*(?:用|使用)?\s*(?:北科大|北科|bjut|bk)", lowered)
+        )
+        if re.search(r"\brl\b", lowered) and not negates_rl:
             module = "RL"
-        elif re.search(r"北科大|北科|bjut|bk", lowered):
+        elif re.search(r"北科大|北科|bjut|bk", lowered) and not negates_bjut:
             module = "北科大"
         if algorithm and module == "RL":
             return "rl_arc" if algorithm == "arc" else "rl"
@@ -2177,11 +2181,7 @@ class AIAgent:
             return None
         if not (pcb_agent_loop_context or has_pcb_tool_history):
             return None
-        if not has_pcb_tool_history and re.search(
-            r"不要|别|先别|不用|无需|只解释|只讲|区别|是什么|什么意思|含义|原理|对比|比较",
-            latest_user or "",
-            flags=re.IGNORECASE,
-        ):
+        if self._shim_is_temporary_pcb_chat(latest_user):
             return None
 
         last_fanout = None
@@ -2215,6 +2215,40 @@ class AIAgent:
                 })]
 
         return None
+
+    @staticmethod
+    def _shim_is_temporary_pcb_chat(text: str) -> bool:
+        if not text:
+            return False
+        if re.search(r"(?:#|＃)\s*(?:全局\s*fanout|布线|拆线\s*重布|reroute)", text, flags=re.IGNORECASE):
+            return False
+        explicit_pcb_action = bool(
+            re.search(r"BGA|fanout|逃逸|扇出|布线|走线|route|routing|reroute", text, flags=re.IGNORECASE)
+            and re.search(
+                r"帮我|执行|开始|启动|做|进行|生成|获取|提取|识别|处理|跑一下|跑|布一下|走一下|重布|重新布|重走|确认|start|run",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if explicit_pcb_action:
+            return bool(
+                re.search(
+                    r"只解释|只讲|不要\s*(?:进行|执行|开始|调用|跑|做)?\s*(?:BGA|fanout|逃逸|扇出|布线|走线|route)|"
+                    r"别\s*(?:进行|执行|开始|调用|跑|做)?\s*(?:BGA|fanout|逃逸|扇出|布线|走线|route)|"
+                    r"先别\s*(?:进行|执行|开始|调用|跑|做)?\s*(?:BGA|fanout|逃逸|扇出|布线|走线|route)|"
+                    r"不用\s*(?:进行|执行|开始|调用|跑|做)?\s*(?:BGA|fanout|逃逸|扇出|布线|走线|route)|"
+                    r"无需\s*(?:进行|执行|开始|调用|跑|做)?\s*(?:BGA|fanout|逃逸|扇出|布线|走线|route)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            )
+        return bool(
+            re.search(
+                r"只解释|只讲|解释一下|区别|是什么|什么意思|含义|原理|对比|比较",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _looks_like_codex_intermediate_ack(
         self,
@@ -8447,6 +8481,24 @@ class AIAgent:
                             pass
                     new_tcs.append(tc)
                 am["tool_calls"] = new_tcs
+
+            preforced_pcb_tool_calls = self._pcb_tool_call_shim_override(api_messages)
+            if preforced_pcb_tool_calls:
+                forced_assistant = SimpleNamespace(
+                    content=None,
+                    tool_calls=preforced_pcb_tool_calls,
+                )
+                forced_msg = self._build_assistant_message(forced_assistant, "tool_calls")
+                messages.append(forced_msg)
+                self._emit_interim_assistant_message(forced_msg)
+                if self.stream_delta_callback:
+                    try:
+                        self.stream_delta_callback(None)
+                    except Exception:
+                        pass
+                self._execute_tool_calls(forced_assistant, messages, effective_task_id, api_call_count)
+                self._stream_needs_break = True
+                continue
 
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
