@@ -92,6 +92,16 @@ _PCB_STRUCTURED_KEY_RE = re.compile(
 _PCB_RAW_LAYOUT_RE = re.compile(
     r"(?is)(?:```[a-zA-Z0-9_-]*\s*)?\(\s*layout\b[\s\S]*$|Pcb-Design_Version[\s\S]*$"
 )
+_PCB_RAW_BOARD_LEAK_MARKERS = (
+    "(pcb_data",
+    "(layout",
+    "Pcb-Design_Version",
+    "ceramic_add_",
+    "pad_to_",
+    "gerber_output_quality",
+    "heatspreader_",
+    "generation_options",
+)
 
 # 思考内容标记（框架 show_reasoning 开启时嵌入文本的前缀格式）
 _REASONING_PATTERN = re.compile(
@@ -3662,6 +3672,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         clean, bare_fields = WebSocketAdapter._extract_bare_pcb_fields(content)
         fields.update(bare_fields)
 
+        if WebSocketAdapter._looks_like_raw_board_leak(clean):
+            return "", fields
+
         clean = re.sub(
             r"```(?:json|javascript|txt|text)?\s*[\s\S]*?"
             r"(?:selection|fanoutParams|routingResult|boardSummary|fanoutContext|"
@@ -3675,6 +3688,18 @@ class WebSocketAdapter(BasePlatformAdapter):
         clean = _PCB_RAW_LAYOUT_RE.sub("", clean)
         clean = re.sub(r"##PCB_FIELDS(?:_END)?#*", "", clean)
         return clean.strip(), fields
+
+    @staticmethod
+    def _looks_like_raw_board_leak(content: str) -> bool:
+        if not content:
+            return False
+        lowered = content.lower()
+        hits = sum(1 for marker in _PCB_RAW_BOARD_LEAK_MARKERS if marker.lower() in lowered)
+        if hits >= 2:
+            return True
+        if hits >= 1 and len(content) > 500:
+            return True
+        return False
 
     @staticmethod
     def _extract_bare_pcb_fields(content: str) -> Tuple[str, Dict[str, Any]]:
