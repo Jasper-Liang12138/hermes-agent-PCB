@@ -8,5 +8,9 @@ compression:
   threshold: 0.85
   summary_model: "qwen3.5-122b-a10b"
 
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+
 terminal:
   backend: "local"

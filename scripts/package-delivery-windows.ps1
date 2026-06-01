@@ -12,6 +12,7 @@ $DeliverySrc = Join-Path $RepoRoot ".github\delivery"
 $HardwareSkillsSrc = Join-Path $RepoRoot "skills\hardware"
 $DocsSrc = Join-Path $RepoRoot "docs"
 $ConfigSrc = Join-Path $RepoRoot "config.ini"
+$DefaultMemoriesSrc = Join-Path $DeliverySrc "memories"
 
 function Write-Info($msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -60,7 +61,7 @@ Write-Info "Copying built runtime files..."
 Copy-Item -Recurse -Force (Join-Path $BuildDir "*") $OutputDir
 
 Write-Info "Copying delivery scripts..."
-foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "sync_config.ps1", "template.env", "template-config.yaml", "使用说明.md", "开发测试包使用说明.md")) {
+foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "sync_config.ps1", "template.env", "template-config.yaml", "使用说明.md", "开发测试包使用说明.md", "前端接入README.md")) {
     $src = Join-Path $DeliverySrc $name
     if (Test-Path $src) {
         Copy-Item -Force $src $OutputDir
@@ -72,6 +73,13 @@ if (Test-Path $ConfigSrc) {
     Copy-Item -Force $ConfigSrc $OutputDir
 } else {
     Write-Warn "未找到 config.ini: $ConfigSrc"
+}
+
+Write-Info "Copying default memories..."
+if (Test-Path $DefaultMemoriesSrc) {
+    Copy-Files (Join-Path $DefaultMemoriesSrc "*") (Join-Path $OutputDir "memories")
+} else {
+    Write-Warn "未找到默认 memories 目录: $DefaultMemoriesSrc"
 }
 
 Write-Info "Copying PCB skills..."

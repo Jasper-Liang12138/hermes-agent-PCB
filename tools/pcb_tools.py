@@ -1344,6 +1344,126 @@ registry.register(
 )
 
 
+def _fanout_positive_number(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def generate_fanout_params_tool(
+    selectedBGA: str = "",
+    routerType: str = "",
+    constraints: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Generate fanoutParams from cached board data via the BJUT layer/order adapter."""
+    session_id = _transport.resolve_session_id(session_id)
+    if not _transport.is_pcb_mode(session_id):
+        msg = _session_mode_error("generateFanoutParams", session_id)
+        logger.warning(msg)
+        return json.dumps({"error": msg}, ensure_ascii=False)
+
+    project_data = _transport.get_cached_project_data(session_id=session_id)
+    if not project_data:
+        return json.dumps({
+            "error": "缺少版图数据，请先调用 getProjectData。",
+            "fanoutParams": None,
+        }, ensure_ascii=False)
+
+    router_type = _normalize_router_type(routerType)
+    if not router_type:
+        return json.dumps({
+            "error": "缺少 routerType，请先让用户选择 arc、135、rl、rl_arc 或 rl_135。",
+            "fanoutParams": None,
+        }, ensure_ascii=False)
+
+    selected_bga = str(selectedBGA or "").strip()
+    if not selected_bga:
+        selected_bga = _resolve_component_refdes(
+            {"selectedBGA": selected_bga, "routerType": router_type},
+            {"selectedBGA": selected_bga, "routerType": router_type},
+            session_id,
+            project_data,
+        )
+
+    normalized_constraints = constraints if isinstance(constraints, dict) else {}
+    normalized_constraints = {
+        "LineWidth": _fanout_positive_number(normalized_constraints.get("LineWidth"), 4),
+        "LineSpacing": _fanout_positive_number(normalized_constraints.get("LineSpacing"), 3),
+    }
+
+    try:
+        from tools.pcb_bjut_router import bjut_router_available, generate_fanout_params
+
+        work_dir = Path(os.getenv("ROUTER_WORK_DIR", ".")).resolve()
+        if not bjut_router_available(router_type, work_dir=work_dir):
+            return json.dumps({
+                "error": (
+                    f"{router_type} fanoutParams 生成器不可用；"
+                    "请检查 config.ini 中对应布线器目录。"
+                ),
+                "fanoutParams": None,
+            }, ensure_ascii=False)
+
+        fanout_params = generate_fanout_params(
+            project_data=project_data,
+            selected_bga=selected_bga,
+            router_type=router_type,
+            work_dir=work_dir,
+            constraints=normalized_constraints,
+        )
+        if not isinstance(fanout_params, dict):
+            fanout_params = {}
+        fanout_params.setdefault("selectedBGA", selected_bga)
+        fanout_params.setdefault("routerType", router_type)
+        fanout_params.setdefault("constraints", normalized_constraints)
+        return json.dumps({"fanoutParams": fanout_params}, ensure_ascii=False)
+    except Exception as exc:
+        logger.error("generateFanoutParams failed: %s", exc, exc_info=True)
+        return json.dumps({"error": str(exc), "fanoutParams": None}, ensure_ascii=False)
+
+
+registry.register(
+    name="generateFanoutParams",
+    toolset="pcb",
+    schema={
+        "name": "generateFanoutParams",
+        "description": (
+            "Generate BGA fanoutParams from cached getProjectData board data. "
+            "Call this after getProjectData and pcb_extract_bga, once selectedBGA and routerType are known. "
+            "Return the resulting fanoutParams to the user for confirmation before calling route."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selectedBGA": {
+                    "type": "string",
+                    "description": "Selected BGA refdes, for example U22.",
+                },
+                "routerType": {
+                    "type": "string",
+                    "description": "Router type: arc, 135, rl, rl_arc, or rl_135.",
+                },
+                "constraints": {
+                    "type": "object",
+                    "description": "Optional routing constraints, e.g. LineWidth/LineSpacing in mil.",
+                },
+            },
+            "required": ["selectedBGA", "routerType"],
+        },
+    },
+    handler=lambda args, **kwargs: generate_fanout_params_tool(
+        selectedBGA=args.get("selectedBGA", ""),
+        routerType=args.get("routerType", ""),
+        constraints=args.get("constraints") if isinstance(args.get("constraints"), dict) else None,
+        session_id=kwargs.get("session_id"),
+    ),
+    check_fn=lambda: True,
+)
+
+
 _NET_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]*")
 
 
@@ -3105,4 +3225,4 @@ registry.register(
 )
 
 
-logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, route, drop_net, reroute")
+logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, generateFanoutParams, route, drop_net, reroute")
