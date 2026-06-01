@@ -182,7 +182,17 @@ _CONFIRM_RE = re.compile(r"(确认|继续|执行|开始布线|开始|go|yes|ok)"
 _CANCEL_RE = re.compile(r"(取消|退出|中止|停止|cancel|abort|exit)", re.IGNORECASE)
 _CHAT_ONLY_RE = re.compile(
     r"(不要.*(布线|route|getprojectdata|getselectedelements)"
-    r"|只聊|闲聊|你好|您好|hello|hi|解释|介绍|笑话|今天星期几|区别|是什么|什么意思|含义|原理|对比|比较|优缺点|讲讲|聊聊|科普|简短回答|简要说明)",
+    r"|只聊|闲聊|你好|您好|hello|hi|解释|介绍|笑话|今天星期几|区别|什么是|是什么|什么意思|含义|原理|对比|比较|优缺点|讲讲|聊聊|科普|简短回答|简要说明)",
+    re.IGNORECASE,
+)
+_PCB_CONCEPT_QUESTION_RE = re.compile(
+    r"(告诉我\s*什么是|什么是|是什么|解释一下|介绍一下|原理|含义|什么意思|区别|对比|比较|讲讲|科普)",
+    re.IGNORECASE,
+)
+_PCB_EXPLICIT_EXECUTION_RE = re.compile(
+    r"(不要解释|直接|开始|执行|确认|立即|马上|立刻|现在\s*(?:布|做|开始|执行)|"
+    r"帮我\s*(?:做|进行|生成|执行|开始|跑)|请\s*(?:做|进行|生成|执行|开始|跑)|"
+    r"启动|route|run|go\b)",
     re.IGNORECASE,
 )
 _CHAT_GREETING_RE = re.compile(r"^\s*(你好|您好|hello|hi|hey|在吗|在不在)[！!。.\s]*$", re.IGNORECASE)
@@ -856,7 +866,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         else:
             auto_skill = None
             self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
-            user_text = str(user_text or "")
+            user_text = self._build_websocket_pcb_chat_turn_text(user_text=str(user_text or ""))
 
         event = MessageEvent(
             text=user_text,
@@ -1650,6 +1660,15 @@ class WebSocketAdapter(BasePlatformAdapter):
             f"{user_text}"
         )
 
+    @staticmethod
+    def _build_websocket_pcb_chat_turn_text(*, user_text: str) -> str:
+        return (
+            "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。\n"
+            "如果用户问 PCB/EDA/封装/布线相关概念，请围绕 PCB/EDA 简洁回答。\n"
+            "不要输出无关故事、训练题、随机文本；不要调用 PCB 工具；不要声称已经开始布线或获取版图。]\n\n"
+            f"{user_text}"
+        )
+
     def _on_session_worker_done(
         self,
         session_id: str,
@@ -2215,11 +2234,22 @@ class WebSocketAdapter(BasePlatformAdapter):
             or _SELECTION_RE.search(text)
         )
 
+    @staticmethod
+    def _is_pcb_concept_question_without_execution(text: str) -> bool:
+        text = text or ""
+        if not _PCB_CONCEPT_QUESTION_RE.search(text):
+            return False
+        if _FORCE_GLOBAL_FANOUT_TAG_RE.search(text) or _FORCE_REROUTE_TAG_RE.search(text):
+            return False
+        return not bool(_PCB_EXPLICIT_EXECUTION_RE.search(text))
+
     def _should_use_route_intent_llm(self, session_id: str, text: str) -> bool:
         text = (text or "").strip()
         if not text:
             return False
         if _CHAT_GREETING_RE.search(text):
+            return False
+        if self._is_pcb_concept_question_without_execution(text):
             return False
         if self._is_explicit_no_operation(text):
             return False
@@ -2873,7 +2903,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 明确要求对文本中指定 net 做拆线重布、删除后重走、reroute，判 pcb_reroute_selected。\n"
             "- 明确要求对当前框选、选中走线、选中 traces 做删除、拆线、重走、重布，判 pcb_reroute_selected。\n"
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
-            "- 如果用户既要求解释又要求执行，以执行为主。\n"
+            "- “我想做/准备做...”只是背景，后面问什么是/原理/介绍时判 chat；明确要求现在/直接/开始/执行时才以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
             "- flow_state=wait_router_type 时，用户回复 arc/135/RL/北科大 或组合如 135 + RL，判 pcb_followup。\n"
             "- flow_state=wait_confirm 时，确认/开始/执行/继续判 pcb_confirm_route。\n"
@@ -2888,6 +2918,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             f"selection_labels={json.dumps(selection_labels, ensure_ascii=False)}\n"
             "examples=\n"
             "- 帮我做一下BGA逃逸 => pcb_entry, route_mode=pcb, should_call_get_project_data=true\n"
+            "- 我想做BGA逃逸布线，告诉我什么是BGA逃逸布线 => chat, route_mode=chat\n"
+            "- 告诉我什么是BGA逃逸布线 => chat, route_mode=chat\n"
             "- BGA和QFP有什么区别？ => chat, route_mode=chat\n"
             "- 不要解释，直接开始PCB BGA逃逸布线 => pcb_entry, route_mode=pcb\n"
             "- 不要布线，只解释一下逃逸布线原理 => chat, route_mode=chat\n"
@@ -2973,6 +3005,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             return _INTENT_PCB_REROUTE_SELECTED
         if forced_global_fanout:
             return _INTENT_PCB_ENTRY
+        if self._is_pcb_concept_question_without_execution(text):
+            return _INTENT_CHAT
         if self._is_explicit_no_operation(text):
             return _INTENT_CHAT
         if _CHAT_ONLY_RE.search(text) and not self._is_strong_pcb_intent(text) and not clear_reroute:
