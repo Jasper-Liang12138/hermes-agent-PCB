@@ -135,10 +135,22 @@ _REROUTE_RE = re.compile(
     r"重布|重新布|重走|重新走线|reroute|ripup|rip-up)",
     re.IGNORECASE,
 )
+_FORCE_GLOBAL_FANOUT_TAG_RE = re.compile(
+    r"(?:#|＃)\s*(?:全局\s*fanout|布线)(?=$|[\s,，。；;:：])",
+    re.IGNORECASE,
+)
+_FORCE_REROUTE_TAG_RE = re.compile(
+    r"(?:#|＃)\s*(?:拆线\s*重布|reroute)(?=$|[\s,，。；;:：])",
+    re.IGNORECASE,
+)
+_REROUTE_SHORT_COMMAND_RE = re.compile(
+    r"^\s*(?:拆线\s*重布|重布|重新布线|reroute)\s*$",
+    re.IGNORECASE,
+)
 
 # 高精度触发：必须同时命中动作词 + PCB 领域词，才进入 PCB 主链路。
 _PCB_ACTION_RE = re.compile(
-    r"(帮我|执行|开始|启动|做|进行|生成|获取|提取|识别|处理|跑一下|跑|布一下|走一下|重布|重新布|重走|route|fanout|reroute|start|run)",
+    r"(帮我|执行|开始|启动|做|进行|生成|获取|提取|识别|处理|用|使用|跑一下|跑|布一下|走一下|重布|重新布|重走|route|reroute|start|run)",
     re.IGNORECASE,
 )
 _PCB_DOMAIN_RE = re.compile(
@@ -810,92 +822,31 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not isinstance(turn_options, dict):
             turn_options = {}
 
-        if self._should_use_route_intent_llm(session_id, str(user_text or "")):
-            llm_intent = await self._classify_route_intent_with_llm(
-                session_id=session_id,
-                user_text=user_text,
-                project_id=project_id,
-            )
-        else:
-            llm_intent = None
-        decision = self._decide_route(session_id, user_text, llm_intent=llm_intent)
+        decision = self._decide_route(session_id, str(user_text or ""), llm_intent=None)
         if decision.immediate_reply:
             await self._send_router_reply(session_id, decision.immediate_reply)
             logger.info(
-                "Router short-circuit: session=%s mode=%s reason=%s llm_intent=%s",
+                "Router short-circuit: session=%s mode=%s reason=%s",
                 session_id,
                 decision.mode,
                 decision.reason,
-                llm_intent,
             )
             return
 
         turn_options = dict(turn_options)
         turn_options["route_mode"] = decision.mode
-        auto_skill = None
+        turn_options["pcb_agent_loop"] = decision.mode == _ROUTE_MODE_PCB
         if decision.mode == _ROUTE_MODE_PCB:
-            auto_skill = (
-                "hardware/pcb-reroute"
-                if decision.intent == _INTENT_PCB_REROUTE_SELECTED
-                else "hardware/pcb-intelligence"
-            )
-        skill_status = self._build_auto_skill_status(auto_skill)
-        if decision.mode == _ROUTE_MODE_PCB:
+            auto_skill = ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-        else:
-            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
-        if skill_status:
-            await self._send_processing_status(session_id, project_id, skill_status)
-
-        bootstrap_context: Optional[Dict[str, Any]] = None
-        if (
-            decision.bootstrap_get_project
-            and self._bootstrap_get_project_enabled
-            and session_id in self._connections
-        ):
-            bootstrap_context = await self._bootstrap_get_project_data(
-                session_id=session_id,
+            user_text = self._build_agent_loop_pcb_turn_text(
+                user_text=str(user_text or ""),
                 project_id=project_id,
-                user_text=user_text,
             )
-            if bootstrap_context is None:
-                return
-
-        if decision.reason == "confirm_route" and await self._run_cached_fanout_route(session_id):
-            return
-
-        if decision.mode == _ROUTE_MODE_PCB and decision.intent != _INTENT_PCB_REROUTE_SELECTED:
-            if bootstrap_context and await self._run_direct_bga_analysis(session_id, bootstrap_context):
-                return
-            if decision.reason == "router_type_step" and await self._run_direct_fanout_param_step(session_id, user_text):
-                return
-
-        if decision.reason == "router_type_step":
-            router_type = self._session_router_types.get(session_id) or self._extract_complete_router_choice(session_id, user_text)
-            selected = self._session_selected_targets.get(session_id)
-            target_line = f"目标 BGA 已确定为 {selected}。\n" if selected else ""
-            algorithm = self._router_algorithm_from_type(router_type or "")
-            module = self._fanout_module_from_type(router_type or "")
-            user_text = (
-                "[SYSTEM: 用户已选择 PCB BGA 逃逸布线配置。\n"
-                f"{target_line}"
-                f"走线算法已确定为 {algorithm or router_type}。\n"
-                f"层分配和逃逸顺序生成模块已确定为 {module or '未指定'}。\n"
-                f"内部 routerType 已确定为 {router_type}。\n"
-                "下一步必须基于已缓存的 boardSummary/fanoutContext 或当前上下文生成 fanoutParams；"
-                "fanoutParams.routerType 必须等于该 routerType，禁止为 null，禁止使用 pcb_fanout。]\n\n"
-                f"用户原始回复：\n{user_text}"
-            )
-
-        # 仅在 PCB 流程里注入 projectid，避免普通聊天因看到项目上下文而主动去拿版图数据。
-        if decision.mode == _ROUTE_MODE_PCB and project_id and user_text:
-            user_text = f"[projectid: {project_id}]\n{user_text}"
-        if bootstrap_context:
-            user_text = self._build_bootstrap_agent_text(user_text, bootstrap_context)
-            turn_options["pcb_bootstrap"] = {
-                "project_data_loaded": True,
-                "source": bootstrap_context.get("source", ""),
-            }
+        else:
+            auto_skill = None
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            user_text = str(user_text or "")
 
         event = MessageEvent(
             text=user_text,
@@ -1671,6 +1622,22 @@ class WebSocketAdapter(BasePlatformAdapter):
             "如果只提取到一个 BGA，也不要直接询问是否执行布线；必须先让用户选择走线算法类型和层分配/逃逸顺序生成模块。\n"
             "在用户明确选择走线算法和层分配/逃逸顺序生成模块之前，禁止输出 fanoutParams，禁止调用 route，禁止询问“是否现在执行”。]\n\n"
             f"用户原始请求：\n{user_text}"
+        )
+
+    @staticmethod
+    def _build_agent_loop_pcb_turn_text(*, user_text: str, project_id: str) -> str:
+        project_line = f"projectid: {project_id}\n" if project_id else ""
+        return (
+            "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+            f"{project_line}"
+            "WebSocket Adapter 只负责收发消息、前端协议、结构化字段抽取和 importLines；"
+            "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。\n"
+            "如果用户只是普通聊天、概念咨询或明确要求不要操作，直接回答，不要调用 PCB 工具。\n"
+            "如果用户要求 BGA 逃逸/fanout，按 hardware/pcb-intelligence："
+            "getProjectData -> pcb_extract_bga -> generateFanoutParams -> route。\n"
+            "如果用户要求局部拆线重布/reroute，按 hardware/pcb-reroute：drop_net -> reroute；"
+            "删除目标只能来自前端选中 traces，不要从文本臆造。]\n\n"
+            f"{user_text}"
         )
 
     def _on_session_worker_done(
@@ -2602,6 +2569,10 @@ class WebSocketAdapter(BasePlatformAdapter):
     async def _prepare_final_pcb_fields_for_frontend(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
         fields = self._sanitize_public_pcb_fields(pcb_fields)
         if "routingResult" in fields:
+            import_status = await self._import_fanout_result(session_id, {}, fields)
+            if import_status:
+                report = str(fields.get("report") or "").strip()
+                fields["report"] = f"{report}\n{import_status}".strip() if report else import_status
             return fields
         if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields:
             return fields
@@ -2978,13 +2949,25 @@ class WebSocketAdapter(BasePlatformAdapter):
         flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
         mode = self._session_mode(session_id)
         route_intent = self._coerce_route_intent(llm_intent)
+        in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
+        forced_global_fanout = bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text))
+        forced_reroute = bool(_FORCE_REROUTE_TAG_RE.search(text))
+        clear_reroute = bool(
+            _REROUTE_RE.search(text)
+            and (_PCB_DOMAIN_RE.search(text) or in_pcb_context or _REROUTE_SHORT_COMMAND_RE.search(text))
+        )
 
-        if _CANCEL_RE.search(text):
+        if _CANCEL_RE.search(text) and not (forced_global_fanout or forced_reroute or clear_reroute):
             return _INTENT_CANCEL
+        if forced_reroute:
+            return _INTENT_PCB_REROUTE_SELECTED
+        if forced_global_fanout:
+            return _INTENT_PCB_ENTRY
         if self._is_explicit_no_operation(text):
             return _INTENT_CHAT
+        if _CHAT_ONLY_RE.search(text) and not self._is_strong_pcb_intent(text) and not clear_reroute:
+            return _INTENT_CHAT
 
-        in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
         if flow_state == _FLOW_WAIT_ROUTER_TYPE and (
             self._extract_router_type(text)
             or self._extract_route_algorithm(text)
@@ -2994,7 +2977,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if route_intent:
             if route_intent.intent == _INTENT_CANCEL:
                 return _INTENT_CANCEL
-            if _REROUTE_RE.search(text) and (_PCB_DOMAIN_RE.search(text) or in_pcb_context):
+            if clear_reroute:
                 return _INTENT_PCB_REROUTE_SELECTED
             if (
                 route_intent.intent == _INTENT_CHAT
@@ -3017,7 +3000,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             } and in_pcb_context:
                 return _INTENT_PCB_FOLLOWUP
 
-        if _REROUTE_RE.search(text) and (_PCB_DOMAIN_RE.search(text) or in_pcb_context):
+        if clear_reroute:
             return _INTENT_PCB_REROUTE_SELECTED
         if self._is_strong_pcb_intent(text):
             return _INTENT_PCB_ENTRY
@@ -3051,8 +3034,11 @@ class WebSocketAdapter(BasePlatformAdapter):
         mode = self._session_mode(session_id)
         route_intent = self._coerce_route_intent(llm_intent)
         validated_intent = self._validate_route_intent(session_id, text, llm_intent)
+        in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
 
         if validated_intent == _INTENT_CHAT and (self._is_explicit_no_operation(text) or _CHAT_ONLY_RE.search(text)):
+            if in_pcb_context:
+                return _RouteDecision(mode=_ROUTE_MODE_CHAT, reason="temporary_chat", intent=_INTENT_CHAT)
             self._reset_flow(session_id)
             return _RouteDecision(mode=_ROUTE_MODE_CHAT, reason="chat_only", intent=_INTENT_CHAT)
 
@@ -3104,6 +3090,16 @@ class WebSocketAdapter(BasePlatformAdapter):
                 reason="pcb_reroute_selected",
                 intent=_INTENT_PCB_REROUTE_SELECTED,
                 bootstrap_get_project=False,
+            )
+
+        if validated_intent == _INTENT_PCB_ENTRY and _FORCE_GLOBAL_FANOUT_TAG_RE.search(text):
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            return _RouteDecision(
+                mode=_ROUTE_MODE_PCB,
+                reason="forced_global_fanout",
+                intent=_INTENT_PCB_ENTRY,
+                bootstrap_get_project=True,
             )
 
         router_type = self._extract_complete_router_choice(session_id, text)
@@ -3220,12 +3216,14 @@ class WebSocketAdapter(BasePlatformAdapter):
     async def _send_router_reply(self, session_id: str, message: str) -> None:
         await self.send(chat_id=session_id, content=message)
 
-    @staticmethod
-    def _pop_pending_pcb_fields(session_id: str) -> Dict[str, Any]:
+    def _pop_pending_pcb_fields(self, session_id: str) -> Dict[str, Any]:
         try:
             from tools.pcb_tools import WebSocketTransportSingleton
             fields = WebSocketTransportSingleton.get_instance().pop_pending_pcb_fields(session_id)
-            return fields if isinstance(fields, dict) else {}
+            fields = fields if isinstance(fields, dict) else {}
+            if fields.get("routingResult"):
+                self._set_flow_state(session_id, _FLOW_ROUTING)
+            return fields
         except Exception as exc:
             logger.warning("Failed to pop pending PCB fields for session=%s: %s", session_id, exc)
             return {}

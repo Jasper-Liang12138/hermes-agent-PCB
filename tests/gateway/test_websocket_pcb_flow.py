@@ -109,12 +109,14 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
 
 
 async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
-    """Covers selection -> fanoutParams -> routingResult over real WebSocket I/O."""
+    """Covers Agent-loop selection -> fanoutParams -> routingResult over real WebSocket I/O."""
     port = _free_port()
     adapter = _make_adapter(port)
 
     session_id = "sess-pcb-1"
     project_id = "proj-autotest-001"
+    observed_auto_skill: list[Any] = []
+    observed_text: list[str] = []
 
     fanout_params = {
         "selectedBGA": "U27",
@@ -131,47 +133,42 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
         "importLinesFilePath": r"F:\router_work\ARC_output.txt",
         "report": "布线连通率: 100%",
     }
-    from tools import pcb_tools
-    from tools import pcb_chunking_tool
-
-    def _fake_route_bga(user_data: str, session_id: str | None = None) -> str:
-        assert session_id == "sess-pcb-1"
-        assert json.loads(user_data) == fanout_params
-        return json.dumps(route_result, ensure_ascii=False)
-
-    def _fake_extract_bga(board_text: str, session_id: str | None = None) -> str:
-        assert board_text == "__CACHED_PROJECT_DATA__"
-        assert session_id == "sess-pcb-1"
-        return json.dumps(
-            {
-                "selection": [
-                    {"label": "U27", "detail": "BGA-256, 1.0mm pitch"},
-                    {"label": "U35", "detail": "BGA-484, 0.8mm pitch"},
-                ],
-                "boardSummary": {
-                    "stackupSummary": ["SIG03: signal", "SIG04: signal"],
-                    "packageHints": ["BGA-256 x1"],
-                    "netSummary": {
-                        "groundNets": ["GND"],
-                        "powerNets": ["VCC"],
-                        "clockNets": ["DDR_D0"],
-                        "signalNetCount": 0,
-                        "ncNetCount": 0,
+    async def handler(event):
+        observed_auto_skill.append(event.auto_skill)
+        observed_text.append(event.text)
+        text = event.text
+        if "帮我进行BGA逃逸布线" in text:
+            return (
+                "请选择一个 BGA 进行布线。\n\n"
+                "##PCB_FIELDS##\n"
+                + json.dumps(
+                    {
+                        "selection": [
+                            {"label": "U27", "detail": "BGA-256, 1.0mm pitch"},
+                            {"label": "U35", "detail": "BGA-484, 0.8mm pitch"},
+                        ]
                     },
-                },
-                "fanoutContext": {
-                    "recommendedEscapeLayers": ["SIG03", "SIG04"],
-                    "recommendedLineWidth": 4,
-                    "recommendedLineSpacing": 3,
-                    "prioritySuggestion": ["ground", "power", "clock", "signal"],
-                },
-            },
-            ensure_ascii=False,
-        )
+                    ensure_ascii=False,
+                )
+                + "\n##PCB_FIELDS_END##"
+            )
+        if "选择 U27" in text:
+            return "已选择目标 BGA：U27。\n\n请选择走线算法类型和层分配/逃逸顺序生成模块。"
+        if "arc + 北科大" in text:
+            return (
+                "已生成扇出参数，请确认。\n\n"
+                "##PCB_FIELDS##\n"
+                + json.dumps({"fanoutParams": fanout_params}, ensure_ascii=False)
+                + "\n##PCB_FIELDS_END##"
+            )
+        if "确认" in text:
+            from tools import pcb_tools
 
-    monkeypatch.setattr(pcb_tools, "route_bga", _fake_route_bga)
-    monkeypatch.setattr(pcb_chunking_tool, "_extract_bga", _fake_extract_bga)
-    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
+            pcb_tools._transport.set_pending_pcb_fields(route_result, session_id=session_id)
+            return "布线完成。"
+        raise AssertionError(f"Unexpected Agent-loop event text: {text}")
+
+    adapter.set_message_handler(handler)
     await adapter.connect()
 
     try:
@@ -179,18 +176,6 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
                 await ws.send_str(_user_message(session_id, project_id, "帮我进行BGA逃逸布线"))
-
-                tool_call = await _recv_json(ws)
-                assert tool_call["type"] == "tool-calls"
-                assert tool_call["body"]["content"]["name"] == "getProjectData"
-                assert tool_call["body"]["content"]["arguments"] == {"projectID": project_id}
-                await ws.send_str(
-                    _tool_result(
-                        tool_call["body"]["content"]["id"],
-                        '(pcb_data (component (name "U27") (package "BGA-256")) '
-                        '(component (name "U35") (package "BGA-484")))',
-                    )
-                )
 
                 selection_msg = await _recv_json(ws)
                 assert selection_msg["type"] == "message"
@@ -217,8 +202,6 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                     if content == "正在导入版图，请稍候...":
                         saw_import_status = True
                         assert routed_msg["body"]["isFinal"] is False
-                    elif content.startswith("已确认，正在调用"):
-                        assert routed_msg["body"]["isFinal"] is True
                     else:
                         raise AssertionError(f"Unexpected message before importLines: {routed_msg}")
                     routed_msg = await _recv_json(ws)
@@ -241,11 +224,19 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 assert routed_msg["type"] == "message"
                 assert routed_msg["body"]["isFinal"] is True
                 assert routed_msg["body"]["routingResult"] == route_result["routingResult"]
-                assert routed_msg["body"]["report"] == route_result["report"]
-                assert "导入完成" in routed_msg["body"]["content"]
+                assert route_result["report"] in routed_msg["body"]["report"]
+                assert "导入完成" in routed_msg["body"]["report"]
 
     finally:
         await adapter.disconnect()
+
+    assert observed_auto_skill == [
+        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
+        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
+        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
+    ]
+    assert observed_text[0].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
+    assert "projectid: proj-autotest-001" in observed_text[0]
 
 
 def test_websocket_pcb_flow_round_trip(monkeypatch):
@@ -295,6 +286,29 @@ def test_websocket_reroute_short_command_works_in_pcb_context():
     assert decision.bootstrap_get_project is False
 
 
+@pytest.mark.parametrize("text", ["#拆线重布", "#reroute", "拆线重布"])
+def test_websocket_reroute_can_start_without_existing_selection(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-reroute-no-selection", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+
+
+@pytest.mark.parametrize("text", ["#全局fanout", "#布线"])
+def test_websocket_hashtag_forces_global_fanout_skill(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-force-fanout", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_entry"
+    assert decision.reason == "forced_global_fanout"
+    assert decision.bootstrap_get_project is True
+
+
 def test_websocket_reroute_interrupts_pending_fanout_confirmation():
     adapter = _make_adapter()
     session_id = "sess-reroute-interrupt"
@@ -312,6 +326,44 @@ def test_websocket_reroute_interrupts_pending_fanout_confirmation():
     assert decision.reason == "pcb_reroute_selected"
     assert adapter._session_flow_states[session_id] == "idle"
     assert session_id not in adapter._session_fanout_params
+
+
+def test_websocket_cancel_and_reroute_phrase_switches_task():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-switch"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+    }
+
+    decision = adapter._decide_route(session_id, "取消当前，#拆线重布")
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.reason == "pcb_reroute_selected"
+    assert adapter._session_flow_states[session_id] == "idle"
+    assert session_id not in adapter._session_fanout_params
+
+
+def test_websocket_temporary_chat_preserves_pcb_flow_state():
+    adapter = _make_adapter()
+    session_id = "sess-temp-chat"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_router_type")
+
+    chat_decision = adapter._decide_route(session_id, "解释一下 RL 是什么意思")
+
+    assert chat_decision.mode == "chat"
+    assert chat_decision.reason == "temporary_chat"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+    followup_decision = adapter._decide_route(session_id, "135 + RL")
+
+    assert followup_decision.mode == "pcb"
+    assert followup_decision.reason == "router_type_step"
+    assert followup_decision.intent == "pcb_followup"
 
 
 def test_websocket_explicit_reroute_overrides_bad_llm_chat_intent():
@@ -438,7 +490,7 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == ["hardware/pcb-reroute"]
+    assert observed_auto_skill == [["hardware/pcb-reroute", "hardware/pcb-intelligence"]]
 
 
 def test_websocket_reroute_fields_round_trip():
@@ -529,7 +581,7 @@ def test_websocket_reroute_txt_with_failed_drc_skips_import():
     asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_txt_with_failed_drc_skips_import())
 
 
-async def _run_websocket_reroute_sends_skill_status() -> None:
+async def _run_websocket_reroute_reaches_agent_loop() -> None:
     port = _free_port()
     adapter = _make_adapter(port)
     session_id = "sess-reroute-status"
@@ -555,35 +607,21 @@ async def _run_websocket_reroute_sends_skill_status() -> None:
                     )
                 )
 
-                received: list[dict[str, Any]] = []
-                for _ in range(4):
-                    msg = await asyncio.wait_for(ws.receive(), timeout=5.0)
-                    assert msg.type == aiohttp.WSMsgType.TEXT
-                    data = json.loads(msg.data)
-                    received.append(data)
-                    if data.get("body", {}).get("content") == "ok":
-                        break
-
-                status_messages = [
-                    item
-                    for item in received
-                    if item.get("type") == "message"
-                    and item.get("body", {}).get("content") == "已收到，进入拆线重布 skill，正在处理..."
-                    and item.get("body", {}).get("isFinal") is False
-                ]
-                assert status_messages
+                msg = await _recv_json(ws)
+                assert msg["type"] == "message"
+                assert msg["body"]["content"] == "ok"
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == ["hardware/pcb-reroute"]
+    assert observed_auto_skill == [["hardware/pcb-reroute", "hardware/pcb-intelligence"]]
 
 
-def test_websocket_reroute_sends_skill_status():
-    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_sends_skill_status())
+def test_websocket_reroute_reaches_agent_loop():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_reaches_agent_loop())
 
 
-async def _run_websocket_chat_turn_not_misrouted() -> None:
-    """普通聊天应走 chat 通道，不应强制 auto_skill=pcb。"""
+async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
+    """普通聊天仍交给 Agent loop，但不开放 PCB skill/toolset。"""
     port = _free_port()
     adapter = _make_adapter(port)
 
@@ -612,8 +650,8 @@ async def _run_websocket_chat_turn_not_misrouted() -> None:
     assert observed_auto_skill == [None]
 
 
-def test_websocket_chat_turn_not_misrouted():
-    asyncio.get_event_loop().run_until_complete(_run_websocket_chat_turn_not_misrouted())
+def test_websocket_chat_turn_uses_chat_mode_without_pcb_skills():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_chat_turn_uses_chat_mode_without_pcb_skills())
 
 
 async def _run_websocket_turn_options_passthrough() -> None:
@@ -652,6 +690,7 @@ async def _run_websocket_turn_options_passthrough() -> None:
             "thinking": True,
             "reasoningEffort": "high",
             "route_mode": "chat",
+            "pcb_agent_loop": False,
         }
     ]
 
@@ -661,13 +700,27 @@ def test_websocket_turn_options_passthrough():
 
 
 async def _run_websocket_selection_stage_fail_closed() -> None:
-    """选择阶段收到“确认”应 fail-closed，直接返回纠偏提示。"""
+    """选择阶段收到“确认”应经 agent loop 返回纠偏提示。"""
     port = _free_port()
     adapter = _make_adapter(port)
 
     session_id = "sess-fsm-1"
     project_id = "proj-fsm-001"
-    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
+
+    async def handler(event):
+        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+        if "帮我进行BGA逃逸布线" in event.text:
+            return (
+                "已识别到目标 BGA：U27。\n\n"
+                "##PCB_FIELDS##\n"
+                + json.dumps({"selection": [{"label": "U27", "detail": "BGA-256"}]}, ensure_ascii=False)
+                + "\n##PCB_FIELDS_END##"
+            )
+        if "确认" in event.text:
+            return "执行布线前必须先选择走线算法和层分配/逃逸顺序生成模块。"
+        raise AssertionError(f"unexpected event text: {event.text}")
+
+    adapter.set_message_handler(handler)
     await adapter.connect()
 
     try:
@@ -675,15 +728,6 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
                 await ws.send_str(_user_message(session_id, project_id, "帮我进行BGA逃逸布线"))
-                tool_call = await _recv_json(ws)
-                assert tool_call["type"] == "tool-calls"
-                assert tool_call["body"]["content"]["name"] == "getProjectData"
-                await ws.send_str(
-                    _tool_result(
-                        tool_call["body"]["content"]["id"],
-                        '(pcb_data (component (name "U27") (package "BGA-256")))',
-                    )
-                )
                 first = await _recv_json(ws)
                 assert first["type"] == "message"
                 assert first["body"]["selection"] == [{"label": "U27", "detail": "BGA-256"}]
@@ -701,13 +745,27 @@ def test_websocket_selection_stage_fail_closed():
 
 
 async def _run_websocket_selection_accepts_non_u_refdes() -> None:
-    """选择阶段应接受 selection 列表里的任意合法位号，而不只 U+数字。"""
+    """Agent-loop 选择阶段应接受 selection 列表里的任意合法位号，而不只 U+数字。"""
     port = _free_port()
     adapter = _make_adapter(port)
 
     session_id = "sess-fsm-fpga"
     project_id = "proj-fsm-fpga"
-    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
+
+    async def handler(event):
+        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+        if "帮我进行BGA逃逸布线" in event.text:
+            return (
+                "已识别到目标 BGA：FPGA1。\n\n"
+                "##PCB_FIELDS##\n"
+                + json.dumps({"selection": [{"label": "FPGA1", "detail": "BGA-1156"}]}, ensure_ascii=False)
+                + "\n##PCB_FIELDS_END##"
+            )
+        if "选择 FPGA1" in event.text:
+            return "已选择目标 BGA：FPGA1。\n\n请回复例如：`135 + RL`、`arc + 北科大`。"
+        raise AssertionError(f"unexpected event text: {event.text}")
+
+    adapter.set_message_handler(handler)
     await adapter.connect()
 
     try:
@@ -715,15 +773,6 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
                 await ws.send_str(_user_message(session_id, project_id, "帮我进行BGA逃逸布线"))
-                tool_call = await _recv_json(ws)
-                assert tool_call["type"] == "tool-calls"
-                assert tool_call["body"]["content"]["name"] == "getProjectData"
-                await ws.send_str(
-                    _tool_result(
-                        tool_call["body"]["content"]["id"],
-                        '(pcb_data (component (name "FPGA1") (package "BGA-1156")))',
-                    )
-                )
                 first = await _recv_json(ws)
                 assert first["type"] == "message"
                 assert first["body"]["selection"] == [{"label": "FPGA1", "detail": "BGA-1156"}]
@@ -1012,7 +1061,7 @@ async def _run_pcb_outbound_trace_log(tmp_path) -> None:
     assert event["reason"] == "sent"
     assert event["sessionId"] == session_id
     assert event["projectid"] == "proj-trace-001"
-    assert event["fieldKeys"] == ["routingResult"]
+    assert event["fieldKeys"] == ["routingResult", "report"]
     assert event["routingResult"] == "F:\\router_work\\routing_input.txt"
 
 
@@ -1175,24 +1224,24 @@ async def test_handle_user_message_injects_camel_project_id():
     )
 
     assert seen["raw"]["projectid"] == "proj-camel-001"
-    assert seen["text"].startswith("[projectid: proj-camel-001]")
+    assert seen["raw"]["options"]["route_mode"] == "pcb"
+    assert seen["raw"]["options"]["pcb_agent_loop"] is True
+    assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
+    assert "projectid: proj-camel-001" in seen["text"]
 
 
 @pytest.mark.asyncio
-async def test_handle_user_message_chat_does_not_inject_project_id():
+async def test_handle_user_message_chat_uses_chat_mode():
     adapter = _make_adapter(route_intent_llm_enabled=True)
     seen = {}
 
     async def handler(event):
         seen["text"] = event.text
         seen["raw"] = event.raw_message
+        seen["auto_skill"] = event.auto_skill
         return None
 
-    async def fake_classify(*, session_id, user_text, project_id):
-        return "chat"
-
     adapter.set_message_handler(handler)
-    adapter._classify_route_intent_with_llm = fake_classify
 
     await adapter._handle_user_message(
         {"type": "message", "body": {"role": "user", "content": "BGA 和 QFP 有什么区别？请简短回答。"}},
@@ -1202,7 +1251,36 @@ async def test_handle_user_message_chat_does_not_inject_project_id():
 
     assert seen["raw"]["projectid"] == "proj-chat-001"
     assert seen["raw"]["options"]["route_mode"] == "chat"
+    assert seen["raw"]["options"]["pcb_agent_loop"] is False
+    assert seen["auto_skill"] is None
     assert seen["text"] == "BGA 和 QFP 有什么区别？请简短回答。"
+
+
+@pytest.mark.asyncio
+async def test_handle_user_message_sends_immediate_reply_without_agent_handler():
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    adapter._connections["sess-immediate"] = (ws, "proj-immediate")
+    adapter._session_flow_states["sess-immediate"] = "wait_router_type"
+    called = False
+
+    async def handler(event):
+        nonlocal called
+        called = True
+        raise AssertionError("immediate_reply should not enter agent handler")
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {"type": "message", "body": {"role": "user", "content": "确认"}},
+        "sess-immediate",
+        "proj-immediate",
+    )
+
+    assert called is False
+    assert ws.sent[-1]["type"] == "message"
+    assert "必须先选择走线算法" in ws.sent[-1]["body"]["content"]
+    assert ws.sent[-1]["body"]["isFinal"] is True
 
 
 @pytest.mark.asyncio
@@ -1229,8 +1307,9 @@ async def test_plain_greeting_skips_route_intent_llm():
         "proj-greeting",
     )
 
-    assert seen["text"] == "你好"
+    assert "你好" in seen["text"]
     assert seen["raw"]["options"]["route_mode"] == "chat"
+    assert seen["raw"]["options"]["pcb_agent_loop"] is False
     assert ws.sent[-1]["body"]["content"] == "你好，我在。"
     assert ws.sent[-1]["body"]["isFinal"] is True
 
@@ -1395,13 +1474,12 @@ def test_rule_validation_rejects_followup_without_pcb_context():
 
 
 @pytest.mark.asyncio
-async def test_handle_user_message_uses_llm_intent_before_rule_fallback(monkeypatch):
+async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(monkeypatch):
     adapter = _make_adapter(route_intent_llm_enabled=True)
     seen = {}
 
     async def fake_classify(*, session_id, user_text, project_id):
-        seen["llm_args"] = (session_id, user_text, project_id)
-        return "pcb_entry"
+        raise AssertionError("WebSocket adapter should not classify PCB business intent")
 
     async def handler(event):
         seen["auto_skill"] = event.auto_skill
@@ -1420,19 +1498,31 @@ async def test_handle_user_message_uses_llm_intent_before_rule_fallback(monkeypa
         "proj-llm-1",
     )
 
-    assert seen["llm_args"] == ("sess-llm-1", "帮我对U27做BGA逃逸布线", "proj-llm-1")
-    assert seen["auto_skill"] == "hardware/pcb-intelligence"
-    assert seen["text"].startswith("[projectid: proj-llm-1]")
+    assert seen["auto_skill"] == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+    assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
+    assert "projectid: proj-llm-1" in seen["text"]
+    assert "帮我对U27做BGA逃逸布线" in seen["text"]
 
 
 @pytest.mark.asyncio
-async def test_pcb_entry_bootstrap_reads_project_data_file_path(monkeypatch, tmp_path):
+async def test_pcb_entry_file_path_mode_is_left_to_agent_loop(monkeypatch, tmp_path):
     monkeypatch.setenv("BOARD_DATA_USE_FILE_PATH", "1")
     port = _free_port()
     adapter = _make_adapter(port)
     board_file = tmp_path / "board.txt"
     board_file.write_text('(pcb_data (component (name "FPGA1") (package "BGA-1156")))', encoding="utf-8")
-    adapter.set_message_handler(lambda event: (_ for _ in ()).throw(AssertionError("BGA flow should not reach main agent handler")))
+
+    async def handler(event):
+        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+        assert "直接开始逃逸布线，不要解释" in event.text
+        return (
+            "已识别到目标 BGA：FPGA1。\n\n"
+            "##PCB_FIELDS##\n"
+            + json.dumps({"selection": [{"label": "FPGA1", "detail": "BGA-1156"}]}, ensure_ascii=False)
+            + "\n##PCB_FIELDS_END##"
+        )
+
+    adapter.set_message_handler(handler)
     await adapter.connect()
     try:
         uri = f"http://127.0.0.1:{port}"
@@ -1445,15 +1535,10 @@ async def test_pcb_entry_bootstrap_reads_project_data_file_path(monkeypatch, tmp
                         "直接开始逃逸布线，不要解释",
                     )
                 )
-                tool_call = await _recv_json(ws)
-                assert tool_call["type"] == "tool-calls"
-                assert tool_call["body"]["content"]["name"] == "getProjectData"
-                await ws.send_str(_tool_result(tool_call["body"]["content"]["id"], str(board_file)))
-
                 msg = await _recv_json(ws)
                 assert msg["type"] == "message"
                 assert msg["body"]["selection"] == [{"label": "FPGA1", "detail": "BGA-1156"}]
-                assert "请选择走线算法类型" in msg["body"]["content"]
+                assert "FPGA1" in msg["body"]["content"]
     finally:
         await adapter.disconnect()
 

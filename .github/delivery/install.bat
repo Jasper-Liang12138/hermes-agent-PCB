@@ -17,6 +17,15 @@ mkdir "%HERMES%\skills\hardware"           2>nul
 xcopy /E /Y /I "%SCRIPT_DIR%skills" "%HERMES%\skills\" >nul
 echo [OK] PCB skill 已安装
 
+if exist "%SCRIPT_DIR%memories\intention_memory.md" (
+    if not exist "%HERMES%\memories\MEMORY.md" (
+        copy /Y "%SCRIPT_DIR%memories\intention_memory.md" "%HERMES%\memories\MEMORY.md" >nul
+        echo [OK] PCB 意图识别 memory 已安装
+    ) else (
+        echo [OK] MEMORY.md 已存在，跳过
+    )
+)
+
 if not exist "%HERMES%\.env" (
     copy /Y "%SCRIPT_DIR%template.env" "%HERMES%\.env" >nul
     echo [!!] 请填写 API Key，正在打开配置文件...

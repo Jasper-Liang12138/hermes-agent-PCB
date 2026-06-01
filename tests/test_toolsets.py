@@ -148,6 +148,7 @@ class TestToolsetConsistency:
             "getSelectedElements",
             "GetSelectedElements",
             "deleteTracesById",
+            "generateFanoutParams",
             "route",
             "pcb_extract_bga",
             "drop_net",
