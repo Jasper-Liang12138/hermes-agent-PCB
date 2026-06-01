@@ -1556,6 +1556,23 @@ def test_bga_question_with_polite_phrase_stays_chat():
     assert decision.reason in {"chat_only", "default_chat"}
 
 
+def test_pcb_visible_content_strips_raw_board_leak():
+    raw = (
+        "**BGA 选择列表**：\n"
+        "- 请在列表中选择一个 BGA。?: 请问箭头指向的是什么？"
+        'T", ceramic_add_min_total_cavity_width: 0.1195, '
+        "ceramic_add_total_cavity_width_min_poly: 0.0024, "
+        'generation_options: "donut_rounded", '
+        "gerber_output_quality_strength: 100.0, "
+        "pad_to_pad_clearance: 0.051811"
+    )
+
+    clean, fields = WebSocketAdapter._sanitize_pcb_visible_content(raw)
+
+    assert clean == ""
+    assert fields == {}
+
+
 def test_stream_snapshot_with_cursor_replaces_instead_of_duplication():
     adapter = _make_adapter()
     buffers = {}
