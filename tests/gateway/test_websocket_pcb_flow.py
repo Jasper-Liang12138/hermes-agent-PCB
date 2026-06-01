@@ -297,7 +297,7 @@ def test_websocket_reroute_can_start_without_existing_selection(text):
     assert decision.bootstrap_get_project is False
 
 
-@pytest.mark.parametrize("text", ["#全局fanout", "#布线"])
+@pytest.mark.parametrize("text", ["#全局fanout", "#布线", "#布线，告诉我什么是BGA逃逸布线"])
 def test_websocket_hashtag_forces_global_fanout_skill(text):
     adapter = _make_adapter()
 
@@ -628,9 +628,11 @@ async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
     session_id = "sess-chat-1"
     project_id = "proj-chat-001"
     observed_auto_skill = []
+    observed_text = []
 
     async def handler(event):
         observed_auto_skill.append(event.auto_skill)
+        observed_text.append(event.text)
         return "这是普通聊天回复。"
 
     adapter.set_message_handler(handler)
@@ -648,6 +650,9 @@ async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
         await adapter.disconnect()
 
     assert observed_auto_skill == [None]
+    assert observed_text[0].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。")
+    assert "不要调用 PCB 工具" in observed_text[0]
+    assert observed_text[0].endswith("今天星期几")
 
 
 def test_websocket_chat_turn_uses_chat_mode_without_pcb_skills():
@@ -1253,7 +1258,9 @@ async def test_handle_user_message_chat_uses_chat_mode():
     assert seen["raw"]["options"]["route_mode"] == "chat"
     assert seen["raw"]["options"]["pcb_agent_loop"] is False
     assert seen["auto_skill"] is None
-    assert seen["text"] == "BGA 和 QFP 有什么区别？请简短回答。"
+    assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。")
+    assert "不要调用 PCB 工具" in seen["text"]
+    assert seen["text"].endswith("BGA 和 QFP 有什么区别？请简短回答。")
 
 
 @pytest.mark.asyncio
@@ -1428,6 +1435,9 @@ def test_short_pcb_commands_enter_fanout_flow(text):
         ("这个板子跑一下 BGA 扇出", "pcb"),
         ("对 U27 做 BGA fanout", "pcb"),
         ("获取当前版图并找出可布线 BGA", "pcb"),
+        ("我想做BGA逃逸布线，告诉我什么是BGA逃逸布线", "chat"),
+        ("告诉我什么是BGA逃逸布线", "chat"),
+        ("介绍一下 BGA 逃逸布线原理", "chat"),
         ("BGA 和 QFP 有什么区别？", "chat"),
         ("不要布线，只解释一下逃逸布线原理", "chat"),
         ("今天星期几？", "chat"),
