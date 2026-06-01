@@ -138,6 +138,158 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_tool_call_shim_extracts_xml_tool_call(agent):
+    agent.valid_tool_names = {"getProjectData"}
+    agent.tools = _make_tool_defs("getProjectData")
+
+    calls, cleaned = agent._extract_shim_tool_calls_from_text(
+        '<think>checking</think>\n<tool_call>{"name":"getProjectData","arguments":{}}</tool_call>'
+    )
+
+    assert cleaned == ""
+    assert len(calls) == 1
+    assert calls[0].function.name == "getProjectData"
+    assert calls[0].function.arguments == "{}"
+
+
+def test_tool_call_shim_ignores_unknown_tool(agent):
+    agent.valid_tool_names = {"getProjectData"}
+    agent.tools = _make_tool_defs("getProjectData")
+
+    calls, cleaned = agent._extract_shim_tool_calls_from_text(
+        '<tool_call>{"name":"notARealTool","arguments":{}}</tool_call>'
+    )
+
+    assert calls == []
+    assert cleaned == ""
+
+
+def test_tool_call_shim_converts_tool_history_to_text(agent):
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "getProjectData", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "(pcb_data)"},
+    ]
+
+    prepared = agent._prepare_tool_call_shim_messages(messages)
+
+    assert prepared[0] == {
+        "role": "assistant",
+        "content": '<tool_call>{"name": "getProjectData", "arguments": {}}</tool_call>',
+    }
+    assert prepared[1] == {
+        "role": "user",
+        "content": '<tool_response>\n{"tool_call_id": "call_1", "name": "", "content": "(pcb_data)"}\n</tool_response>',
+    }
+
+
+def test_pcb_tool_call_shim_forces_extract_after_project_data(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "getProjectData", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "getProjectData", "content": "(pcb_data)"},
+    ])
+
+    assert calls[0].function.name == "pcb_extract_bga"
+    assert json.loads(calls[0].function.arguments) == {"board_text": "__CACHED_PROJECT_DATA__"}
+
+
+def test_pcb_tool_call_shim_requires_pcb_loop_context_for_initial_project_data(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    assert agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "BGA 和 QFP 有什么区别？"},
+    ]) is None
+
+    calls = agent._pcb_tool_call_shim_override([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "帮我进行BGA逃逸布线"
+            ),
+        },
+    ])
+
+    assert calls[0].function.name == "getProjectData"
+    assert json.loads(calls[0].function.arguments) == {}
+
+
+def test_pcb_tool_call_shim_forces_generate_after_selection(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {
+            "role": "tool",
+            "name": "pcb_extract_bga",
+            "content": json.dumps({"selection": [{"label": "U22", "detail": "BGA-400"}]}, ensure_ascii=False),
+        },
+        {"role": "user", "content": "选择 U22，arc + 北科大"},
+    ])
+
+    assert calls[0].function.name == "generateFanoutParams"
+    assert json.loads(calls[0].function.arguments) == {"selectedBGA": "U22", "routerType": "arc"}
+
+
+@pytest.mark.parametrize(
+    ("text", "router_type"),
+    [
+        ("arc + RL", "rl_arc"),
+        ("135 + RL", "rl"),
+        ("135 + 北科大", "135"),
+        ("arc + 北科大", "arc"),
+    ],
+)
+def test_pcb_tool_call_shim_router_type_combinations(agent, text, router_type):
+    assert agent._shim_router_type_from_text(text) == router_type
+
+
+def test_pcb_tool_call_shim_forces_route_on_confirmed_fanout(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+    fanout = {
+        "selectedBGA": "U22",
+        "routerType": "arc",
+        "orderLines": [{"net": "N1", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+
+    calls = agent._pcb_tool_call_shim_override([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {"role": "tool", "name": "pcb_extract_bga", "content": "{}"},
+        {"role": "tool", "name": "generateFanoutParams", "content": json.dumps({"fanoutParams": fanout}, ensure_ascii=False)},
+        {"role": "user", "content": "确认"},
+    ])
+
+    assert calls[0].function.name == "route"
+    assert json.loads(json.loads(calls[0].function.arguments)["userData"]) == fanout
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (
@@ -3896,7 +4048,7 @@ class TestMemoryNudgeCounterPersistence:
         """Counters must exist on the agent after __init__."""
         with patch("run_agent.get_tool_definitions", return_value=[]):
             a = AIAgent(
-                model="test", api_key="test-key", provider="openrouter",
+                model="test", api_key="test-key", base_url="https://openrouter.ai/api/v1", provider="openrouter",
                 skip_context_files=True, skip_memory=True,
             )
         assert hasattr(a, "_turns_since_memory")

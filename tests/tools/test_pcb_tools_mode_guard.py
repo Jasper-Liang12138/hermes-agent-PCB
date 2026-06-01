@@ -120,6 +120,65 @@ def test_route_blocked_in_chat_mode():
     assert "被拒绝" in payload["report"]
 
 
+def test_generate_fanout_params_blocked_in_chat_mode():
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-chat-fanout"
+    transport.set_session_mode("sess-chat-fanout", "chat")
+
+    result = pcb_tools.generate_fanout_params_tool(selectedBGA="U27", routerType="arc")
+    payload = json.loads(result)
+
+    assert "error" in payload
+    assert "被拒绝" in payload["error"]
+
+
+def test_generate_fanout_params_uses_cached_project_data(monkeypatch, tmp_path):
+    from tools import pcb_bjut_router
+
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    session_id = "sess-pcb-fanout"
+    transport.current_session_id = session_id
+    transport.set_session_mode(session_id, "pcb")
+    transport.cache_project_data(
+        '(pcb_data (component (name "U27") (package "BGA-256")))',
+        session_id=session_id,
+    )
+    monkeypatch.setenv("ROUTER_WORK_DIR", str(tmp_path))
+
+    seen = {}
+
+    def fake_generate_fanout_params(**kwargs):
+        seen.update(kwargs)
+        return {
+            "selectedBGA": kwargs["selected_bga"],
+            "routerType": kwargs["router_type"],
+            "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        }
+
+    monkeypatch.setattr(pcb_bjut_router, "bjut_router_available", lambda router_type, work_dir: True)
+    monkeypatch.setattr(pcb_bjut_router, "generate_fanout_params", fake_generate_fanout_params)
+
+    result = pcb_tools.generate_fanout_params_tool(
+        selectedBGA="U27",
+        routerType="rl_135",
+        constraints={"LineWidth": "5", "LineSpacing": 0},
+        session_id=session_id,
+    )
+    payload = json.loads(result)
+
+    assert payload["fanoutParams"] == {
+        "selectedBGA": "U27",
+        "routerType": "rl_135",
+        "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 5.0, "LineSpacing": 3},
+    }
+    assert seen["project_data"] == '(pcb_data (component (name "U27") (package "BGA-256")))'
+    assert seen["selected_bga"] == "U27"
+    assert seen["router_type"] == "rl_135"
+    assert seen["work_dir"] == tmp_path.resolve()
+    assert seen["constraints"] == {"LineWidth": 5.0, "LineSpacing": 3}
+
+
 def test_route_requires_router_type_even_with_active_websocket_adapter(monkeypatch, tmp_path):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-route-local"

@@ -1880,6 +1880,342 @@ class AIAgent:
         content = re.sub(r'</?(?:think|thinking|reasoning|REASONING_SCRATCHPAD)>\s*', '', content, flags=re.IGNORECASE)
         return content
 
+    def _tool_call_shim_enabled(self) -> bool:
+        raw = os.getenv("HERMES_TOOL_CALL_SHIM", "").strip().lower()
+        if raw:
+            return raw in {"1", "true", "yes", "on"}
+        if os.getenv("HERMES_CTYUN_OMIT_TOOL_SCHEMAS", "1").lower() in {"0", "false", "no", "off"}:
+            return False
+        return "wishub-x5.ctyun.cn" in self._base_url_lower
+
+    def _tool_call_shim_system_message(self) -> Dict[str, str]:
+        tool_defs = []
+        for tool in self.tools or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(function, dict):
+                continue
+            tool_defs.append({
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {}),
+            })
+        return {
+            "role": "system",
+            "content": (
+                "/no_think\n"
+                "This endpoint does not support native OpenAI tools. You must emulate tool calls in text.\n"
+                "If a tool is needed, output ONLY one or more XML blocks exactly like:\n"
+                "<tool_call>{\"name\":\"toolName\",\"arguments\":{}}</tool_call>\n"
+                "Use valid JSON inside each block. Do not use Markdown. Do not explain before or after tool calls.\n"
+                "If no tool is needed, answer normally without any <tool_call> block.\n"
+                "Only call tools explicitly relevant to the user's request; ordinary chat, explanations, logs/config/package/debug questions, "
+                "cancel/no-op requests, and ambiguous follow-ups must not call tools.\n"
+                "Never call getProjectData for agent/frontend/config.ini/port/log/package/debug questions; those are support-chat, not PCB layout operations.\n"
+                "Use getProjectData only when the user asks to operate on the currently open PCB layout, such as BGA fanout/routing.\n"
+                "Use drop_net only when the user asks to reroute/delete/rebuild selected PCB traces.\n"
+                "For BGA fanout/routing: if there is no prior <tool_response> from getProjectData in the conversation, your next output MUST be exactly a getProjectData tool call.\n"
+                "After getProjectData returns board data, if pcb_extract_bga has not run yet, your next output MUST be exactly a pcb_extract_bga tool call with board_text=\"__CACHED_PROJECT_DATA__\".\n"
+                "Raw PCB board data inside <tool_response> is not for you to inspect or summarize; only pcb_extract_bga may extract BGA names, selections, pins, nets, or board summaries.\n"
+                "Do not output ##PCB_FIELDS## from getProjectData results. Output ##PCB_FIELDS## only after a pcb_extract_bga tool response provides selection data.\n"
+                "After a target BGA and routerType are both known, call generateFanoutParams before route. For generateFanoutParams, pass only selectedBGA, routerType, and constraints explicitly stated by the user; do not invent line width, spacing, layer, via, or clearance values.\n"
+                "If a prior generateFanoutParams <tool_response> contains fanoutParams and the current user asks to confirm/execute/start routing, your next output MUST be exactly a route tool call.\n"
+                "For route, set userData to the JSON string of the confirmed fanoutParams. Do not re-run getProjectData, pcb_extract_bga, or generateFanoutParams after fanoutParams are present unless the user asks to regenerate/change parameters.\n"
+                "Only call route after fanoutParams are present and the user confirms execution.\n"
+                "Never claim that a BGA was selected, never output selection/fanoutParams/routingResult, and never summarize routing progress unless the relevant tool response already exists.\n"
+                "Do not fabricate IDs, file paths, project IDs, pins, nets, or component names. If an argument is unknown, use an empty string or omit it.\n"
+                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False)}"
+            ),
+        }
+
+    def _prepare_tool_call_shim_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "tool":
+                payload = {
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "name": msg.get("name", ""),
+                    "content": msg.get("content", ""),
+                }
+                prepared.append({
+                    "role": "user",
+                    "content": f"<tool_response>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_response>",
+                })
+                continue
+
+            item = {key: value for key, value in msg.items() if key not in {"tool_calls", "tool_call_id"}}
+            tool_calls = msg.get("tool_calls")
+            if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+                content_parts = [str(item.get("content") or "").strip()]
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = function.get("name", "")
+                    raw_args = function.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            args = json.loads(raw_args)
+                        except Exception:
+                            args = {}
+                    elif isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        args = {}
+                    content_parts.append(
+                        "<tool_call>"
+                        + json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
+                        + "</tool_call>"
+                    )
+                item["content"] = "\n".join(part for part in content_parts if part)
+            prepared.append(item)
+        return prepared
+
+    def _extract_shim_tool_calls_from_text(self, content: str) -> tuple[list[Any], str]:
+        if not content or not self.tools:
+            return [], content or ""
+        valid_names = self.valid_tool_names or {
+            tool.get("function", {}).get("name")
+            for tool in self.tools
+            if isinstance(tool, dict)
+        }
+        tool_calls: list[Any] = []
+
+        def add_call(raw: str) -> None:
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return
+            if isinstance(parsed, dict) and isinstance(parsed.get("tool_call"), dict):
+                parsed = parsed["tool_call"]
+            if not isinstance(parsed, dict):
+                return
+            name = str(parsed.get("name") or parsed.get("tool") or "").strip()
+            arguments = parsed.get("arguments")
+            if arguments is None and isinstance(parsed.get("args"), dict):
+                arguments = parsed.get("args")
+            if not name or name not in valid_names:
+                return
+            if not isinstance(arguments, dict):
+                arguments = {}
+            call_id = self._deterministic_call_id(name, json.dumps(arguments, ensure_ascii=False), len(tool_calls))
+            tool_calls.append(SimpleNamespace(
+                id=call_id,
+                type="function",
+                function=SimpleNamespace(
+                    name=name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                ),
+            ))
+
+        block_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+        for match in block_pattern.finditer(content):
+            add_call(match.group(1))
+        cleaned = block_pattern.sub("", content)
+
+        if not tool_calls:
+            stripped = self._strip_think_blocks(content).strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                add_call(stripped)
+                cleaned = "" if tool_calls else content
+
+        return tool_calls, self._strip_think_blocks(cleaned).strip()
+
+    def _make_shim_tool_call(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+        arguments = arguments if isinstance(arguments, dict) else {}
+        args_json = json.dumps(arguments, ensure_ascii=False)
+        return SimpleNamespace(
+            id=self._deterministic_call_id(name, args_json, 0),
+            type="function",
+            function=SimpleNamespace(name=name, arguments=args_json),
+        )
+
+    @staticmethod
+    def _shim_msg_text(message: Dict[str, Any]) -> str:
+        content = message.get("content") if isinstance(message, dict) else ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if text is not None:
+                        parts.append(str(text))
+            return "\n".join(parts)
+        return str(content or "")
+
+    @staticmethod
+    def _shim_json_obj(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+
+    @classmethod
+    def _shim_extract_fanout_params(cls, content: Any) -> Optional[Dict[str, Any]]:
+        parsed = cls._shim_json_obj(content)
+        if isinstance(parsed, dict):
+            fanout = parsed.get("fanoutParams")
+            if isinstance(fanout, str):
+                fanout = cls._shim_json_obj(fanout)
+            if isinstance(fanout, dict):
+                return fanout
+            if {"orderLines", "selectedBGA", "routerType"} & set(parsed):
+                return parsed
+        return None
+
+    @staticmethod
+    def _shim_router_type_from_text(text: str) -> str:
+        lowered = (text or "").lower()
+        if re.search(r"\brl[_\s-]*arc\b", lowered):
+            return "rl_arc"
+        if re.search(r"\brl[_\s-]*135\b", lowered):
+            return "rl_135"
+        algorithm = ""
+        module = ""
+        if re.search(r"\barc\b|圆弧|弧形", lowered):
+            algorithm = "arc"
+        elif re.search(r"\b135\b|135\s*度|折角", lowered):
+            algorithm = "135"
+        if re.search(r"\brl\b", lowered):
+            module = "RL"
+        elif re.search(r"北科大|北科|bjut|bk", lowered):
+            module = "北科大"
+        if algorithm and module == "RL":
+            return "rl_arc" if algorithm == "arc" else "rl"
+        if algorithm and module == "北科大":
+            return algorithm
+        if re.search(r"\brl\b", lowered):
+            return "rl"
+        if algorithm:
+            return algorithm
+        return ""
+
+    @classmethod
+    def _shim_bga_from_extract_response(cls, content: Any) -> str:
+        parsed = cls._shim_json_obj(content)
+        if not isinstance(parsed, dict):
+            return ""
+        selection = parsed.get("selection")
+        if isinstance(selection, list) and len(selection) == 1:
+            item = selection[0]
+            if isinstance(item, dict):
+                return str(item.get("label") or item.get("name") or "").strip()
+            if isinstance(item, str):
+                return item.strip()
+        fanout_context = parsed.get("fanoutContext")
+        if isinstance(fanout_context, dict):
+            bga_list = fanout_context.get("bgaList") or fanout_context.get("bgas")
+            if isinstance(bga_list, list) and len(bga_list) == 1:
+                return str(bga_list[0]).strip()
+        return ""
+
+    def _pcb_tool_call_shim_override(self, messages: List[Dict[str, Any]]) -> Optional[list[Any]]:
+        valid_names = self.valid_tool_names or {
+            tool.get("function", {}).get("name")
+            for tool in self.tools or []
+            if isinstance(tool, dict)
+        }
+        required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+        if not required.issubset(valid_names):
+            return None
+
+        latest_user = ""
+        tool_name_by_id: dict[str, str] = {}
+        tool_responses: list[tuple[str, Any]] = []
+        assistant_tool_names: set[str] = set()
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "user":
+                latest_user = self._shim_msg_text(msg)
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = str(function.get("name") or "").strip()
+                    if name:
+                        assistant_tool_names.add(name)
+                        call_id = str(tc.get("id") or "")
+                        if call_id:
+                            tool_name_by_id[call_id] = name
+            if msg.get("role") == "tool":
+                name = str(msg.get("name") or tool_name_by_id.get(str(msg.get("tool_call_id") or ""), "")).strip()
+                if name:
+                    tool_responses.append((name, msg.get("content", "")))
+
+        response_names = {name for name, _ in tool_responses}
+        pcb_agent_loop_context = any(
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and (
+                "route_mode=pcb" in self._shim_msg_text(msg)
+                or "pcb_agent_loop" in self._shim_msg_text(msg)
+                or "PCB 业务流程由 Agent loop" in self._shim_msg_text(msg)
+                or "当前消息来自启云方 WebSocket PCB 客户端" in self._shim_msg_text(msg)
+            )
+            for msg in messages or []
+        )
+        has_pcb_tool_history = bool(
+            {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"} & (assistant_tool_names | response_names)
+        )
+        bga_flow_seen = (
+            has_pcb_tool_history
+            or (pcb_agent_loop_context and bool(re.search(r"BGA|fanout|逃逸|扇出|布线", latest_user or "", flags=re.IGNORECASE)))
+        )
+        if not bga_flow_seen:
+            return None
+        if not (pcb_agent_loop_context or has_pcb_tool_history):
+            return None
+        if not has_pcb_tool_history and re.search(
+            r"不要|别|先别|不用|无需|只解释|只讲|区别|是什么|什么意思|含义|原理|对比|比较",
+            latest_user or "",
+            flags=re.IGNORECASE,
+        ):
+            return None
+
+        last_fanout = None
+        last_extract_content = None
+        for name, content in tool_responses:
+            if name == "generateFanoutParams":
+                fanout = self._shim_extract_fanout_params(content)
+                if fanout:
+                    last_fanout = fanout
+            elif name == "pcb_extract_bga":
+                last_extract_content = content
+
+        is_confirm = bool(re.search(r"确认|执行|开始|继续|可以|ok\b|yes\b|go\b", latest_user or "", flags=re.IGNORECASE))
+        if last_fanout and is_confirm and not re.search(r"不|不要|取消|先别|修改|调整|change|edit", latest_user or "", flags=re.IGNORECASE):
+            return [self._make_shim_tool_call("route", {"userData": json.dumps(last_fanout, ensure_ascii=False)})]
+
+        if "getProjectData" not in response_names:
+            return [self._make_shim_tool_call("getProjectData", {})]
+
+        if "pcb_extract_bga" not in response_names:
+            return [self._make_shim_tool_call("pcb_extract_bga", {"board_text": "__CACHED_PROJECT_DATA__"})]
+
+        if not last_fanout:
+            router_type = self._shim_router_type_from_text(latest_user)
+            selected_match = re.search(r"\b([A-Za-z]{1,6}\d{1,5})\b", latest_user or "")
+            selected_bga = selected_match.group(1).upper() if selected_match else self._shim_bga_from_extract_response(last_extract_content)
+            if router_type and selected_bga:
+                return [self._make_shim_tool_call("generateFanoutParams", {
+                    "selectedBGA": selected_bga,
+                    "routerType": router_type,
+                })]
+
+        return None
+
     def _looks_like_codex_intermediate_ack(
         self,
         user_message: str,
@@ -6164,7 +6500,11 @@ class AIAgent:
                 "sessionId": self.session_id or "hermes",
                 "promptId": str(uuid.uuid4()),
             }
-        if self.tools and not self._should_omit_tool_schemas_for_endpoint():
+        if self.tools and self._tool_call_shim_enabled():
+            sanitized_messages = self._prepare_tool_call_shim_messages(sanitized_messages)
+            sanitized_messages.append(self._tool_call_shim_system_message())
+            api_kwargs["messages"] = sanitized_messages
+        elif self.tools and not self._should_omit_tool_schemas_for_endpoint():
             api_kwargs["tools"] = self.tools
 
         if self.max_tokens is not None:
@@ -9459,6 +9799,19 @@ class AIAgent:
                         assistant_message.content = "\n".join(parts)
                     else:
                         assistant_message.content = str(raw)
+
+                if self._tool_call_shim_enabled() and not getattr(assistant_message, "tool_calls", None):
+                    shim_calls, shim_content = self._extract_shim_tool_calls_from_text(assistant_message.content or "")
+                    if shim_calls:
+                        assistant_message.tool_calls = shim_calls
+                        assistant_message.content = shim_content or None
+                        finish_reason = "tool_calls"
+                if self._tool_call_shim_enabled():
+                    pcb_forced_calls = self._pcb_tool_call_shim_override(api_messages)
+                    if pcb_forced_calls:
+                        assistant_message.tool_calls = pcb_forced_calls
+                        assistant_message.content = None
+                        finish_reason = "tool_calls"
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
