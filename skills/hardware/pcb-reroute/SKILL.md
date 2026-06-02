@@ -106,5 +106,5 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
 - Do not call `reroute` if selected trace id count is 0 or greater than 40.
 - Do not call `reroute` if `deleteTracesById` fails.
 - `##PCB_FIELDS##` content must be valid JSON.
-- Do not expose internal `.kicad_pcb` file paths in visible text or `##PCB_FIELDS##`; only expose the txt/S-expression result path via `routedLayoutTxtFilePath`.
+- Do not expose internal board file paths in visible text or `##PCB_FIELDS##`; only expose the txt/S-expression result path via `routedLayoutTxtFilePath`.
 - Keep visible text short; large board data, patches, and DRC details belong in structured fields or output files.
