@@ -19,9 +19,48 @@ Usage:
 # ============================================================================
 import configparser as _cp, pathlib as _pl, os as _os
 
-_config_ini = _pl.Path(__file__).parent.parent / "config.ini"
+def _resolve_local_config_ini() -> _pl.Path:
+    env_path = _os.getenv("PCB_AGENT_CONFIG_INI", "").strip()
+    if env_path:
+        return _pl.Path(env_path)
+    module_root = _pl.Path(__file__).resolve().parent.parent
+    if module_root.name.lower() == "_internal":
+        delivery_root = module_root.parent
+        for candidate in (delivery_root / "config.ini", module_root / "config.ini"):
+            if candidate.exists():
+                return candidate
+    return module_root / "config.ini"
+
+
+def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None:
+    cfg = cfg or _cfg
+    if cfg.has_section("model"):
+        model_cfg = cfg["model"]
+        if model_cfg.get("api_key", "").strip():
+            _os.environ["OPENAI_API_KEY"] = model_cfg["api_key"].strip()
+        if model_cfg.get("base_url", "").strip():
+            _os.environ["OPENAI_BASE_URL"] = model_cfg["base_url"].strip()
+    if cfg.has_section("router"):
+        router_cfg = cfg["router"]
+        for cfg_key, env_key in {
+            "cmd": "ROUTER_CMD",
+            "work_dir": "ROUTER_WORK_DIR",
+            "arc_dir": "ROUTER_ARC_DIR",
+            "135_dir": "ROUTER_135_DIR",
+            "rl_root_dir": "ROUTER_RL_ROOT_DIR",
+            "rl_arc_dir": "ROUTER_RL_ARC_DIR",
+            "rl_135_dir": "ROUTER_RL_135_DIR",
+        }.items():
+            if router_cfg.get(cfg_key, "").strip():
+                _os.environ[env_key] = router_cfg[cfg_key].strip()
+    if cfg.has_section("model") and cfg["model"].get("board_data_use_file_path", "").strip():
+        _os.environ["BOARD_DATA_USE_FILE_PATH"] = cfg["model"]["board_data_use_file_path"].strip()
+
+
+_config_ini = _resolve_local_config_ini()
 _cfg = _cp.ConfigParser()
-_cfg.read(_config_ini, encoding="utf-8")
+_cfg.read(_config_ini, encoding="utf-8-sig")
+_apply_config_ini_env_overrides(_cfg)
 
 if _cfg.has_section("model"):
     _m = _cfg["model"]
@@ -185,6 +224,7 @@ from dotenv import load_dotenv  # backward-compat for tests that monkeypatch thi
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+_apply_config_ini_env_overrides(_cfg)
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -7858,6 +7898,7 @@ class GatewayRunner:
                 load_dotenv(_env_path, override=True, encoding="latin-1")
             except Exception:
                 pass
+            _apply_config_ini_env_overrides(_cfg)
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
