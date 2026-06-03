@@ -286,7 +286,7 @@ def test_websocket_reroute_short_command_works_in_pcb_context():
     assert decision.bootstrap_get_project is False
 
 
-@pytest.mark.parametrize("text", ["#拆线重布", "#reroute", "拆线重布"])
+@pytest.mark.parametrize("text", ["#reroute", "拆线重布"])
 def test_websocket_reroute_can_start_without_existing_selection(text):
     adapter = _make_adapter()
 
@@ -297,7 +297,7 @@ def test_websocket_reroute_can_start_without_existing_selection(text):
     assert decision.bootstrap_get_project is False
 
 
-@pytest.mark.parametrize("text", ["#全局fanout", "#布线", "#布线，告诉我什么是BGA逃逸布线"])
+@pytest.mark.parametrize("text", ["#逃逸布线", "#逃逸布线，告诉我什么是BGA逃逸布线"])
 def test_websocket_hashtag_forces_global_fanout_skill(text):
     adapter = _make_adapter()
 
@@ -309,14 +309,14 @@ def test_websocket_hashtag_forces_global_fanout_skill(text):
     assert decision.bootstrap_get_project is True
 
 
-def test_websocket_escape_routing_phrase_forces_global_fanout_skill():
+def test_websocket_escape_routing_phrase_without_hash_is_not_forced_command():
     adapter = _make_adapter()
 
     decision = adapter._decide_route("sess-force-escape-routing", "逃逸布线")
 
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_entry"
-    assert decision.reason == "forced_global_fanout"
+    assert decision.reason == "pcb_entry"
     assert decision.bootstrap_get_project is True
 
 
@@ -349,7 +349,7 @@ def test_websocket_cancel_and_reroute_phrase_switches_task():
         "routerType": "135",
     }
 
-    decision = adapter._decide_route(session_id, "取消当前，#拆线重布")
+    decision = adapter._decide_route(session_id, "取消当前，#reroute")
 
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_reroute_selected"

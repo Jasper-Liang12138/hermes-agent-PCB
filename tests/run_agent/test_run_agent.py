@@ -247,6 +247,12 @@ def test_pcb_tool_call_shim_allows_explicit_no_operation_chat(agent):
     assert calls is None
 
 
+def test_pcb_tool_call_shim_tag_commands_are_not_temporary_chat(agent):
+    assert agent._shim_is_temporary_pcb_chat("#逃逸布线") is False
+    assert agent._shim_is_temporary_pcb_chat("#reroute") is False
+    assert agent._shim_is_temporary_pcb_chat("#布线 是什么意思") is True
+
+
 def test_pcb_tool_call_shim_keeps_negative_router_preference_as_action(agent):
     agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
     agent.tools = _make_tool_defs(*agent.valid_tool_names)

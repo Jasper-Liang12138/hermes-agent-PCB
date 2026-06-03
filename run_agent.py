@@ -2220,7 +2220,7 @@ class AIAgent:
     def _shim_is_temporary_pcb_chat(text: str) -> bool:
         if not text:
             return False
-        if re.search(r"(?:#|＃)\s*(?:全局\s*fanout|布线|拆线\s*重布|reroute)", text, flags=re.IGNORECASE):
+        if re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|reroute)", text, flags=re.IGNORECASE):
             return False
         explicit_pcb_action = bool(
             re.search(r"BGA|fanout|逃逸|扇出|布线|走线|route|routing|reroute", text, flags=re.IGNORECASE)
