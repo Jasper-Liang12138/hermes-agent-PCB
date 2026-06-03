@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
@@ -400,17 +401,70 @@ def _is_signal_layer(kind: str, name: str) -> bool:
     return any(token in name_norm for token in ("top", "bottom", "sig", "art"))
 
 
-def _extract_rule_bga_selection(board_text: str) -> list[dict[str, str]]:
-    text_fallback = _extract_text_bga_selection(board_text)
-    if not _service:
-        return text_fallback
+def _extract_bga_components_json_with_script(board_text: str) -> dict[str, Any]:
+    from extract_bga_components import BGA_PIN_THRESHOLD, extract_bga_components
+
+    with tempfile.TemporaryDirectory(prefix="pcb_extract_bga_") as tmp_dir:
+        input_path = Path(tmp_dir) / "board.txt"
+        output_path = Path(tmp_dir) / "bga_components.json"
+        input_path.write_text(board_text or "", encoding="utf-8")
+        components = extract_bga_components(input_path)
+        result = {
+            "source": str(input_path),
+            "match_rule": (
+                "component has DFA_DEV_CLASS=BGA, and all U components over "
+                f"{BGA_PIN_THRESHOLD} pins are included"
+            ),
+            "count": len(components),
+            "components": components,
+        }
+        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def _component_detail_from_script(component: dict[str, Any]) -> str:
+    package = str(component.get("footprint") or component.get("part") or "").strip()
+    pin_count = component.get("pincount")
     try:
-        bga_list = _service.extract_bga_from_txt(qiyun_board_text=board_text)
+        pin_count = int(pin_count) if pin_count is not None else None
+    except Exception:
+        pin_count = None
+    if package and pin_count is not None:
+        return f"{package} ({pin_count} pins)"
+    if package:
+        return package
+    if pin_count is not None:
+        return f"{pin_count} pins"
+    reasons = component.get("match_reasons")
+    if isinstance(reasons, list) and reasons:
+        return ", ".join(str(reason) for reason in reasons if str(reason).strip())
+    return ""
+
+
+def _selection_from_bga_components_json(data: dict[str, Any]) -> list[dict[str, str]]:
+    selection: list[dict[str, str]] = []
+    seen: set[str] = set()
+    components = data.get("components") if isinstance(data, dict) else []
+    if not isinstance(components, list):
+        return []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        refdes = str(component.get("refdes") or "").strip()
+        if not refdes or refdes in seen:
+            continue
+        selection.append({"label": refdes, "detail": _component_detail_from_script(component)})
+        seen.add(refdes)
+    return selection
+
+
+def _extract_rule_bga_selection(board_text: str) -> list[dict[str, str]]:
+    try:
+        data = _extract_bga_components_json_with_script(board_text)
     except Exception as exc:
-        logger.warning("Rule-based BGA fallback failed: %s", exc)
-        return text_fallback
-    selection = [entry.to_dict() for entry in bga_list]
-    return selection or text_fallback
+        logger.warning("Script-based BGA extraction failed: %s", exc)
+        return []
+    return _selection_from_bga_components_json(data)
 
 
 def _extract_text_bga_selection(board_text: str) -> list[dict[str, str]]:
@@ -806,10 +860,7 @@ def _normalize_board_analysis(
     fallback_summary = _build_fallback_board_summary(parser_hints)
     fallback_fanout = _build_fallback_fanout_context(parser_hints)
 
-    normalized_selection = _merge_selection(
-        _normalize_selection(analysis.get("selection")),
-        rule_selection,
-    )
+    normalized_selection = [dict(item) for item in rule_selection if item.get("label")]
 
     raw_board_summary = analysis.get("boardSummary") if isinstance(analysis.get("boardSummary"), dict) else {}
     raw_net_summary = raw_board_summary.get("netSummary") if isinstance(raw_board_summary.get("netSummary"), dict) else {}
