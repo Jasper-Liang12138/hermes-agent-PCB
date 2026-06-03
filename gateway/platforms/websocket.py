@@ -149,6 +149,10 @@ _FORCE_GLOBAL_FANOUT_TAG_RE = re.compile(
     r"(?:#|＃)\s*(?:全局\s*fanout|布线)(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
+_FORCE_GLOBAL_FANOUT_COMMAND_RE = re.compile(
+    r"^\s*(?:BGA\s*)?(?:全局\s*fanout|逃逸\s*布线)\s*$",
+    re.IGNORECASE,
+)
 _FORCE_REROUTE_TAG_RE = re.compile(
     r"(?:#|＃)\s*(?:拆线\s*重布|reroute)(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
@@ -179,7 +183,6 @@ _ROUTER_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 _CONFIRM_RE = re.compile(r"(确认|继续|执行|开始布线|开始|go|yes|ok)", re.IGNORECASE)
-_CANCEL_RE = re.compile(r"(取消|退出|中止|停止|cancel|abort|exit)", re.IGNORECASE)
 _CHAT_ONLY_RE = re.compile(
     r"(不要.*(布线|route|getprojectdata|getselectedelements)"
     r"|只聊|闲聊|你好|您好|hello|hi|解释|介绍|笑话|今天星期几|区别|什么是|是什么|什么意思|含义|原理|对比|比较|优缺点|讲讲|聊聊|科普|简短回答|简要说明)",
@@ -200,6 +203,19 @@ _STREAM_CURSOR_RE = re.compile(r"(?:\s?▉)$")
 _ROUTE_INTENT_LABEL_RE = re.compile(
     r"\b(chat|pcb_entry|pcb_followup|pcb_select_target|pcb_confirm_route|"
     r"pcb_modify_params|pcb_reroute_selected|cancel|unclear)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_CANCEL_FLOW_RE = re.compile(
+    r"^\s*(?:取消|退出|中止|停止|cancel|abort|exit)\s*$|"
+    r"(?:取消|退出|中止|停止|cancel|abort|exit).{0,12}(?:当前|这个|本次)?\s*"
+    r"(?:PCB|BGA|fanout|route|routing|reroute|布线|逃逸|扇出|拆线重布|流程)",
+    re.IGNORECASE,
+)
+_IMPORT_LINES_REJECTED = "__pcb_import_lines_rejected__"
+_IMPORT_REJECT_TEXT_RE = re.compile(
+    r"(用户|前端|人工|手动)?.{0,8}(拒绝|取消|放弃|跳过|不导入|不要导入|declin|reject|cancel|skip).{0,12}"
+    r"(导入|import|importLines|布线)?|"
+    r"(导入|import|importLines).{0,12}(拒绝|取消|放弃|跳过|declin|reject|cancel|skip)",
     re.IGNORECASE,
 )
 _EXPLICIT_NO_OPERATION_RE = re.compile(
@@ -1409,6 +1425,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         import_status = ""
         if fields.get("importLinesFilePath") or fields.get("routingResult"):
             import_status = await self._import_fanout_result(session_id, route_params, fields)
+        if import_status == _IMPORT_LINES_REJECTED:
+            self._reset_flow(session_id)
+            self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
+            await self.send(
+                chat_id=session_id,
+                content="已取消导入布线。",
+                metadata={"stream_is_final": True},
+            )
+            return True
         if fields.get("report"):
             visible = str(fields.get("report") or "").strip() or visible
         if fields.get("routingResult"):
@@ -1497,6 +1522,8 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _format_import_lines_status(result: Any) -> str:
+        if WebSocketAdapter._looks_like_import_rejected(result):
+            return _IMPORT_LINES_REJECTED
         parsed = result
         if isinstance(result, str):
             text = result.strip()
@@ -1519,6 +1546,43 @@ class WebSocketAdapter(BasePlatformAdapter):
         if parsed is True:
             return "EDA 导入完成。"
         return f"EDA 导入结果：{str(parsed)[:240]}"
+
+    @staticmethod
+    def _looks_like_import_rejected(result: Any) -> bool:
+        if isinstance(result, str):
+            text = result.strip()
+            if not text:
+                return False
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return bool(_IMPORT_REJECT_TEXT_RE.search(text))
+            return WebSocketAdapter._looks_like_import_rejected(parsed)
+        if isinstance(result, dict):
+            explicit_keys = (
+                "cancelled",
+                "canceled",
+                "rejected",
+                "declined",
+                "skipped",
+                "userCancelled",
+                "userCanceled",
+                "userRejected",
+                "userDeclined",
+            )
+            for key in explicit_keys:
+                if result.get(key) is True:
+                    return True
+            status = " ".join(
+                str(result.get(key) or "")
+                for key in ("status", "message", "error", "reason", "code", "result")
+            )
+            if status and _IMPORT_REJECT_TEXT_RE.search(status):
+                return True
+            nested = result.get("data") or result.get("body")
+            if isinstance(nested, (dict, str)):
+                return WebSocketAdapter._looks_like_import_rejected(nested)
+        return False
 
     @staticmethod
     def _reroute_drc_passed(fields: Dict[str, Any]) -> bool:
@@ -2233,6 +2297,14 @@ class WebSocketAdapter(BasePlatformAdapter):
             (_PCB_ACTION_RE.search(text) and _PCB_DOMAIN_RE.search(text))
             or _SELECTION_RE.search(text)
         )
+
+    @staticmethod
+    def _is_forced_global_fanout_command(text: str) -> bool:
+        return bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text) or _FORCE_GLOBAL_FANOUT_COMMAND_RE.search(text or ""))
+
+    @staticmethod
+    def _is_explicit_cancel_flow(text: str) -> bool:
+        return bool(_EXPLICIT_CANCEL_FLOW_RE.search(text or ""))
 
     @staticmethod
     def _is_pcb_concept_question_without_execution(text: str) -> bool:
@@ -2992,14 +3064,14 @@ class WebSocketAdapter(BasePlatformAdapter):
         mode = self._session_mode(session_id)
         route_intent = self._coerce_route_intent(llm_intent)
         in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
-        forced_global_fanout = bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text))
+        forced_global_fanout = self._is_forced_global_fanout_command(text)
         forced_reroute = bool(_FORCE_REROUTE_TAG_RE.search(text))
         clear_reroute = bool(
             _REROUTE_RE.search(text)
             and (_PCB_DOMAIN_RE.search(text) or in_pcb_context or _REROUTE_SHORT_COMMAND_RE.search(text))
         )
 
-        if _CANCEL_RE.search(text) and not (forced_global_fanout or forced_reroute or clear_reroute):
+        if self._is_explicit_cancel_flow(text) and not (forced_global_fanout or forced_reroute or clear_reroute):
             return _INTENT_CANCEL
         if forced_reroute:
             return _INTENT_PCB_REROUTE_SELECTED
@@ -3136,7 +3208,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 bootstrap_get_project=False,
             )
 
-        if validated_intent == _INTENT_PCB_ENTRY and _FORCE_GLOBAL_FANOUT_TAG_RE.search(text):
+        if validated_intent == _INTENT_PCB_ENTRY and self._is_forced_global_fanout_command(text):
             self._reset_flow(session_id)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             return _RouteDecision(
@@ -3200,6 +3272,21 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
 
         if flow_state == _FLOW_WAIT_ROUTER_TYPE:
+            selected_label = self._extract_selected_label(session_id, text)
+            if selected_label:
+                self._session_selected_targets[session_id] = selected_label
+                self._session_fanout_params.pop(session_id, None)
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                complete_choice = self._extract_complete_router_choice(session_id, text)
+                if complete_choice:
+                    self._session_router_types[session_id] = complete_choice
+                    return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="router_type_step", intent=_INTENT_PCB_FOLLOWUP)
+                return _RouteDecision(
+                    mode=_ROUTE_MODE_PCB,
+                    immediate_reply=self._router_type_prompt(session_id),
+                    reason="reselect_wait_router_type",
+                    intent=_INTENT_PCB_SELECT_TARGET,
+                )
             if router_type:
                 self._session_router_types[session_id] = router_type
                 self._set_session_mode(session_id, _ROUTE_MODE_PCB)
@@ -3233,7 +3320,17 @@ class WebSocketAdapter(BasePlatformAdapter):
             selected_label = self._extract_selected_label(session_id, text)
             if selected_label:
                 self._session_selected_targets[session_id] = selected_label
-                return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="reselect_before_confirm", intent=_INTENT_PCB_SELECT_TARGET)
+                self._session_fanout_params.pop(session_id, None)
+                self._session_router_types.pop(session_id, None)
+                self._session_route_algorithms.pop(session_id, None)
+                self._session_fanout_modules.pop(session_id, None)
+                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+                return _RouteDecision(
+                    mode=_ROUTE_MODE_PCB,
+                    immediate_reply=self._router_type_prompt(session_id),
+                    reason="reselect_before_confirm",
+                    intent=_INTENT_PCB_SELECT_TARGET,
+                )
             return _RouteDecision(
                 mode=_ROUTE_MODE_PCB,
                 immediate_reply="请回复“确认”执行布线，或回复“取消”退出。",

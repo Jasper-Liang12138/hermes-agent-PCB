@@ -15,7 +15,7 @@ metadata:
 
 ## Goal
 
-Use this skill when the user asks to rip up selected PCB traces and reroute them locally. The deletion target is never inferred from free-form user text. The trace ids must come from the PCB frontend selection.
+Use this skill when the user asks to rip up selected PCB traces and reroute them locally. Prefer trace ids from the PCB frontend selection. If the user explicitly names net targets such as `net13` or `NET_A1`, pass the original text to `drop_net` so those names can seed `selectedNets`.
 
 This skill is separate from `hardware/pcb-intelligence`:
 - BGA fanout / full escape routing uses `route` with `routerType` equal to `arc` or `135`.
@@ -53,7 +53,8 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
    - `userText` is the original user request.
    - `projectID` comes from the incoming message `projectid` field if available.
    - `drop_net` obtains selected trace ids from `getSelectedElements` with `PFindType="TRACES"`.
-   - `drop_net` rejects an empty selection.
+   - If no trace ids are selected but the user explicitly named nets, `drop_net` can proceed with `selectedNets` and refreshed project data.
+   - `drop_net` rejects an empty selection only when no explicit net names are present.
    - `drop_net` rejects selections with more than 40 ids and ends the skill.
    - `drop_net` calls `deleteTracesById` only when the selected id count is between 1 and 40.
    - `drop_net` calls `getProjectData` after successful deletion to refresh board data.
@@ -66,7 +67,7 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
 
 ## Failure Handling
 
-- If no selected traces are returned, tell the user to box-select the traces in the PCB frontend first.
+- If no selected traces are returned and the user did not explicitly name nets, tell the user to box-select the traces in the PCB frontend first.
 - If more than 40 traces are selected, tell the user to reduce the selection and rerun.
 - If `deleteTracesById` fails, report the delete result and stop.
 - If `reroute` returns `checkReport.passed=false`, include the explanation and the returned file path if present.
@@ -100,7 +101,7 @@ Frontend tools are called by `drop_net`; do not call them manually unless explic
 
 ## Constraints
 
-- Do not infer deletion targets from net names in user text.
+- Do not invent deletion targets. Only use net names that the user explicitly wrote, or trace ids returned by the frontend selection.
 - Do not call `route`.
 - Do not ask the user to choose `arc` or `135`; those are BGA fanout routers, not this local reroute flow.
 - Do not call `reroute` if selected trace id count is 0 or greater than 40.

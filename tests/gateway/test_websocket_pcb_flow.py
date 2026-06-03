@@ -309,6 +309,17 @@ def test_websocket_hashtag_forces_global_fanout_skill(text):
     assert decision.bootstrap_get_project is True
 
 
+def test_websocket_escape_routing_phrase_forces_global_fanout_skill():
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-force-escape-routing", "逃逸布线")
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_entry"
+    assert decision.reason == "forced_global_fanout"
+    assert decision.bootstrap_get_project is True
+
+
 def test_websocket_reroute_interrupts_pending_fanout_confirmation():
     adapter = _make_adapter()
     session_id = "sess-reroute-interrupt"
@@ -347,6 +358,25 @@ def test_websocket_cancel_and_reroute_phrase_switches_task():
     assert session_id not in adapter._session_fanout_params
 
 
+def test_websocket_natural_language_task_switch_resets_fanout_flow():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-switch-natural"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+    }
+
+    decision = adapter._decide_route(session_id, "先不做 BGA 了，改成拆线重布")
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.reason == "pcb_reroute_selected"
+    assert adapter._session_flow_states[session_id] == "idle"
+    assert session_id not in adapter._session_fanout_params
+
+
 def test_websocket_temporary_chat_preserves_pcb_flow_state():
     adapter = _make_adapter()
     session_id = "sess-temp-chat"
@@ -364,6 +394,66 @@ def test_websocket_temporary_chat_preserves_pcb_flow_state():
     assert followup_decision.mode == "pcb"
     assert followup_decision.reason == "router_type_step"
     assert followup_decision.intent == "pcb_followup"
+
+
+def test_websocket_temporary_chat_preserves_wait_confirm_flow_state():
+    adapter = _make_adapter()
+    session_id = "sess-temp-chat-confirm"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+    }
+
+    chat_decision = adapter._decide_route(session_id, "这个 RL 是什么意思？")
+
+    assert chat_decision.mode == "chat"
+    assert chat_decision.reason == "temporary_chat"
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U22"
+
+
+def test_websocket_cancel_requires_explicit_flow_cancel_phrase():
+    adapter = _make_adapter()
+    session_id = "sess-cancel-guard"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_router_type")
+
+    chat_decision = adapter._decide_route(session_id, "这个停止条件是什么意思？")
+
+    assert chat_decision.mode == "chat"
+    assert chat_decision.reason == "temporary_chat"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+    cancel_decision = adapter._decide_route(session_id, "取消当前布线流程")
+
+    assert cancel_decision.mode == "chat"
+    assert cancel_decision.reason == "cancel_flow"
+    assert cancel_decision.intent == "cancel"
+    assert adapter._session_flow_states[session_id] == "idle"
+
+
+def test_websocket_natural_language_bga_reselect_invalidates_fanout_params():
+    adapter = _make_adapter()
+    session_id = "sess-bga-reselect"
+    adapter._session_selection_labels[session_id] = ("U22", "U23")
+    adapter._session_selected_targets[session_id] = "U22"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+    }
+
+    decision = adapter._decide_route(session_id, "目标 BGA 改成 U23")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "reselect_before_confirm"
+    assert decision.immediate_reply
+    assert adapter._session_selected_targets[session_id] == "U23"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert session_id not in adapter._session_fanout_params
 
 
 def test_websocket_explicit_reroute_overrides_bad_llm_chat_intent():
@@ -1392,6 +1482,52 @@ async def test_import_fanout_result_calls_import_lines():
     assert "导入完成" in status
 
 
+@pytest.mark.asyncio
+async def test_cached_fanout_route_suppresses_report_when_import_is_rejected(monkeypatch):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-import-rejected"
+    adapter._connections[session_id] = (ws, "proj-import-rejected")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+        "orderLines": [{"net": "net13", "layer": "Top", "order": 1}],
+    }
+    route_result = {
+        "importLinesFilePath": r"F:\router_work\line.out",
+        "report": "布线连通率: 100%",
+        "routingResult": r"F:\router_work\line.out",
+    }
+
+    from tools import pcb_tools
+
+    monkeypatch.setattr(
+        pcb_tools,
+        "route_bga",
+        lambda userData, session_id=None: json.dumps(route_result, ensure_ascii=False),
+    )
+
+    task = asyncio.create_task(adapter._run_cached_fanout_route(session_id))
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if any(item.get("type") == "tool-calls" for item in ws.sent):
+            break
+
+    sent = next(item for item in ws.sent if item["type"] == "tool-calls")
+    assert sent["body"]["content"]["name"] == "importLines"
+
+    adapter._resolve_tool_result(
+        json.loads(_tool_result(sent["body"]["content"]["id"], {"cancelled": True, "message": "用户取消导入"}))
+    )
+    assert await task is True
+
+    final = ws.sent[-1]
+    assert final["type"] == "message"
+    assert final["body"]["content"] == "已取消导入布线。"
+    assert "布线连通率" not in final["body"]["content"]
+    assert "##PCB_FIELDS##" not in final["body"]["content"]
+
+
 def test_rule_validation_rejects_llm_chat_for_strong_pcb_request():
     adapter = _make_adapter()
 
@@ -1423,7 +1559,7 @@ def test_short_pcb_commands_enter_fanout_flow(text):
 
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_entry"
-    assert decision.reason == "pcb_entry"
+    assert decision.reason in {"pcb_entry", "forced_global_fanout"}
     assert decision.bootstrap_get_project is True
 
 
