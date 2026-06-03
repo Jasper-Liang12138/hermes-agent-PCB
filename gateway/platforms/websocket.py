@@ -146,15 +146,11 @@ _REROUTE_RE = re.compile(
     re.IGNORECASE,
 )
 _FORCE_GLOBAL_FANOUT_TAG_RE = re.compile(
-    r"(?:#|＃)\s*(?:全局\s*fanout|布线)(?=$|[\s,，。；;:：])",
-    re.IGNORECASE,
-)
-_FORCE_GLOBAL_FANOUT_COMMAND_RE = re.compile(
-    r"^\s*(?:BGA\s*)?(?:全局\s*fanout|逃逸\s*布线)\s*$",
+    r"(?:#|＃)\s*逃逸\s*布线(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
 _FORCE_REROUTE_TAG_RE = re.compile(
-    r"(?:#|＃)\s*(?:拆线\s*重布|reroute)(?=$|[\s,，。；;:：])",
+    r"(?:#|＃)\s*reroute(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
 _REROUTE_SHORT_COMMAND_RE = re.compile(
@@ -2300,7 +2296,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_forced_global_fanout_command(text: str) -> bool:
-        return bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text) or _FORCE_GLOBAL_FANOUT_COMMAND_RE.search(text or ""))
+        return bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text or ""))
 
     @staticmethod
     def _is_explicit_cancel_flow(text: str) -> bool:
