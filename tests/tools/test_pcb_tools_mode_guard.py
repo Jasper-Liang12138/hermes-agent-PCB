@@ -554,6 +554,37 @@ def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
     assert cached["localContext"]["source"] == "getSelectedElements/deleteTracesById/getProjectData"
 
 
+def test_drop_net_uses_explicit_user_text_nets_when_no_traces_selected(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-text-nets"
+    transport.set_session_mode("sess-pcb-drop-text-nets", "pcb")
+    calls = []
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        calls.append((tool_name, arguments, timeout, session_id))
+        if tool_name == "getSelectedElements":
+            return {"ids": []}
+        if tool_name == "getProjectData":
+            return "(pcb before text-net reroute)"
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.drop_net("请把 net13、net17 拆线后重布", projectID="proj1")
+    payload = json.loads(result)
+
+    assert calls == [
+        ("getSelectedElements", {"PFindType": "TRACES"}, 30.0, "sess-pcb-drop-text-nets"),
+        ("getProjectData", {}, 30.0, "sess-pcb-drop-text-nets"),
+    ]
+    assert payload["selectedNets"] == ["net13", "net17"]
+    assert payload["selectedTraceIds"] == []
+    assert payload["droppedBoardData"] == "(pcb before text-net reroute)"
+    cached = transport.get_cached_reroute_context("sess-pcb-drop-text-nets")
+    assert cached["selectedNets"] == ["net13", "net17"]
+    assert cached["localContext"]["source"] == "userText/getProjectData"
+
+
 def test_drop_net_rejects_too_many_selected_traces(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-many"

@@ -2019,6 +2019,7 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
     Rip up currently selected traces and cache the post-delete board for reroute.
 
     Flow: getSelectedElements(PFindType=TRACES) -> deleteTracesById -> getProjectData.
+    If no frontend trace ids are selected, explicit net names in userText can seed selectedNets.
     """
     session_id = _transport.resolve_session_id(session_id)
     if not _transport.is_pcb_mode(session_id):
@@ -2027,6 +2028,7 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
         return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": msg}, ensure_ascii=False)
 
     try:
+        selected_nets = extract_reroute_nets(userText)
         selected_result = _transport.call_tool_sync(
             tool_name="getSelectedElements",
             arguments={"PFindType": "TRACES"},
@@ -2035,6 +2037,28 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
         )
         selected_trace_ids = _normalize_id_list(selected_result)
         if not selected_trace_ids:
+            if selected_nets:
+                dropped_board_data = get_project_data(session_id=session_id)
+                original_board_path = _extract_board_file_path_from_text(userText)
+                payload = {
+                    "selectedNets": selected_nets,
+                    "selectedTraceIds": [],
+                    "dropResult": {"selectedResult": selected_result, "deleteResult": None},
+                    "deleteResult": None,
+                    "droppedBoardData": dropped_board_data,
+                    "droppedBoardDataFilePath": "",
+                    "originalBoardDataFilePath": original_board_path,
+                    "droppedObjects": [{"net": net, "type": "net", "deleted": False} for net in selected_nets],
+                    "localContext": {
+                        "source": "userText/getProjectData",
+                        "selectionCount": 0,
+                        "selectedNetCount": len(selected_nets),
+                        "PFindType": "TRACES",
+                        "projectID": projectID,
+                    },
+                }
+                _transport.cache_reroute_context(payload, session_id=session_id)
+                return json.dumps(payload, ensure_ascii=False)
             return json.dumps(
                 {
                     "selectedNets": [],
@@ -2075,7 +2099,7 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
         dropped_board_data = get_project_data(session_id=session_id)
         original_board_path = _extract_board_file_path_from_text(userText)
         payload = {
-            "selectedNets": [],
+            "selectedNets": selected_nets,
             "selectedTraceIds": selected_trace_ids,
             "dropResult": {"selectedResult": selected_result, "deleteResult": delete_result},
             "deleteResult": delete_result,
@@ -2086,6 +2110,7 @@ def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = Non
             "localContext": {
                 "source": "getSelectedElements/deleteTracesById/getProjectData",
                 "selectionCount": len(selected_trace_ids),
+                "selectedNetCount": len(selected_nets),
                 "PFindType": "TRACES",
                 "projectID": projectID,
             },
@@ -2105,7 +2130,8 @@ registry.register(
         "description": (
             "Use the frontend selection to rip up traces for local reroute. "
             "Calls getSelectedElements(PFindType=TRACES), rejects selections over 40 ids, "
-            "then calls deleteTracesById and refreshes getProjectData."
+            "then calls deleteTracesById and refreshes getProjectData. "
+            "If no trace ids are selected, explicit net names in userText can be used as selectedNets."
         ),
         "parameters": {
             "type": "object",
