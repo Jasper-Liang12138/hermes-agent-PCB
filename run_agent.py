@@ -2106,22 +2106,211 @@ class AIAgent:
 
     @classmethod
     def _shim_bga_from_extract_response(cls, content: Any) -> str:
+        candidates = cls._shim_bga_candidates_from_extract_response(content)
+        return candidates[0] if len(candidates) == 1 else ""
+
+    @classmethod
+    def _shim_bga_candidates_from_extract_response(cls, content: Any) -> list[str]:
         parsed = cls._shim_json_obj(content)
         if not isinstance(parsed, dict):
-            return ""
+            return []
+        candidates: list[str] = []
+
+        def add_candidate(value: Any) -> None:
+            text = str(value or "").strip()
+            if text and text.upper() not in {item.upper() for item in candidates}:
+                candidates.append(text)
+
         selection = parsed.get("selection")
-        if isinstance(selection, list) and len(selection) == 1:
-            item = selection[0]
-            if isinstance(item, dict):
-                return str(item.get("label") or item.get("name") or "").strip()
-            if isinstance(item, str):
-                return item.strip()
+        if isinstance(selection, list):
+            for item in selection:
+                label = ""
+                if isinstance(item, dict):
+                    label = str(item.get("label") or item.get("name") or "").strip()
+                elif isinstance(item, str):
+                    label = item.strip()
+                add_candidate(label)
+        components = parsed.get("components")
+        if isinstance(components, list):
+            for item in components:
+                if isinstance(item, dict):
+                    add_candidate(item.get("refdes") or item.get("label") or item.get("name"))
         fanout_context = parsed.get("fanoutContext")
         if isinstance(fanout_context, dict):
             bga_list = fanout_context.get("bgaList") or fanout_context.get("bgas")
-            if isinstance(bga_list, list) and len(bga_list) == 1:
-                return str(bga_list[0]).strip()
-        return ""
+            if isinstance(bga_list, list):
+                for item in bga_list:
+                    add_candidate(item)
+        return candidates
+
+    @classmethod
+    def _shim_extract_pcb_fields_from_bga_response(cls, content: Any) -> Dict[str, Any]:
+        parsed = cls._shim_json_obj(content)
+        if not isinstance(parsed, dict):
+            return {}
+        fields: Dict[str, Any] = {}
+        for key in ("selection", "boardSummary", "fanoutContext"):
+            if key in parsed:
+                fields[key] = parsed[key]
+        return fields
+
+    @classmethod
+    def _shim_wait_for_fanout_choice_content(cls, content: Any) -> str:
+        fields = cls._shim_extract_pcb_fields_from_bga_response(content)
+        selection = fields.get("selection")
+        label = ""
+        if isinstance(selection, list) and len(selection) == 1:
+            item = selection[0]
+            if isinstance(item, dict):
+                label = str(item.get("label") or item.get("name") or "").strip()
+            if isinstance(item, str):
+                label = item.strip()
+
+        if label:
+            prompt = (
+                f"已识别到目标 BGA：{label}。\n\n"
+                "请选择走线算法：`arc` 或 `135`；并选择层分配和逃逸顺序生成模块：`RL` 或 `北科大`。"
+            )
+        else:
+            prompt = (
+                "已识别到候选 BGA。\n\n"
+                "请选择目标 BGA、走线算法（`arc` 或 `135`），以及层分配和逃逸顺序生成模块（`RL` 或 `北科大`）。"
+            )
+        if fields:
+            return (
+                f"{prompt}\n\n"
+                "##PCB_FIELDS##\n"
+                f"{json.dumps(fields, ensure_ascii=False)}\n"
+                "##PCB_FIELDS_END##"
+            )
+        return prompt
+
+    @staticmethod
+    def _shim_tool_call_name_args(tool_call: Any) -> tuple[str, Dict[str, Any]]:
+        if isinstance(tool_call, dict):
+            function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        else:
+            function = getattr(tool_call, "function", None)
+        if isinstance(function, dict):
+            name = str(function.get("name") or "").strip()
+            raw_args = function.get("arguments", {})
+        else:
+            name = str(getattr(function, "name", "") or "").strip()
+            raw_args = getattr(function, "arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+        return name, args
+
+    def _pcb_tool_call_shim_block_invalid_model_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_calls: Any,
+    ) -> Optional[str]:
+        valid_names = self.valid_tool_names or {
+            tool.get("function", {}).get("name")
+            for tool in self.tools or []
+            if isinstance(tool, dict)
+        }
+        bga_required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+        reroute_required = {"drop_net", "reroute"}
+        if not (bga_required.issubset(valid_names) or reroute_required.issubset(valid_names)) or not tool_calls:
+            return None
+
+        latest_user = ""
+        latest_user_envelope = ""
+        tool_responses: list[tuple[str, Any]] = []
+        tool_name_by_id: dict[str, str] = {}
+        assistant_tool_names: set[str] = set()
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "user":
+                latest_user_envelope = self._shim_msg_text(msg)
+                latest_user = self._shim_actual_user_text(latest_user_envelope)
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    name, _ = self._shim_tool_call_name_args(tc)
+                    if name:
+                        assistant_tool_names.add(name)
+                        call_id = str(tc.get("id") or "") if isinstance(tc, dict) else str(getattr(tc, "id", "") or "")
+                        if call_id:
+                            tool_name_by_id[call_id] = name
+            if msg.get("role") == "tool":
+                name = str(msg.get("name") or tool_name_by_id.get(str(msg.get("tool_call_id") or ""), "")).strip()
+                if name:
+                    tool_responses.append((name, msg.get("content", "")))
+
+        response_names = {name for name, _ in tool_responses}
+        has_pcb_context = bool(
+            {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"} & (assistant_tool_names | response_names)
+        ) or any(
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and (
+                "route_mode=pcb" in self._shim_msg_text(msg)
+                or "pcb_agent_loop" in self._shim_msg_text(msg)
+                or "PCB 业务流程由 Agent loop" in self._shim_msg_text(msg)
+            )
+            for msg in messages or []
+        )
+        if not has_pcb_context:
+            return None
+
+        last_extract_content = None
+        last_fanout = None
+        for name, content in tool_responses:
+            if name == "pcb_extract_bga":
+                last_extract_content = content
+            elif name == "generateFanoutParams":
+                fanout = self._shim_extract_fanout_params(content)
+                if fanout:
+                    last_fanout = fanout
+
+        proposed = [self._shim_tool_call_name_args(tc) for tc in tool_calls or []]
+        proposed_names = {name for name, _ in proposed if name}
+        forced_global_fanout = bool(
+            re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
+            or "forced_skill: global_fanout" in latest_user_envelope
+        )
+        forced_reroute = bool(
+            re.search(r"(?:#|＃)\s*(?:reroute|拆线\s*重布)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
+            or "forced_skill: reroute" in latest_user_envelope
+        )
+        if forced_global_fanout and (proposed_names & {"drop_net", "reroute", "getSelectedElements", "GetSelectedElements", "deleteTracesById"}):
+            if last_extract_content:
+                return self._shim_wait_for_fanout_choice_content(last_extract_content)
+            return "已进入全局 BGA fanout/逃逸布线流程，请先获取版图并识别 BGA。"
+        if forced_reroute and (proposed_names & {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}):
+            return "已进入拆线重布流程，请先框选需要拆线的走线，或说明要拆哪根线。"
+        if "route" in proposed_names and not last_fanout:
+            return self._shim_wait_for_fanout_choice_content(last_extract_content)
+        if "generateFanoutParams" not in proposed_names:
+            return None
+        if not bga_required.issubset(valid_names):
+            return None
+        if not last_extract_content:
+            return None
+
+        candidates = self._shim_bga_candidates_from_extract_response(last_extract_content)
+        candidates_upper = {candidate.upper() for candidate in candidates}
+        explicit_router_type = self._shim_router_type_from_text(latest_user)
+        for name, args in proposed:
+            if name != "generateFanoutParams":
+                continue
+            selected_bga = str(args.get("selectedBGA") or args.get("refBGA") or "").strip()
+            router_type = str(args.get("routerType") or "").strip()
+            if candidates_upper and selected_bga.upper() not in candidates_upper:
+                return self._shim_wait_for_fanout_choice_content(last_extract_content)
+            if not explicit_router_type or router_type != explicit_router_type:
+                return self._shim_wait_for_fanout_choice_content(last_extract_content)
+        return None
 
     def _pcb_tool_call_shim_override(self, messages: List[Dict[str, Any]]) -> Optional[list[Any]]:
         valid_names = self.valid_tool_names or {
@@ -2129,11 +2318,13 @@ class AIAgent:
             for tool in self.tools or []
             if isinstance(tool, dict)
         }
-        required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
-        if not required.issubset(valid_names):
+        bga_required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+        reroute_required = {"drop_net", "reroute"}
+        if not (bga_required.issubset(valid_names) or reroute_required.issubset(valid_names)):
             return None
 
         latest_user = ""
+        latest_user_envelope = ""
         tool_name_by_id: dict[str, str] = {}
         tool_responses: list[tuple[str, Any]] = []
         assistant_tool_names: set[str] = set()
@@ -2141,7 +2332,8 @@ class AIAgent:
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") == "user":
-                latest_user = self._shim_msg_text(msg)
+                latest_user_envelope = self._shim_msg_text(msg)
+                latest_user = self._shim_actual_user_text(latest_user_envelope)
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
                     if not isinstance(tc, dict):
@@ -2173,10 +2365,43 @@ class AIAgent:
         has_pcb_tool_history = bool(
             {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"} & (assistant_tool_names | response_names)
         )
+        has_reroute_tool_history = bool(
+            {"drop_net", "reroute"} & (assistant_tool_names | response_names)
+        )
+        forced_global_fanout = bool(
+            re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
+            or "forced_skill: global_fanout" in latest_user_envelope
+        )
+        reroute_flow_seen = (
+            (has_reroute_tool_history and not forced_global_fanout)
+            or (
+                pcb_agent_loop_context
+                and not forced_global_fanout
+                and self._shim_is_reroute_request(latest_user)
+            )
+        )
+        if reroute_required.issubset(valid_names) and reroute_flow_seen and (pcb_agent_loop_context or has_reroute_tool_history):
+            if self._shim_is_temporary_pcb_chat(latest_user):
+                return None
+            last_drop_net_content = None
+            for name, content in tool_responses:
+                if name == "drop_net":
+                    last_drop_net_content = content
+            if "drop_net" not in response_names:
+                return [self._make_shim_tool_call("drop_net", {
+                    "userText": latest_user,
+                    "projectID": self._shim_project_id_from_text(latest_user_envelope),
+                })]
+            if "reroute" not in response_names and self._shim_drop_net_succeeded(last_drop_net_content):
+                return [self._make_shim_tool_call("reroute", {})]
+            return None
+
         bga_flow_seen = (
             has_pcb_tool_history
             or (pcb_agent_loop_context and bool(re.search(r"BGA|fanout|逃逸|扇出|布线", latest_user or "", flags=re.IGNORECASE)))
         )
+        if not bga_required.issubset(valid_names):
+            return None
         if not bga_flow_seen:
             return None
         if not (pcb_agent_loop_context or has_pcb_tool_history):
@@ -2217,10 +2442,60 @@ class AIAgent:
         return None
 
     @staticmethod
+    def _shim_actual_user_text(text: str) -> str:
+        if not text:
+            return ""
+        if text.startswith("[SYSTEM:"):
+            marker = "]\n\n"
+            pos = text.find(marker)
+            if pos >= 0:
+                return text[pos + len(marker):].strip()
+        return text.strip()
+
+    @staticmethod
+    def _shim_project_id_from_text(text: str) -> str:
+        if not text:
+            return ""
+        match = re.search(r"(?im)^\s*projectid:\s*([^\s\]]+)", text)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _shim_is_reroute_request(text: str) -> bool:
+        if not text:
+            return False
+        return bool(
+            re.search(
+                r"(?:#|＃)\s*reroute\b|拆线\s*重布|局部\s*重布|重新布线|重布|重新布|重走|重新走线|"
+                r"\breroute\b|\bripup\b|\brip-up\b|删除.*(?:走线|线|trace|traces|框选|选中)|"
+                r"删.*(?:走线|线|trace|traces|框选|选中)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _shim_drop_net_succeeded(content: Any) -> bool:
+        if isinstance(content, dict):
+            parsed = content
+        else:
+            try:
+                parsed = json.loads(str(content or ""))
+            except Exception:
+                return False
+        if not isinstance(parsed, dict) or parsed.get("error"):
+            return False
+        selected_nets = parsed.get("selectedNets")
+        selected_trace_ids = parsed.get("selectedTraceIds")
+        return bool(
+            (isinstance(selected_nets, list) and selected_nets)
+            or (isinstance(selected_trace_ids, list) and selected_trace_ids)
+        )
+
+    @staticmethod
     def _shim_is_temporary_pcb_chat(text: str) -> bool:
         if not text:
             return False
-        if re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|reroute)", text, flags=re.IGNORECASE):
+        if re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout|reroute|拆线\s*重布)", text, flags=re.IGNORECASE):
             return False
         explicit_pcb_action = bool(
             re.search(r"BGA|fanout|逃逸|扇出|布线|走线|route|routing|reroute", text, flags=re.IGNORECASE)
@@ -9864,6 +10139,15 @@ class AIAgent:
                         assistant_message.tool_calls = pcb_forced_calls
                         assistant_message.content = None
                         finish_reason = "tool_calls"
+                    else:
+                        blocked_content = self._pcb_tool_call_shim_block_invalid_model_calls(
+                            api_messages,
+                            getattr(assistant_message, "tool_calls", None),
+                        )
+                        if blocked_content:
+                            assistant_message.tool_calls = None
+                            assistant_message.content = blocked_content
+                            finish_reason = "stop"
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook

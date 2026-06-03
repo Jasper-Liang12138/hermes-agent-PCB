@@ -20,8 +20,8 @@ def test_websocket_reroute_auto_skill_injects_for_existing_session():
     )
 
 
-def test_non_reroute_auto_skill_still_waits_for_new_session():
-    assert not _should_inject_auto_skill_for_turn(
+def test_websocket_pcb_auto_skill_injects_for_existing_session():
+    assert _should_inject_auto_skill_for_turn(
         is_new_session=False,
         auto_skill="hardware/pcb-intelligence",
         source=_source(Platform.WEBSOCKET),

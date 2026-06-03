@@ -80,6 +80,15 @@ def _make_source() -> SessionSource:
     )
 
 
+def _make_websocket_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.WEBSOCKET,
+        chat_id="ws-chat-1",
+        chat_type="dm",
+        user_id="ws-chat-1",
+    )
+
+
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
@@ -189,3 +198,71 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_websocket_chat_turn_isolates_tools_memory_and_pcb_history(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key: {
+            "hermes-websocket",
+            "hermes-websocket-pcb",
+            "skills",
+            "session_search",
+        },
+    )
+
+    polluted_history = [
+        {"role": "user", "content": "帮我做BGA逃逸布线"},
+        {
+            "role": "assistant",
+            "content": "routeTypes: refBGA; fanoutParams; selectedBGA; getProjectData",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "getProjectData", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "getProjectData", "content": "(pcb data)"},
+    ]
+
+    _CapturingAgent.last_init = None
+    _CapturingAgent.last_run = None
+    result = await runner._run_agent(
+        message="什么是逃逸布线",
+        context_prompt="[SYSTEM: 当前是 PCB Agent 普通问答模式。]",
+        history=polluted_history,
+        source=_make_websocket_source(),
+        session_id="session-ws-chat",
+        session_key="agent:main:websocket:dm:ws-chat-1",
+        turn_options={"route_mode": "chat", "pcb_agent_loop": False},
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["enabled_toolsets"] == []
+    assert _CapturingAgent.last_init["skip_memory"] is True
+    assert _CapturingAgent.last_init["skip_context_files"] is True
+    assert _CapturingAgent.last_run["conversation_history"] == []

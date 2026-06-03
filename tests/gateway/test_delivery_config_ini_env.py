@@ -29,3 +29,25 @@ rl_root_dir = F:/PCB/routers/bk_routing
     assert gateway_run.os.environ["BOARD_DATA_USE_FILE_PATH"] == "1"
     assert gateway_run.os.environ["ROUTER_WORK_DIR"] == "F:/PCB/router_work"
     assert gateway_run.os.environ["ROUTER_RL_ROOT_DIR"] == "F:/PCB/routers/bk_routing"
+
+
+def test_config_ini_override_ignores_dict_argument(monkeypatch):
+    import gateway.run as gateway_run
+
+    cfg = configparser.ConfigParser()
+    cfg.read_string(
+        """
+[model]
+api_key = fallback-config-key
+base_url = https://wishub-x5.ctyun.cn/v1
+"""
+    )
+
+    monkeypatch.setattr(gateway_run, "_config_ini_cfg", cfg)
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://your-endpoint/v1")
+
+    gateway_run._apply_config_ini_env_overrides({"model": {"api_key": "dict-key"}})
+
+    assert gateway_run.os.environ["OPENAI_API_KEY"] == "fallback-config-key"
+    assert gateway_run.os.environ["OPENAI_BASE_URL"] == "https://wishub-x5.ctyun.cn/v1"

@@ -33,7 +33,9 @@ def _resolve_local_config_ini() -> _pl.Path:
 
 
 def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None:
-    cfg = cfg or _cfg
+    cfg = cfg or _config_ini_cfg
+    if not isinstance(cfg, _cp.ConfigParser):
+        cfg = _config_ini_cfg
     if cfg.has_section("model"):
         model_cfg = cfg["model"]
         if model_cfg.get("api_key", "").strip():
@@ -58,12 +60,12 @@ def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None
 
 
 _config_ini = _resolve_local_config_ini()
-_cfg = _cp.ConfigParser()
-_cfg.read(_config_ini, encoding="utf-8-sig")
-_apply_config_ini_env_overrides(_cfg)
+_config_ini_cfg = _cp.ConfigParser()
+_config_ini_cfg.read(_config_ini, encoding="utf-8-sig")
+_apply_config_ini_env_overrides(_config_ini_cfg)
 
-if _cfg.has_section("model"):
-    _m = _cfg["model"]
+if _config_ini_cfg.has_section("model"):
+    _m = _config_ini_cfg["model"]
     if _m.get("api_key", "").strip():
         _os.environ["OPENAI_API_KEY"] = _m["api_key"].strip()
     if _m.get("base_url", "").strip():
@@ -96,8 +98,8 @@ if _cfg.has_section("model"):
                 "provider": "custom",  # 使用自定义端点而非 openai-codex
             }.items() if v
         })
-        _ws_host = _cfg.get("server", "host", fallback="0.0.0.0")
-        _ws_port = int(_cfg.get("server", "port", fallback="8765"))
+        _ws_host = _config_ini_cfg.get("server", "host", fallback="0.0.0.0")
+        _ws_port = int(_config_ini_cfg.get("server", "port", fallback="8765"))
         _hermes_cfg.setdefault("gateway", {}).setdefault("websocket", {}).update({
             "enabled": True,
             "host": _ws_host,
@@ -123,8 +125,8 @@ if _cfg.has_section("model"):
         import warnings
         warnings.warn(f"config.ini → config.yaml 同步失败: {_e}")
 
-if _cfg.has_section("router"):
-    _r = _cfg["router"]
+if _config_ini_cfg.has_section("router"):
+    _r = _config_ini_cfg["router"]
     if _r.get("cmd", "").strip():
         _os.environ["ROUTER_CMD"] = _r["cmd"].strip()
     if _r.get("work_dir", "").strip():
@@ -134,17 +136,17 @@ if _cfg.has_section("router"):
     if _r.get("135_dir", "").strip():
         _os.environ["ROUTER_135_DIR"] = _r["135_dir"].strip()
 
-if _cfg.has_section("model") and _cfg["model"].get("board_data_use_file_path", "").strip():
-    _os.environ["BOARD_DATA_USE_FILE_PATH"] = _cfg["model"]["board_data_use_file_path"].strip()
+if _config_ini_cfg.has_section("model") and _config_ini_cfg["model"].get("board_data_use_file_path", "").strip():
+    _os.environ["BOARD_DATA_USE_FILE_PATH"] = _config_ini_cfg["model"]["board_data_use_file_path"].strip()
 
-if _cfg.has_section("pcb"):
+if _config_ini_cfg.has_section("pcb"):
     try:
         import yaml as _yaml
         _hermes_cfg_path = _pl.Path.home() / ".hermes" / "config.yaml"
         _hermes_cfg_path.parent.mkdir(exist_ok=True)
         _hermes_cfg = _yaml.safe_load(_hermes_cfg_path.read_text(encoding="utf-8")) if _hermes_cfg_path.exists() else {}
         _hermes_cfg = _hermes_cfg or {}
-        _raw = _cfg["pcb"].get("use_long_context_module", "true").strip().lower()
+        _raw = _config_ini_cfg["pcb"].get("use_long_context_module", "true").strip().lower()
         _hermes_cfg.setdefault("pcb", {})["use_long_context_module"] = _raw not in ("false", "0", "no", "off")
         _hermes_cfg_path.write_text(_yaml.dump(_hermes_cfg, allow_unicode=True), encoding="utf-8")
     except Exception as _e:
@@ -224,26 +226,27 @@ from dotenv import load_dotenv  # backward-compat for tests that monkeypatch thi
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
-_apply_config_ini_env_overrides(_cfg)
+_apply_config_ini_env_overrides(_config_ini_cfg)
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
+_gateway_env_cfg = {}
 if _config_path.exists():
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+            _gateway_env_cfg = _yaml.safe_load(_f) or {}
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
-        _cfg = _expand_env_vars(_cfg)
+        _gateway_env_cfg = _expand_env_vars(_gateway_env_cfg)
         # Top-level simple values (fallback only — don't override .env)
-        for _key, _val in _cfg.items():
+        for _key, _val in _gateway_env_cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
                 os.environ[_key] = str(_val)
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
-        _terminal_cfg = _cfg.get("terminal", {})
+        _terminal_cfg = _gateway_env_cfg.get("terminal", {})
         if _terminal_cfg and isinstance(_terminal_cfg, dict):
             _terminal_env_map = {
                 "backend": "TERMINAL_ENV",
@@ -278,7 +281,7 @@ if _config_path.exists():
         # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract).
         # Each task has provider/model/base_url/api_key; bridge non-default values to env vars.
-        _auxiliary_cfg = _cfg.get("auxiliary", {})
+        _auxiliary_cfg = _gateway_env_cfg.get("auxiliary", {})
         if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
             _aux_task_env = {
                 "vision": {
@@ -316,7 +319,7 @@ if _config_path.exists():
                     os.environ[_env_map["base_url"]] = _base_url
                 if _api_key:
                     os.environ[_env_map["api_key"]] = _api_key
-        _agent_cfg = _cfg.get("agent", {})
+        _agent_cfg = _gateway_env_cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
@@ -328,17 +331,17 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "restart_drain_timeout" in _agent_cfg and "HERMES_RESTART_DRAIN_TIMEOUT" not in os.environ:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
-        _display_cfg = _cfg.get("display", {})
+        _display_cfg = _gateway_env_cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg and "HERMES_GATEWAY_BUSY_INPUT_MODE" not in os.environ:
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         # HERMES_TIMEZONE from .env takes precedence (already in os.environ).
-        _tz_cfg = _cfg.get("timezone", "")
+        _tz_cfg = _gateway_env_cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str) and "HERMES_TIMEZONE" not in os.environ:
             os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
         # Security settings
-        _security_cfg = _cfg.get("security", {})
+        _security_cfg = _gateway_env_cfg.get("security", {})
         if isinstance(_security_cfg, dict):
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
@@ -349,7 +352,7 @@ if _config_path.exists():
 # Apply IPv4 preference if configured (before any HTTP clients are created).
 try:
     from hermes_constants import apply_ipv4_preference
-    _network_cfg = (_cfg if '_cfg' in dir() else {}).get("network", {})
+    _network_cfg = _gateway_env_cfg.get("network", {})
     if isinstance(_network_cfg, dict) and _network_cfg.get("force_ipv4"):
         apply_ipv4_preference(force=True)
 except Exception:
@@ -470,7 +473,10 @@ def _should_inject_auto_skill_for_turn(
     skill_names = _auto_skill_names(auto_skill)
     return (
         source.platform == Platform.WEBSOCKET
-        and "hardware/pcb-reroute" in skill_names
+        and (
+            "hardware/pcb-reroute" in skill_names
+            or "hardware/pcb-intelligence" in skill_names
+        )
     )
 
 logger = logging.getLogger(__name__)
@@ -5039,7 +5045,7 @@ class GatewayRunner:
         }
 
         if source.platform == Platform.WEBSOCKET and route_mode == "chat":
-            updated = [ts for ts in updated if ts != "hermes-websocket"]
+            return []
         elif source.platform == Platform.WEBSOCKET and route_mode == "pcb":
             updated = [ts for ts in updated if ts not in pcb_excluded]
             if "hermes-websocket-pcb" not in updated:
@@ -7459,6 +7465,7 @@ class GatewayRunner:
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        agent_flags: dict = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -7484,6 +7491,7 @@ class GatewayRunner:
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
+                agent_flags or {},
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
@@ -7551,11 +7559,14 @@ class GatewayRunner:
         Supports interruption via new messages.
         """
         from run_agent import AIAgent
+        from gateway.config import Platform
         import queue
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         turn_options = self._normalize_turn_options(turn_options or {})
+        route_mode = str(turn_options.get("route_mode") or "").strip().lower()
+        websocket_chat_turn = source.platform == Platform.WEBSOCKET and route_mode == "chat"
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -7898,7 +7909,7 @@ class GatewayRunner:
                 load_dotenv(_env_path, override=True, encoding="latin-1")
             except Exception:
                 pass
-            _apply_config_ini_env_overrides(_cfg)
+            _apply_config_ini_env_overrides(_config_ini_cfg)
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -8010,6 +8021,10 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                {
+                    "skip_memory": websocket_chat_turn,
+                    "skip_context_files": websocket_chat_turn,
+                },
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -8030,6 +8045,8 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
+                    skip_memory=websocket_chat_turn,
+                    skip_context_files=websocket_chat_turn,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -8095,7 +8112,8 @@ class GatewayRunner:
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
             agent_history = []
-            for msg in history:
+            history_for_agent = [] if websocket_chat_turn else history
+            for msg in history_for_agent:
                 role = msg.get("role")
                 if not role:
                     continue

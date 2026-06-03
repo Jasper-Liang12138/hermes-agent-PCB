@@ -249,7 +249,11 @@ def test_pcb_tool_call_shim_allows_explicit_no_operation_chat(agent):
 
 def test_pcb_tool_call_shim_tag_commands_are_not_temporary_chat(agent):
     assert agent._shim_is_temporary_pcb_chat("#逃逸布线") is False
+    assert agent._shim_is_temporary_pcb_chat("＃逃逸布线") is False
+    assert agent._shim_is_temporary_pcb_chat("#全局fanout") is False
     assert agent._shim_is_temporary_pcb_chat("#reroute") is False
+    assert agent._shim_is_temporary_pcb_chat("＃reroute") is False
+    assert agent._shim_is_temporary_pcb_chat("#拆线重布") is False
     assert agent._shim_is_temporary_pcb_chat("#布线 是什么意思") is True
 
 
@@ -295,6 +299,112 @@ def test_pcb_tool_call_shim_requires_pcb_loop_context_for_initial_project_data(a
     assert json.loads(calls[0].function.arguments) == {}
 
 
+@pytest.mark.parametrize("text", ["#reroute", "＃reroute", "#reroute；", "#拆线重布", "＃拆线重布", "拆线重布"])
+def test_pcb_tool_call_shim_forces_drop_net_for_reroute(agent, text):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route", "drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "projectid: proj-reroute-1\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                f"{text}"
+            ),
+        },
+    ])
+
+    assert calls[0].function.name == "drop_net"
+    assert json.loads(calls[0].function.arguments) == {
+        "userText": text,
+        "projectID": "proj-reroute-1",
+    }
+
+
+def test_pcb_tool_call_shim_forced_fanout_overrides_reroute_history(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route", "drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "projectid: proj-forced-fanout\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "#reroute"
+            ),
+        },
+        {
+            "role": "tool",
+            "name": "drop_net",
+            "content": json.dumps({"selectedNets": [], "selectedTraceIds": ["trace-1"]}, ensure_ascii=False),
+        },
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "projectid: proj-forced-fanout\n"
+                "forced_skill: global_fanout\n"
+                "本轮用户使用 #逃逸布线 强制进入全局 BGA fanout/逃逸布线。]\n\n"
+                "#逃逸布线"
+            ),
+        },
+    ])
+
+    assert calls[0].function.name == "getProjectData"
+    assert json.loads(calls[0].function.arguments) == {}
+
+
+def test_pcb_tool_call_shim_forces_reroute_after_successful_drop_net(agent):
+    agent.valid_tool_names = {"drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "拆线重布"
+            ),
+        },
+        {
+            "role": "tool",
+            "name": "drop_net",
+            "content": json.dumps({"selectedNets": [], "selectedTraceIds": ["trace-1"]}, ensure_ascii=False),
+        },
+    ])
+
+    assert calls[0].function.name == "reroute"
+    assert json.loads(calls[0].function.arguments) == {}
+
+
+def test_pcb_tool_call_shim_stops_reroute_after_failed_drop_net(agent):
+    agent.valid_tool_names = {"drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+
+    calls = agent._pcb_tool_call_shim_override([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "#reroute"
+            ),
+        },
+        {
+            "role": "tool",
+            "name": "drop_net",
+            "content": json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": "No selected traces"}, ensure_ascii=False),
+        },
+    ])
+
+    assert calls is None
+
+
 def test_pcb_tool_call_shim_forces_generate_after_selection(agent):
     agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
     agent.tools = _make_tool_defs(*agent.valid_tool_names)
@@ -312,6 +422,103 @@ def test_pcb_tool_call_shim_forces_generate_after_selection(agent):
 
     assert calls[0].function.name == "generateFanoutParams"
     assert json.loads(calls[0].function.arguments) == {"selectedBGA": "U22", "routerType": "arc"}
+
+
+def test_pcb_tool_call_shim_blocks_premature_wrong_generate_after_extract(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+    bad_call = agent._make_shim_tool_call(
+        "generateFanoutParams",
+        {"selectedBGA": "U27", "routerType": "rl_arc"},
+    )
+
+    content = agent._pcb_tool_call_shim_block_invalid_model_calls([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "forced_skill: global_fanout\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "#逃逸布线"
+            ),
+        },
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {
+            "role": "tool",
+            "name": "pcb_extract_bga",
+            "content": json.dumps({"selection": [{"label": "U22", "detail": "CG400 (400 pins)"}]}, ensure_ascii=False),
+        },
+    ], [bad_call])
+
+    assert content is not None
+    assert "U22" in content
+    assert "请选择走线算法" in content
+    assert "##PCB_FIELDS##" in content
+
+
+def test_pcb_tool_call_shim_blocks_reroute_tool_under_forced_fanout(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route", "drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+    bad_call = agent._make_shim_tool_call("drop_net", {"userText": "#全局fanout"})
+
+    content = agent._pcb_tool_call_shim_block_invalid_model_calls([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "forced_skill: global_fanout\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "#全局fanout"
+            ),
+        },
+    ], [bad_call])
+
+    assert content == "已进入全局 BGA fanout/逃逸布线流程，请先获取版图并识别 BGA。"
+
+
+def test_pcb_tool_call_shim_blocks_bga_tool_under_forced_reroute(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route", "drop_net", "reroute"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+    bad_call = agent._make_shim_tool_call(
+        "generateFanoutParams",
+        {"selectedBGA": "U22", "routerType": "arc"},
+    )
+
+    content = agent._pcb_tool_call_shim_block_invalid_model_calls([
+        {
+            "role": "user",
+            "content": (
+                "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
+                "forced_skill: reroute\n"
+                "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。]\n\n"
+                "#拆线重布"
+            ),
+        },
+    ], [bad_call])
+
+    assert content == "已进入拆线重布流程，请先框选需要拆线的走线，或说明要拆哪根线。"
+
+
+def test_pcb_tool_call_shim_allows_explicit_valid_generate_after_extract(agent):
+    agent.valid_tool_names = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+    agent.tools = _make_tool_defs(*agent.valid_tool_names)
+    good_call = agent._make_shim_tool_call(
+        "generateFanoutParams",
+        {"selectedBGA": "U22", "routerType": "arc"},
+    )
+
+    content = agent._pcb_tool_call_shim_block_invalid_model_calls([
+        {"role": "user", "content": "帮我进行BGA逃逸布线"},
+        {"role": "tool", "name": "getProjectData", "content": "(pcb_data)"},
+        {
+            "role": "tool",
+            "name": "pcb_extract_bga",
+            "content": json.dumps({"selection": [{"label": "U22", "detail": "CG400 (400 pins)"}]}, ensure_ascii=False),
+        },
+        {"role": "user", "content": "选择 U22，arc + 北科大"},
+    ], [good_call])
+
+    assert content is None
 
 
 @pytest.mark.parametrize(
