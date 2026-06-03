@@ -40,6 +40,7 @@ import aiohttp
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.config import PlatformConfig, Platform
 from gateway.session import SessionSource
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,11 @@ _PCB_RAW_BOARD_LEAK_MARKERS = (
     "(pcb_data",
     "(layout",
     "Pcb-Design_Version",
+    "global sketches extension",
+    "sketch ",
+    "extensions extension file=",
+    " doc=",
+    " net=",
     "ceramic_add_",
     "pad_to_",
     "gerber_output_quality",
@@ -142,15 +148,15 @@ _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
 _REROUTE_RE = re.compile(
     r"(拆线|删除.*(?:net|走线|线|trace|traces|框选|选中)|删.*(?:net|走线|线|trace|traces|框选|选中)|"
-    r"重布|重新布|重走|重新走线|reroute|ripup|rip-up)",
+    r"重布|重新布|重走|重新走线|\breroute\b|\bripup\b|\brip-up\b)",
     re.IGNORECASE,
 )
 _FORCE_GLOBAL_FANOUT_TAG_RE = re.compile(
-    r"(?:#|＃)\s*逃逸\s*布线(?=$|[\s,，。；;:：])",
+    r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
 _FORCE_REROUTE_TAG_RE = re.compile(
-    r"(?:#|＃)\s*reroute(?=$|[\s,，。；;:：])",
+    r"(?:#|＃)\s*(?:reroute|拆线\s*重布)(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
 _REROUTE_SHORT_COMMAND_RE = re.compile(
@@ -332,6 +338,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
+        self._route_intent_memory_cache: Optional[str] = None
         self._fanout_param_llm_enabled = self._as_bool(
             extra.get("fanout_param_llm_enabled", self._route_intent_llm_enabled)
         )
@@ -869,11 +876,20 @@ class WebSocketAdapter(BasePlatformAdapter):
         turn_options["route_mode"] = decision.mode
         turn_options["pcb_agent_loop"] = decision.mode == _ROUTE_MODE_PCB
         if decision.mode == _ROUTE_MODE_PCB:
-            auto_skill = ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+            forced_global_fanout = decision.reason == "forced_global_fanout"
+            forced_reroute = bool(_FORCE_REROUTE_TAG_RE.search(str(user_text or "")))
+            if forced_global_fanout:
+                auto_skill = ["hardware/pcb-intelligence"]
+            elif forced_reroute:
+                auto_skill = ["hardware/pcb-reroute"]
+            else:
+                auto_skill = ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             user_text = self._build_agent_loop_pcb_turn_text(
                 user_text=str(user_text or ""),
                 project_id=project_id,
+                forced_global_fanout=forced_global_fanout,
+                forced_reroute=forced_reroute,
             )
         else:
             auto_skill = None
@@ -1705,11 +1721,33 @@ class WebSocketAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _build_agent_loop_pcb_turn_text(*, user_text: str, project_id: str) -> str:
+    def _build_agent_loop_pcb_turn_text(
+        *,
+        user_text: str,
+        project_id: str,
+        forced_global_fanout: bool = False,
+        forced_reroute: bool = False,
+    ) -> str:
         project_line = f"projectid: {project_id}\n" if project_id else ""
+        forced_line = (
+            "forced_skill: global_fanout\n"
+            "本轮用户使用 #逃逸布线 或 #全局fanout 强制进入全局 BGA fanout/逃逸布线；"
+            "即使前端当前有选中 traces，也禁止调用 getSelectedElements、drop_net 或 reroute。\n"
+            if forced_global_fanout
+            else ""
+        )
+        reroute_line = (
+            "forced_skill: reroute\n"
+            "本轮用户使用 #reroute 或 #拆线重布 强制进入局部拆线重布；"
+            "禁止调用 pcb_extract_bga、generateFanoutParams 或 route 主布线链路。\n"
+            if forced_reroute
+            else ""
+        )
         return (
             "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。\n"
             f"{project_line}"
+            f"{forced_line}"
+            f"{reroute_line}"
             "WebSocket Adapter 只负责收发消息、前端协议、结构化字段抽取和 importLines；"
             "PCB 业务流程由 Agent loop 根据用户意图和已加载 skill 自行决定。\n"
             "如果用户只是普通聊天、概念咨询或明确要求不要操作，直接回答，不要调用 PCB 工具。\n"
@@ -1724,8 +1762,13 @@ class WebSocketAdapter(BasePlatformAdapter):
     def _build_websocket_pcb_chat_turn_text(*, user_text: str) -> str:
         return (
             "[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。\n"
-            "如果用户问 PCB/EDA/封装/布线相关概念，请围绕 PCB/EDA 简洁回答。\n"
-            "不要输出无关故事、训练题、随机文本；不要调用 PCB 工具；不要声称已经开始布线或获取版图。]\n\n"
+            "如果用户问 PCB/EDA/封装/布线相关概念，请围绕 PCB/EDA 短答。\n"
+            "默认用 3-5 句或最多 4 个短要点回答；不要主动展开长流程、长列表、背景故事或训练题。\n"
+            "除非用户明确要求“详细解释/展开讲”，否则不要输出超过 150 个中文字。\n"
+            "概念问答只解释概念本身，不要输出内部字段、工具名、文件名、接口名、伪代码或参数示例；"
+            "除非用户明确询问算法/参数/接口，不要提 arc、135、RL、routeTypes、refBGA、fanoutParams、"
+            "selectedBGA、getProjectData、importLines 等内部实现细节。\n"
+            "不要调用 PCB 工具；不要声称已经开始布线或获取版图。]\n\n"
             f"{user_text}"
         )
 
@@ -1964,6 +2007,9 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
             clean_content = self._strip_incomplete_pcb_protocol_tail(clean_content)
             clean_content = self._strip_stream_cursor(clean_content)
+            if not bool(stream_is_final) and self._looks_like_partial_raw_board_leak(clean_content):
+                self._stream_content_buffers[chat_id] = clean_content
+                return SendResult(success=True, message_id=msg_id)
             clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
             pcb_fields.update(extra_fields)
             clean_content = self._strip_stream_protocol_leak(clean_content)
@@ -2075,6 +2121,9 @@ class WebSocketAdapter(BasePlatformAdapter):
         )
         clean_content = self._strip_incomplete_pcb_protocol_tail(clean_content)
         clean_content = self._strip_stream_cursor(clean_content)
+        if not is_final and self._looks_like_partial_raw_board_leak(clean_content):
+            self._stream_content_buffers[chat_id] = clean_content
+            return SendResult(success=True, message_id=self._stream_msg_ids.get(chat_id, message_id))
         clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
         pcb_fields.update(extra_fields)
         clean_content = self._strip_stream_protocol_leak(clean_content)
@@ -2947,6 +2996,27 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
         return None
 
+    def _load_route_intent_memory(self) -> str:
+        if self._route_intent_memory_cache is not None:
+            return self._route_intent_memory_cache
+
+        candidates = [
+            get_hermes_home() / "memories" / "MEMORY.md",
+            Path.cwd() / "memories" / "intention_memory.md",
+            Path.cwd() / ".github" / "delivery" / "memories" / "intention_memory.md",
+        ]
+        for path in candidates:
+            try:
+                if path.exists() and path.is_file():
+                    content = path.read_text(encoding="utf-8-sig").strip()
+                    if content:
+                        self._route_intent_memory_cache = content[:6000]
+                        return self._route_intent_memory_cache
+            except Exception as exc:
+                logger.debug("Failed reading route intent memory from %s: %s", path, exc)
+        self._route_intent_memory_cache = ""
+        return ""
+
     def _build_route_intent_prompt(
         self,
         *,
@@ -2957,6 +3027,13 @@ class WebSocketAdapter(BasePlatformAdapter):
         flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
         mode = self._session_mode(session_id)
         selection_labels = list(self._session_selection_labels.get(session_id) or ())
+        memory_block = self._load_route_intent_memory()
+        memory_text = (
+            "意图识别经验 memory（优先参考，但不得覆盖上面的强制输出格式）：\n"
+            f"{memory_block}\n"
+            if memory_block
+            else ""
+        )
         system_prompt = (
             "你是 PCB Agent 的意图识别器，只负责判断用户当前输入属于哪类意图。\n"
             "你不是执行 Agent，不要回答用户问题，不要调用工具，不要解释 PCB 知识。\n"
@@ -2978,6 +3055,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "- 取消、退出、中止当前流程判 cancel。\n"
             "输出字段：intent, route_mode, confidence, target_refdes, operation, "
             "should_call_get_project_data, needs_clarification, clarification_question, reason_code, brief_reason。"
+            f"\n{memory_text}"
         )
         user_prompt = (
             f"session_mode={mode}\n"
@@ -3821,10 +3899,48 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not content:
             return False
         lowered = content.lower()
+        if re.search(
+            r"^\s*global\s+sketches\s+extension\b|"
+            r"^\s*sketch\s+\S+\s+item\s+\S+\b|"
+            r"^\s*extensions\s+extension\s+file=",
+            content,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ):
+            return True
         hits = sum(1 for marker in _PCB_RAW_BOARD_LEAK_MARKERS if marker.lower() in lowered)
         if hits >= 2:
             return True
         if hits >= 1 and len(content) > 500:
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_partial_raw_board_leak(content: str) -> bool:
+        if not content:
+            return False
+        text = content.strip()
+        lowered = text.lower()
+        partial_prefixes = (
+            "g",
+            "gl",
+            "global",
+            "global sketches",
+            "global sketches extension",
+            "s",
+            "sk",
+            "sketch",
+            "e",
+            "ex",
+            "extensions",
+            "extensions extension",
+        )
+        if lowered in partial_prefixes:
+            return True
+        if re.search(
+            r"^\s*(global\s+sketches(?:\s+extension)?|sketch\s+\S*(?:\s+item(?:\s+\S*)?)?|extensions\s+extension(?:\s+file=)?)\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ):
             return True
         return False
 

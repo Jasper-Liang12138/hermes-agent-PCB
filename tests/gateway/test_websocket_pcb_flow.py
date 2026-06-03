@@ -286,7 +286,7 @@ def test_websocket_reroute_short_command_works_in_pcb_context():
     assert decision.bootstrap_get_project is False
 
 
-@pytest.mark.parametrize("text", ["#reroute", "拆线重布"])
+@pytest.mark.parametrize("text", ["#reroute", "＃reroute", "#reroute；", "#拆线重布", "＃拆线重布", "拆线重布"])
 def test_websocket_reroute_can_start_without_existing_selection(text):
     adapter = _make_adapter()
 
@@ -297,7 +297,17 @@ def test_websocket_reroute_can_start_without_existing_selection(text):
     assert decision.bootstrap_get_project is False
 
 
-@pytest.mark.parametrize("text", ["#逃逸布线", "#逃逸布线，告诉我什么是BGA逃逸布线"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "#逃逸布线",
+        "＃逃逸布线",
+        "#逃逸 布线；",
+        "#全局fanout",
+        "＃全局 fanout",
+        "#逃逸布线，告诉我什么是BGA逃逸布线",
+    ],
+)
 def test_websocket_hashtag_forces_global_fanout_skill(text):
     adapter = _make_adapter()
 
@@ -307,6 +317,16 @@ def test_websocket_hashtag_forces_global_fanout_skill(text):
     assert decision.intent == "pcb_entry"
     assert decision.reason == "forced_global_fanout"
     assert decision.bootstrap_get_project is True
+
+
+@pytest.mark.parametrize("text", ["#布线 是什么意思", "#逃逸布线abc", "#全局fanoutabc", "#rerouteabc", "#拆线重布abc"])
+def test_unknown_or_partial_hashtag_commands_do_not_force_pcb_skill(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-unknown-hashtag", text)
+
+    assert decision.reason != "forced_global_fanout"
+    assert decision.intent != "pcb_reroute_selected"
 
 
 def test_websocket_escape_routing_phrase_without_hash_is_not_forced_command():
@@ -742,6 +762,11 @@ async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
     assert observed_auto_skill == [None]
     assert observed_text[0].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。")
     assert "不要调用 PCB 工具" in observed_text[0]
+    assert "默认用 3-5 句或最多 4 个短要点回答" in observed_text[0]
+    assert "不要输出超过 150 个中文字" in observed_text[0]
+    assert "不要输出内部字段、工具名、文件名、接口名、伪代码或参数示例" in observed_text[0]
+    assert "routeTypes" in observed_text[0]
+    assert "fanoutParams" in observed_text[0]
     assert observed_text[0].endswith("今天星期几")
 
 
@@ -1234,6 +1259,27 @@ def test_extract_pcb_fields_accepts_missing_end_marker():
     assert '"selection"' not in clean
 
 
+def test_raw_board_sketch_extension_text_is_not_visible():
+    content = (
+        "global sketches extension\n"
+        "sketch DOC4QM_5 item EXT26\n"
+        "extensions extension file=sketches/DOC4QM5-view.sch\n"
+        "doc=DOC4QM5 net=NET47\n"
+    )
+
+    clean, fields = WebSocketAdapter._sanitize_pcb_visible_content(content)
+
+    assert clean == ""
+    assert fields == {}
+
+
+def test_partial_raw_board_stream_prefix_is_suppressed():
+    assert WebSocketAdapter._looks_like_partial_raw_board_leak("global")
+    assert WebSocketAdapter._looks_like_partial_raw_board_leak("global sketches extension")
+    assert WebSocketAdapter._looks_like_partial_raw_board_leak("sketch DOC4QM_5 item")
+    assert not WebSocketAdapter._looks_like_partial_raw_board_leak("已完成局部拆线重布。")
+
+
 async def _run_stream_delta_is_accumulated_and_final_true() -> None:
     """增量流式输入时，WebSocket 输出应始终携带累计全文，最终帧 isFinal=true。"""
     adapter = _make_adapter()
@@ -1573,6 +1619,7 @@ def test_short_pcb_commands_enter_fanout_flow(text):
         ("获取当前版图并找出可布线 BGA", "pcb"),
         ("我想做BGA逃逸布线，告诉我什么是BGA逃逸布线", "chat"),
         ("告诉我什么是BGA逃逸布线", "chat"),
+        ("什么是逃逸布线", "chat"),
         ("介绍一下 BGA 逃逸布线原理", "chat"),
         ("BGA 和 QFP 有什么区别？", "chat"),
         ("不要布线，只解释一下逃逸布线原理", "chat"),
@@ -1604,6 +1651,27 @@ def test_parse_route_intent_output_tolerates_non_json(raw, expected_intent, expe
     assert intent is not None
     assert intent.intent == expected_intent
     assert intent.route_mode == expected_route
+
+
+def test_route_intent_prompt_includes_intention_memory(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    memory_dir = hermes_home / "memories"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "MEMORY.md").write_text(
+        "PCB 意图识别经验：#全局fanout 必须进入全局 fanout skill。",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter()
+
+    messages = adapter._build_route_intent_prompt(
+        session_id="sess-memory-intent",
+        user_text="#全局fanout",
+        project_id="proj-memory-intent",
+    )
+
+    assert "意图识别经验 memory" in messages[0]["content"]
+    assert "#全局fanout 必须进入全局 fanout skill" in messages[0]["content"]
 
 
 def test_rule_validation_rejects_followup_without_pcb_context():
@@ -1648,6 +1716,71 @@ async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(mon
     assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
     assert "projectid: proj-llm-1" in seen["text"]
     assert "帮我对U27做BGA逃逸布线" in seen["text"]
+
+
+@pytest.mark.parametrize("content", ["#逃逸布线", "#全局fanout"])
+@pytest.mark.asyncio
+async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monkeypatch, content):
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    seen = {}
+
+    async def handler(event):
+        seen["auto_skill"] = event.auto_skill
+        seen["text"] = event.text
+        seen["options"] = event.raw_message["options"]
+        return None
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {"role": "user", "content": content},
+        },
+        "sess-forced-fanout",
+        "proj-forced-fanout",
+    )
+
+    assert seen["auto_skill"] == ["hardware/pcb-intelligence"]
+    assert seen["options"]["route_mode"] == "pcb"
+    assert seen["options"]["pcb_agent_loop"] is True
+    assert "forced_skill: global_fanout" in seen["text"]
+    assert "禁止调用 getSelectedElements、drop_net 或 reroute" in seen["text"]
+    assert content in seen["text"]
+    assert "projectid: proj-forced-fanout" in seen["text"]
+    assert adapter._session_modes["sess-forced-fanout"] == "pcb"
+
+
+@pytest.mark.parametrize("content", ["#reroute", "#拆线重布"])
+@pytest.mark.asyncio
+async def test_forced_reroute_tag_loads_only_reroute_skill(monkeypatch, content):
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    seen = {}
+
+    async def handler(event):
+        seen["auto_skill"] = event.auto_skill
+        seen["text"] = event.text
+        seen["options"] = event.raw_message["options"]
+        return None
+
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {"role": "user", "content": content},
+        },
+        "sess-forced-reroute",
+        "proj-forced-reroute",
+    )
+
+    assert seen["auto_skill"] == ["hardware/pcb-reroute"]
+    assert seen["options"]["route_mode"] == "pcb"
+    assert seen["options"]["pcb_agent_loop"] is True
+    assert "forced_skill: reroute" in seen["text"]
+    assert "禁止调用 pcb_extract_bga、generateFanoutParams 或 route" in seen["text"]
+    assert content in seen["text"]
+    assert "projectid: proj-forced-reroute" in seen["text"]
 
 
 @pytest.mark.asyncio
