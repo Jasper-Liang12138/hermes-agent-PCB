@@ -71,6 +71,8 @@ def _repo_root() -> Path:
 
 def _config_paths() -> list[Path]:
     paths: list[Path] = []
+    if getattr(sys, "frozen", False):
+        paths.append(Path(sys.executable).resolve().parent / "config.ini")
     bundled = getattr(sys, "_MEIPASS", None)
     if bundled:
         paths.append(Path(bundled) / "config.ini")
@@ -78,24 +80,29 @@ def _config_paths() -> list[Path]:
     return paths
 
 
-def load_router_config() -> configparser.ConfigParser:
+def load_router_config() -> tuple[configparser.ConfigParser, Path | None]:
     parser = configparser.ConfigParser()
+    last = None
     for path in _config_paths():
         if path.is_file():
             parser.read(path, encoding="utf-8")
+            last = path
             break
-    return parser
+    return parser, last.parent.resolve() if last else None
 
 
-def _expand_path(value: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(value.strip())))
+def _expand_path(value: str, base_dir: Path | None = None) -> Path:
+    expanded = Path(os.path.expandvars(os.path.expanduser(value.strip())))
+    if not expanded.is_absolute() and base_dir is not None:
+        return (base_dir / expanded).resolve()
+    return expanded
 
 
-def _config_path(parser: configparser.ConfigParser, section: str, key: str) -> Path | None:
+def _config_path(parser: configparser.ConfigParser, section: str, key: str, base_dir: Path | None = None) -> Path | None:
     if parser.has_option(section, key):
         raw = parser.get(section, key, fallback="").strip()
         if raw:
-            return _expand_path(raw)
+            return _expand_path(raw, base_dir=base_dir)
     return None
 
 
@@ -124,7 +131,7 @@ def resolve_router_dir(router_type: str, work_dir: Path | None = None) -> Path:
         if value:
             return _expand_path(value)
 
-    parser = load_router_config()
+    parser, config_base_dir = load_router_config()
     if parser.has_section("router"):
         key_by_type = {
             "arc": "arc_dir",
@@ -135,11 +142,11 @@ def resolve_router_dir(router_type: str, work_dir: Path | None = None) -> Path:
         }
         config_key = key_by_type.get(normalized)
         if config_key:
-            configured = _config_path(parser, "router", config_key)
+            configured = _config_path(parser, "router", config_key, base_dir=config_base_dir)
             if configured:
                 return configured
         if normalized.startswith("rl"):
-            rl_root = _config_path(parser, "router", "rl_root_dir")
+            rl_root = _config_path(parser, "router", "rl_root_dir", base_dir=config_base_dir)
             if rl_root:
                 auto = _auto_rl_subdir(rl_root, router_execution_family(normalized))
                 if auto:
@@ -229,43 +236,43 @@ def write_order_input(
     component_refdes: str,
     constraints: Any | None = None,
 ) -> Path:
-    body = "\n".join(
-        f"{item['net']} {item['layer']} {item['order']}"
-        for item in order_lines
-        if item.get("net") and item.get("layer")
-    )
-    line_width = 4
-    line_spacing = 3
-    if isinstance(constraints, dict):
-        line_width = constraints.get("LineWidth") or constraints.get("lineWidth") or line_width
-        line_spacing = constraints.get("LineSpacing") or constraints.get("lineSpacing") or line_spacing
-    text = f"{component_refdes.strip()}\n{line_width}\n{line_spacing}\n{body}\n"
+    _ = constraints
+    text = format_order_input_text(order_lines, component_refdes)
     path = work_dir / "order_input.txt"
     path.write_text(text, encoding="utf-8")
     return path
 
 
-def write_arc_constrain(work_dir: Path, constraints: Any) -> Path:
-    line_width = 3.0
-    line_spacing = 4.5
-    if isinstance(constraints, dict):
+def format_order_input_text(order_lines: list[dict[str, Any]], component_refdes: str) -> str:
+    layers: dict[str, list[dict[str, Any]]] = {}
+    for index, item in enumerate(order_lines, start=1):
+        if not isinstance(item, dict):
+            continue
+        net = str(item.get("net") or "").strip()
+        layer = str(item.get("layer") or "").strip()
+        if not net or not layer:
+            continue
         try:
-            if constraints.get("LineWidth") is not None:
-                line_width = float(constraints["LineWidth"])
+            order = int(item.get("order", index))
         except (TypeError, ValueError):
-            pass
-        try:
-            if constraints.get("LineSpacing") is not None:
-                line_spacing = float(constraints["LineSpacing"])
-        except (TypeError, ValueError):
-            pass
-    path = work_dir / "constrain.txt"
-    path.write_text(
-        f"CrossLayer:1\nviaradius: 8\nkeepoutlength: 9.5\nkeepoutradius: 14.0\n"
-        f"LineWidth:{line_width:g}\nLineSpacing:{line_spacing:g}\n",
-        encoding="utf-8",
-    )
-    return path
+            order = index
+        layers.setdefault(layer, []).append({"net": net, "layer": layer, "order": max(1, order)})
+
+    lines = [component_refdes.strip(), str(len(layers))]
+    for layer_entries in layers.values():
+        ordered_entries = sorted(layer_entries, key=lambda item: item["order"])
+        lines.append(str(len(ordered_entries)))
+        lines.extend(f"{item['net']} {item['layer']} {item['order']}" for item in ordered_entries)
+    return "\n".join(lines)
+
+
+def copy_arc_constrain(work_dir: Path, router_dir: Path) -> Path:
+    source = router_dir / "constrain.txt"
+    if not source.is_file():
+        raise FileNotFoundError(f"arc 布线器缺少 constrain.txt: {source}")
+    target = work_dir / "constrain.txt"
+    shutil.copyfile(source, target)
+    return target
 
 
 def parse_order_input_text(text: str) -> dict[str, Any]:
@@ -279,6 +286,14 @@ def parse_order_input_text(text: str) -> dict[str, Any]:
     if len(first_parts) < 3:
         selected_bga = lines[0]
         index = 1
+    grouped = _parse_layer_grouped_order_lines(lines, index)
+    if grouped is not None:
+        return {
+            "selectedBGA": selected_bga,
+            "orderLines": _normalize_order_lines_by_order(grouped),
+            "constraints": {},
+        }
+
     constraints: dict[str, Any] = {}
     while index < len(lines):
         parts = lines[index].split()
@@ -309,14 +324,58 @@ def parse_order_input_text(text: str) -> dict[str, Any]:
             continue
         order_lines.append({"net": net, "layer": layer, "order": order})
 
-    order_lines.sort(key=lambda item: item.get("order", 0))
-    for idx, item in enumerate(order_lines, start=1):
-        item["order"] = idx
     return {
         "selectedBGA": selected_bga,
-        "orderLines": order_lines,
+        "orderLines": _normalize_order_lines_by_order(order_lines),
         "constraints": constraints,
     }
+
+
+def _normalize_order_lines_by_order(order_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = [dict(item) for item in order_lines]
+    normalized.sort(key=lambda item: item.get("order", 0))
+    for idx, item in enumerate(normalized, start=1):
+        item["order"] = idx
+    return normalized
+
+
+def _parse_layer_grouped_order_lines(lines: list[str], index: int) -> list[dict[str, Any]] | None:
+    if index >= len(lines):
+        return None
+    try:
+        layer_count = int(lines[index])
+    except ValueError:
+        return None
+    if layer_count < 0:
+        return None
+
+    cursor = index + 1
+    order_lines: list[dict[str, Any]] = []
+    for _ in range(layer_count):
+        if cursor >= len(lines):
+            return None
+        try:
+            block_count = int(lines[cursor])
+        except ValueError:
+            return None
+        if block_count < 0:
+            return None
+        cursor += 1
+        for _ in range(block_count):
+            if cursor >= len(lines):
+                return None
+            parts = lines[cursor].split()
+            cursor += 1
+            if len(parts) < 3:
+                return None
+            net, layer, order_text = parts[0], parts[1], parts[2]
+            try:
+                order = int(order_text)
+            except ValueError:
+                return None
+            order_lines.append({"net": net, "layer": layer, "order": order})
+
+    return order_lines if cursor == len(lines) else None
 
 
 def parse_order_input_file(path: Path) -> dict[str, Any]:
@@ -469,7 +528,7 @@ def generate_fanout_params(
     layout_path = write_layout_inputs(work_dir, project_data)
     write_component_input(work_dir, selected_bga)
     if router_execution_family(normalized) == "arc":
-        write_arc_constrain(work_dir, constraints or {})
+        copy_arc_constrain(work_dir, router_dir)
 
     _run_layer_assign(work_dir, router_dir, normalized, layout_path.name, "component_input.txt")
     _run_escape_order(work_dir, router_dir, layout_path.name)
@@ -533,7 +592,7 @@ def run_bjut_route(
     write_component_input(work_dir, selected_bga)
     constraints = fanout_params.get("constraints") or {}
     if router_execution_family(router_type) == "arc":
-        write_arc_constrain(work_dir, constraints)
+        copy_arc_constrain(work_dir, router_dir)
 
     _run_layer_assign(work_dir, router_dir, router_type, layout_path.name, "component_input.txt")
     _run_escape_order(work_dir, router_dir, layout_path.name)

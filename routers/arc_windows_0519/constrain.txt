@@ -1,0 +1,6 @@
+LineWidth:3
+LineSpacing:4.5
+CrossLayer:1
+viaradius: 8
+keepoutlength: 6
+keepoutradius: 14.0

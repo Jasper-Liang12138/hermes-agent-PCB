@@ -219,6 +219,7 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
     router_dir.mkdir()
     for name in ("a.out", "b.out", "c.out"):
         (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
     (router_dir / "Turn_QYF.py").write_text(
         "from pathlib import Path\n"
         "Path('routing_input.txt').write_text('(routes (u35))', encoding='utf-8')\n"
@@ -261,7 +262,7 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
 
     _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-route-selected")
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == (
-        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU35"
+        "U35\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
     )
 
 
@@ -313,6 +314,7 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
     router_dir.mkdir()
     for name in ("a.out", "b.out", "c.out"):
         (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
     (router_dir / "Turn_QYF.py").write_text(
         "from pathlib import Path\n"
         "Path('routing_input.txt').write_text('(routes (fpga1))', encoding='utf-8')\n"
@@ -363,7 +365,7 @@ def test_handle_function_call_route_uses_explicit_session_cache(monkeypatch, tmp
     _assert_route_summary(result, "布线成功", tmp_path / "routing_input.txt", "sess-explicit-route")
     assert (tmp_path / "版图信息.txt").read_text(encoding="utf-8") == '(pcb_data (component (name "FPGA1")))'
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == (
-        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nFPGA1"
+        "FPGA1\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
     )
 
 
@@ -379,6 +381,7 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
     work_dir.mkdir()
     for name in ("a.out", "b.out", "c.out"):
         (router_dir / name).write_text("runtime", encoding="utf-8")
+    (router_dir / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
     (router_dir / "Turn_QYF.py").write_text(
         "from pathlib import Path\n"
         "Path('routing_input.txt').write_text('(arc routed)', encoding='utf-8')\n"
@@ -431,9 +434,9 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
     assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-arc-route"]
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U27\n"
     assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == (
-        "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU27"
+        "U27\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
     )
-    assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "LineWidth:3\nLineSpacing:4.5\n"
+    assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "PROFILE_CONSTRAINT\n"
     assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == ["c.out"]
 
 
@@ -495,7 +498,7 @@ def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
     _assert_route_summary(result, "135 ok", work_dir / "routing_input.txt", "sess-135-route")
     assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-135-route"]
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U22\n"
-    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "VCC SIG04 2\n\nU22"
+    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "U22\n1\n1\nVCC SIG04 2"
     assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == [
         "d.out",
         "e.out",

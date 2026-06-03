@@ -976,15 +976,10 @@ class WebSocketAdapter(BasePlatformAdapter):
         if labels:
             self._session_selection_labels[session_id] = tuple(labels)
 
-        if len(labels) == 1:
-            self._session_selected_targets[session_id] = labels[0]
-            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-            self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
-            visible = self._router_type_prompt(session_id)
-        else:
-            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-            self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
-            visible = "已识别到多个 BGA 候选，请选择目标器件。"
+        self._session_selected_targets.pop(session_id, None)
+        self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+        self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
+        visible = "已识别到 BGA 候选，请选择目标器件。"
 
         await self.send(
             chat_id=session_id,
@@ -3672,11 +3667,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             self._session_route_algorithms.pop(session_id, None)
             self._session_fanout_modules.pop(session_id, None)
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-            if len(labels) == 1:
-                self._session_selected_targets[session_id] = labels[0]
-                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
-            else:
-                self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
+            self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
 
     @staticmethod
     def _pcb_fields_fingerprint(pcb_fields: Dict[str, Any]) -> str:
