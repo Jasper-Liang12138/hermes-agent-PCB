@@ -225,19 +225,6 @@ def test_extract_first_json_object_strips_qwen_thinking():
 
 
 def test_extract_bga_prefers_long_context_analysis(monkeypatch):
-    class _FakeBGA:
-        def __init__(self, label: str, detail: str):
-            self.label = label
-            self.detail = detail
-
-        def to_dict(self):
-            return {"label": self.label, "detail": self.detail}
-
-    fake_service = types.SimpleNamespace(
-        extract_bga_from_txt=lambda **kwargs: [_FakeBGA("U22", "BGA 400pin")]
-    )
-
-    monkeypatch.setattr(pcb_chunking_tool, "_service", fake_service)
     monkeypatch.setattr(
         pcb_chunking_tool,
         "_summarize_board_model",
@@ -252,7 +239,7 @@ def test_extract_bga_prefers_long_context_analysis(monkeypatch):
         pcb_chunking_tool,
         "_analyze_board_with_model",
         lambda board_text: {
-            "selection": [],
+            "selection": [{"label": "U99", "detail": "model invented BGA"}],
             "boardSummary": {
                 "stackupSummary": ["Top: signal", "Art03: signal"],
                 "packageHints": ["U22: BGA 400pin"],
@@ -276,29 +263,26 @@ def test_extract_bga_prefers_long_context_analysis(monkeypatch):
         },
     )
 
-    result = json.loads(pcb_chunking_tool._extract_bga("(pcb demo)"))
+    board_text = """
+(part "PART400"
+  (footprint "PKG_400")
+  (class "IC")
+  (pincount 400)
+)
+(component "U22"
+  (part "PART400")
+)
+"""
+    result = json.loads(pcb_chunking_tool._extract_bga(board_text))
 
     assert result["source"] == "llm_long_context"
     assert result["fallbackUsed"] is False
-    assert result["selection"] == [{"label": "U22", "detail": "BGA 400pin"}]
+    assert result["selection"] == [{"label": "U22", "detail": "PKG_400 (400 pins)"}]
     assert result["boardSummary"]["stackupSummary"] == ["Top: signal", "Art03: signal"]
     assert result["fanoutContext"]["recommendedEscapeLayers"] == ["Top", "Art03"]
 
 
 def test_extract_bga_falls_back_to_rule_path(monkeypatch):
-    class _FakeBGA:
-        def __init__(self, label: str, detail: str):
-            self.label = label
-            self.detail = detail
-
-        def to_dict(self):
-            return {"label": self.label, "detail": self.detail}
-
-    fake_service = types.SimpleNamespace(
-        extract_bga_from_txt=lambda **kwargs: [_FakeBGA("U35", "BGA 256pin")]
-    )
-
-    monkeypatch.setattr(pcb_chunking_tool, "_service", fake_service)
     monkeypatch.setattr(
         pcb_chunking_tool,
         "_summarize_board_model",
@@ -319,11 +303,21 @@ def test_extract_bga_falls_back_to_rule_path(monkeypatch):
 
     monkeypatch.setattr(pcb_chunking_tool, "_analyze_board_with_model", _raise)
 
-    result = json.loads(pcb_chunking_tool._extract_bga("(pcb demo)"))
+    board_text = """
+(part "PART256"
+  (footprint "PKG_256")
+  (class "IC")
+  (pincount 256)
+)
+(component "U35"
+  (part "PART256")
+)
+"""
+    result = json.loads(pcb_chunking_tool._extract_bga(board_text))
 
     assert result["source"] == "rule_fallback"
     assert result["fallbackUsed"] is True
-    assert result["selection"] == [{"label": "U35", "detail": "BGA 256pin"}]
+    assert result["selection"] == [{"label": "U35", "detail": "PKG_256 (256 pins)"}]
     assert result["boardSummary"]["stackupSummary"] == [
         "Top: signal",
         "Gnd02: plane",
@@ -331,6 +325,41 @@ def test_extract_bga_falls_back_to_rule_path(monkeypatch):
     ]
     assert result["fanoutContext"]["recommendedEscapeLayers"] == ["Top", "Art03"]
     assert "已回退到规则提取" in result["message"]
+
+
+def test_script_bga_selection_uses_dfa_class_or_pin_threshold_not_footprint_name():
+    board_text = """
+(part "SMALL_BGA"
+  (footprint "BGA_SMALL")
+  (class "IC")
+  (pincount 100)
+)
+(part "LARGE_QFN"
+  (footprint "QFN_256")
+  (class "IC")
+  (pincount 256)
+)
+(part "DFA_SMALL"
+  (footprint "QFN_64")
+  (class "IC")
+  (pincount 64)
+)
+(component "U10"
+  (part "SMALL_BGA")
+)
+(component "U22"
+  (part "LARGE_QFN")
+)
+(component "U27"
+  (part "DFA_SMALL")
+  (property (propname "DFA_DEV_CLASS") (propvalue "BGA"))
+)
+"""
+
+    assert pcb_chunking_tool._extract_rule_bga_selection(board_text) == [
+        {"label": "U27", "detail": "QFN_64 (64 pins)"},
+        {"label": "U22", "detail": "QFN_256 (256 pins)"},
+    ]
 
 
 def test_resolve_board_text_uses_websocket_cache_for_sentinel():
