@@ -1726,7 +1726,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         project_line = f"projectid: {project_id}\n" if project_id else ""
         forced_line = (
             "forced_skill: global_fanout\n"
-            "本轮用户使用 #逃逸布线 或 #全局fanout 强制进入全局 BGA fanout/逃逸布线；"
+            "本轮用户使用 #逃逸布线、#全局fanout 或短命令“逃逸布线”强制进入全局 BGA fanout/逃逸布线；"
             "即使前端当前有选中 traces，也禁止调用 getSelectedElements、drop_net 或 reroute。\n"
             if forced_global_fanout
             else ""
@@ -2340,7 +2340,13 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_forced_global_fanout_command(text: str) -> bool:
-        return bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text or ""))
+        text = text or ""
+        if _FORCE_GLOBAL_FANOUT_TAG_RE.search(text):
+            return True
+        if _PCB_CONCEPT_QUESTION_RE.search(text) or _CHAT_ONLY_RE.search(text):
+            return False
+        compact = re.sub(r"\s+", "", text.strip().lower())
+        return compact in {"逃逸布线", "bga逃逸布线", "pcb逃逸布线"}
 
     @staticmethod
     def _is_explicit_cancel_flow(text: str) -> bool:

@@ -305,6 +305,7 @@ def test_websocket_reroute_can_start_without_existing_selection(text):
         "#逃逸 布线；",
         "#全局fanout",
         "＃全局 fanout",
+        "逃逸布线",
         "#逃逸布线，告诉我什么是BGA逃逸布线",
     ],
 )
@@ -329,15 +330,25 @@ def test_unknown_or_partial_hashtag_commands_do_not_force_pcb_skill(text):
     assert decision.intent != "pcb_reroute_selected"
 
 
-def test_websocket_escape_routing_phrase_without_hash_is_not_forced_command():
+def test_websocket_escape_routing_phrase_without_hash_forces_global_fanout():
     adapter = _make_adapter()
 
     decision = adapter._decide_route("sess-force-escape-routing", "逃逸布线")
 
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_entry"
-    assert decision.reason == "pcb_entry"
+    assert decision.reason == "forced_global_fanout"
     assert decision.bootstrap_get_project is True
+
+
+@pytest.mark.parametrize("text", ["什么是逃逸布线", "不要布线，只解释一下逃逸布线原理"])
+def test_escape_routing_concept_or_noop_does_not_force_global_fanout(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-escape-chat", text)
+
+    assert decision.mode == "chat"
+    assert decision.reason != "forced_global_fanout"
 
 
 def test_websocket_reroute_interrupts_pending_fanout_confirmation():
@@ -1718,7 +1729,7 @@ async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(mon
     assert "帮我对U27做BGA逃逸布线" in seen["text"]
 
 
-@pytest.mark.parametrize("content", ["#逃逸布线", "#全局fanout"])
+@pytest.mark.parametrize("content", ["#逃逸布线", "#全局fanout", "逃逸布线"])
 @pytest.mark.asyncio
 async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monkeypatch, content):
     adapter = _make_adapter(route_intent_llm_enabled=True)
