@@ -18,6 +18,7 @@ import asyncio
 import subprocess
 import os
 import sys
+import shutil
 import runpy
 import io
 import contextlib
@@ -138,12 +139,19 @@ def _write_arc_constraint(work_dir: Path, constraints: Any) -> Path:
     return path
 
 
+def _copy_arc_constraint(work_dir: Path, router_dir: Path) -> Path:
+    source = router_dir / "constrain.txt"
+    if not source.is_file():
+        raise FileNotFoundError(f"arc 布线器缺少 constrain.txt: {source}")
+    path = work_dir / "constrain.txt"
+    shutil.copyfile(source, path)
+    return path
+
+
 def _write_order_input(work_dir: Path, order_lines: list[dict[str, Any]], component_refdes: str) -> Path:
-    order_text = "\n".join(
-        f"{item['net']} {item['layer']} {item['order']}"
-        for item in order_lines
-    )
-    order_text = f"{order_text}\n\n{component_refdes}"
+    from tools.pcb_bjut_router import format_order_input_text
+
+    order_text = format_order_input_text(order_lines, component_refdes)
     path = work_dir / "order_input.txt"
     path.write_text(order_text, encoding="utf-8")
     return path
@@ -604,7 +612,8 @@ def _run_arc_router(
     _validate_arc_order_lines(order_lines)
     _remove_file_if_exists(work_dir / f"{component_refdes}_pins.csv")
     _write_component_input(work_dir, component_refdes)
-    constrain_path = _write_arc_constraint(work_dir, constraints)
+    _ = constraints
+    constrain_path = _copy_arc_constraint(work_dir, router_dir)
     _write_arc_layer_input(work_dir, order_lines, component_refdes)
 
     c_out = _copy_runtime_file(router_dir, work_dir, "c.out")

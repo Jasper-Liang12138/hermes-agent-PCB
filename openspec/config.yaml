@@ -1,0 +1,53 @@
+schema: spec-driven
+
+context: |
+  Project: hermes-agent PCB Demo
+  Domain: AI-assisted PCB routing for BGA fanout, escape routing, and selected-trace local reroute workflows.
+
+  Primary runtime:
+    - Python 3.11 package: hermes-agent
+    - Entry points: hermes, hermes-agent, hermes-acp
+    - Main modules: run_agent.py, cli.py, hermes_cli/, agent/, tools/, gateway/, acp_adapter/
+    - Test framework: pytest with integration tests excluded by default
+
+  Supporting runtime:
+    - Node.js >=18 is used for browser tooling dependencies.
+    - Windows delivery packaging uses PyInstaller and produces agent.exe.
+
+  PCB-specific capabilities:
+    - hardware/pcb-intelligence handles full BGA fanout and escape routing.
+    - hardware/pcb-reroute handles selected-trace rip-up followed by local reroute.
+    - Full BGA routing uses routerType values such as arc, 135, rl, rl_arc, and rl_135 where supported by the implementation.
+    - Local reroute must use frontend-selected trace ids; do not infer deletion targets from free-form text.
+    - Structured PCB responses use ##PCB_FIELDS## and ##PCB_FIELDS_END## markers containing valid JSON only.
+
+  Delivery constraints:
+    - Windows delivery targets PCB-AGENT/ with agent.exe, _internal/, config.ini, routers/, skills/, logs/, router_work/, model/best.pt, and startup/install scripts.
+    - Default delivery server port is 7073 unless the target environment explicitly configures another port.
+    - logs/ and router_work/ should be empty in release packages.
+    - Do not manually edit router output files; fix parsing/import issues in code.
+
+  Engineering conventions:
+    - Keep changes scoped and compatible with existing Hermes skill/tool patterns.
+    - Preserve frontend protocol fields and existing JSON marker formats.
+    - Prefer configuration-driven paths and environment variables over hard-coded local machine paths.
+    - Keep user-visible PCB workflow messages concise; large board data and diagnostics belong in structured fields or files.
+    - Add or update focused pytest coverage for behavioral changes with meaningful risk.
+
+rules:
+  proposal:
+    - State the PCB workflow impact clearly: BGA fanout, local reroute, gateway/API, packaging, or shared agent behavior.
+    - Include non-goals when a request might be confused with another PCB workflow.
+    - Mention protocol or delivery compatibility risks when touching ##PCB_FIELDS## output, WebSocket flows, router adapters, or packaged files.
+  design:
+    - Describe affected modules, data flow, and failure handling.
+    - Call out Windows packaging, router path, and config.ini implications when relevant.
+    - Avoid broad rewrites unless required by the requested behavior.
+  specs:
+    - Use concrete requirements with observable behavior.
+    - Include at least one scenario for success and one for important failure or validation behavior.
+    - Keep global BGA fanout and selected-trace local reroute requirements separate.
+  tasks:
+    - Break work into implementation, tests, and validation steps.
+    - Include exact verification commands when known.
+    - Add packaging or manual delivery checks for changes that affect agent.exe or PCB-AGENT contents.

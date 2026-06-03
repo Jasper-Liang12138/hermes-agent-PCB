@@ -1217,7 +1217,7 @@ async def _run_stream_fields_emitted_without_true_final() -> None:
     assert first["isFinal"] is None
     assert first["selection"] == [{"label": "U27", "detail": "BGA-256"}]
     assert "##PCB_FIELDS##" not in first["content"]
-    assert adapter._session_flow_states.get(session_id) == "wait_router_type"
+    assert adapter._session_flow_states.get(session_id) == "wait_selection"
 
     # 同一份累计内容重复到达时，不应重复发同样的结构字段
     result2 = await adapter.edit_message(

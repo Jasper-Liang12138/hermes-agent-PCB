@@ -61,6 +61,7 @@ def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
     work_dir = tmp_path / "arc_work"
     router_dir.mkdir()
     work_dir.mkdir()
+    (router_dir / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
 
     _write_step(
         router_dir / "c.out",
@@ -92,7 +93,7 @@ def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
 
     _assert_route_summary(result, "arc report", work_dir / "routing_input.txt", "arc-e2e")
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U27\n"
-    assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "LineWidth:3\nLineSpacing:4.5\n"
+    assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "PROFILE_CONSTRAINT\n"
 
 
 def test_arc_adapter_runs_pins_helper_when_router_does_not_emit_pin_csv(monkeypatch, tmp_path):
@@ -100,6 +101,7 @@ def test_arc_adapter_runs_pins_helper_when_router_does_not_emit_pin_csv(monkeypa
     work_dir = tmp_path / "arc_work"
     router_dir.mkdir()
     work_dir.mkdir()
+    (router_dir / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
 
     _write_step(router_dir / "get_pins.py", "assert sys.argv[1:] == ['layout_input.txt', 'U27']; (cwd / 'U27_pins.csv').write_text('PinNumber,Net\\n1,U27.NET1\\n', encoding='utf-8')")
     _write_step(
@@ -158,7 +160,7 @@ def test_135_adapter_e2e_with_fake_router(monkeypatch, tmp_path):
 
     _assert_route_summary(result, "135 report", work_dir / "routing_input.txt", "135-e2e")
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U22\n"
-    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "VCC SIG04 2\n\nU22"
+    assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "U22\n1\n1\nVCC SIG04 2"
 
 
 def test_135_adapter_runs_pins_helper_when_router_does_not_emit_pin_csv(monkeypatch, tmp_path):
@@ -198,6 +200,7 @@ def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
     runtime135 = tmp_path / "runtime135"
     for path in (arc_work, work135, arc_runtime, runtime135):
         path.mkdir()
+    (arc_runtime / "constrain.txt").write_text("PROFILE_CONSTRAINT\n", encoding="utf-8")
 
     for name, body in {
         "c.out": "assert sys.argv[1:] == ['order_input.txt', 'layout_input.txt', 'constrain.txt', 'component_input.txt']; (cwd / 'U1_pins.csv').write_text('PinNumber,Net\\n1,U1.NET1\\n', encoding='utf-8'); (cwd / 'net_list.txt').write_text('NET_A_P_SIG03 ; J1.A1 U1.A1 ; 3.00\\nNET_A_N_SIG03 ; J1.A2 U1.A2 ; 3.00\\n', encoding='utf-8'); (cwd / 'ARC_output.txt').write_text('arc', encoding='utf-8')",
@@ -237,5 +240,5 @@ def test_router_selection_arc_135_full_chain(monkeypatch, tmp_path):
 
         result = pcb_tools.route_bga(json.dumps({**base_payload, **override}))
         _assert_route_summary(result, expected_report, work_dir / "routing_input.txt", session_id)
-        expected_order = "NET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2\n\nU1"
+        expected_order = "U1\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
         assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == expected_order
