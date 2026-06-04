@@ -2010,7 +2010,10 @@ class AIAgent:
                 ),
             ))
 
-        block_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+        block_pattern = re.compile(
+            r"<tool[\s_-]*call>\s*(\{.*?\})\s*</tool[\s_-]*call>",
+            re.DOTALL | re.IGNORECASE,
+        )
         for match in block_pattern.finditer(content):
             add_call(match.group(1))
         cleaned = block_pattern.sub("", content)

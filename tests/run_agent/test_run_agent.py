@@ -152,6 +152,21 @@ def test_tool_call_shim_extracts_xml_tool_call(agent):
     assert calls[0].function.arguments == "{}"
 
 
+@pytest.mark.parametrize("tag", ["toolcall", "tool-call", "tool call"])
+def test_tool_call_shim_extracts_loose_xml_tool_call_tags(agent, tag):
+    agent.valid_tool_names = {"getProjectData"}
+    agent.tools = _make_tool_defs("getProjectData")
+
+    calls, cleaned = agent._extract_shim_tool_calls_from_text(
+        f'<{tag}>{{"name":"getProjectData","arguments":{{}}}}</{tag}>Please wait...'
+    )
+
+    assert cleaned == "Please wait..."
+    assert len(calls) == 1
+    assert calls[0].function.name == "getProjectData"
+    assert calls[0].function.arguments == "{}"
+
+
 def test_tool_call_shim_ignores_unknown_tool(agent):
     agent.valid_tool_names = {"getProjectData"}
     agent.tools = _make_tool_defs("getProjectData")

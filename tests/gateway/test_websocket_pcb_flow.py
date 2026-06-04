@@ -1734,6 +1734,7 @@ async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(mon
 async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monkeypatch, content):
     adapter = _make_adapter(route_intent_llm_enabled=True)
     seen = {}
+    sent = []
 
     async def handler(event):
         seen["auto_skill"] = event.auto_skill
@@ -1741,7 +1742,11 @@ async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monk
         seen["options"] = event.raw_message["options"]
         return None
 
+    async def fake_send(*, chat_id, content, **kwargs):
+        sent.append((chat_id, content))
+
     adapter.set_message_handler(handler)
+    monkeypatch.setattr(adapter, "send", fake_send)
 
     await adapter._handle_user_message(
         {
@@ -1760,6 +1765,38 @@ async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monk
     assert content in seen["text"]
     assert "projectid: proj-forced-fanout" in seen["text"]
     assert adapter._session_modes["sess-forced-fanout"] == "pcb"
+    assert sent == [("sess-forced-fanout", "已进入全局 BGA fanout/逃逸布线流程，正在获取版图信息。")]
+
+
+@pytest.mark.asyncio
+async def test_forced_fanout_empty_agent_response_sends_status_fallback(monkeypatch):
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    sent = []
+
+    async def handler(event):
+        return ""
+
+    async def fake_send(*, chat_id, content, **kwargs):
+        sent.append((chat_id, content))
+
+    adapter.set_message_handler(handler)
+    monkeypatch.setattr(adapter, "send", fake_send)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {"role": "user", "content": "#逃逸布线"},
+        },
+        "sess-forced-fanout-empty",
+        "proj-forced-fanout-empty",
+    )
+
+    assert sent == [
+        (
+            "sess-forced-fanout-empty",
+            "已进入全局 BGA fanout/逃逸布线流程，正在获取版图信息。",
+        )
+    ]
 
 
 @pytest.mark.parametrize("content", ["#reroute", "#拆线重布"])

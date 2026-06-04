@@ -920,6 +920,15 @@ class WebSocketAdapter(BasePlatformAdapter):
                     chat_id=session_id,
                     content=response,
                 )
+            elif decision.mode == _ROUTE_MODE_PCB:
+                fallback = (
+                    "已进入全局 BGA fanout/逃逸布线流程，正在获取版图信息。"
+                    if auto_skill == ["hardware/pcb-intelligence"]
+                    else "已进入拆线重布流程，请框选需要拆线的走线，或说明要拆哪根线。"
+                    if auto_skill == ["hardware/pcb-reroute"]
+                    else "已进入 PCB 业务流程，正在处理当前请求。"
+                )
+                await self.send(chat_id=session_id, content=fallback)
 
     async def _run_direct_bga_analysis(self, session_id: str, bootstrap_context: Dict[str, Any]) -> bool:
         """Run the BGA analysis tool from the adapter layer instead of asking the LLM to tool-call it."""
