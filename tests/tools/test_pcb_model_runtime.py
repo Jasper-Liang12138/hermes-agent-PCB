@@ -47,6 +47,7 @@ def _clear_model_env(monkeypatch):
         "PCB_MODEL_TOKEN_PARAMETER",
         "PCB_FORCE_OPENROUTER_QWEN",
         "PCB_MODEL_RUNTIME_DISABLE_DOTENV",
+        "PCB_AGENT_MODEL_CONFIG_TXT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PCB_MODEL_RUNTIME_DISABLE_DOTENV", "1")
@@ -120,6 +121,54 @@ def test_stage_specific_reroute_env_overrides_legacy_env(monkeypatch, tmp_path):
         "model": "stage-reroute-model",
         "base_url": "https://stage.example/v1",
         "api_key": "stage-secret-value",
+    }
+
+
+def test_model_config_txt_keeps_primary_and_reroute_models_separate(monkeypatch, tmp_path):
+    _clear_model_env(monkeypatch)
+    monkeypatch.setattr(pcb_model_runtime, "_runtime_from_global_config", lambda: {})
+    monkeypatch.setenv("PCB_DISABLE_OPENROUTER_QWEN", "1")
+    model_config = tmp_path / "model_config.txt"
+    model_config.write_text(
+        "[tool-planning-chat-model]\n"
+        "api_key = primary-secret-value\n"
+        "model = primary-model\n"
+        "base_url = https://primary.example/v1/chat/completions\n\n"
+        "[reroute-model]\n"
+        "api_key = reroute-secret-value\n"
+        "model = reroute-model\n"
+        "base_url = https://reroute.example/v1/chat/completions\n",
+        encoding="utf-8",
+    )
+    project_config = tmp_path / "config.ini"
+    project_config.write_text(
+        "[model]\n"
+        "api_key = config-secret-value\n"
+        "model = config-model\n"
+        "base_url = https://config.example/v1\n",
+        encoding="utf-8",
+    )
+
+    primary = pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        project_config_paths=[project_config],
+        require_api_key=True,
+    )
+    reroute = pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_REROUTE,
+        project_config_paths=[project_config],
+        require_api_key=True,
+    )
+
+    assert primary == {
+        "model": "primary-model",
+        "base_url": "https://primary.example/v1",
+        "api_key": "primary-secret-value",
+    }
+    assert reroute == {
+        "model": "reroute-model",
+        "base_url": "https://reroute.example/v1",
+        "api_key": "reroute-secret-value",
     }
 
 

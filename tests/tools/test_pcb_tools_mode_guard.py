@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from model_tools import handle_function_call
+from tools import pcb_model_runtime
 from tools import pcb_tools
 from tools import pcb_reroute_drc
 
@@ -73,6 +74,66 @@ def test_get_project_data_blocked_in_chat_mode(monkeypatch):
     payload = json.loads(result)
     assert "error" in payload
     assert "chat" in payload["error"]
+
+
+def test_generate_reroute_with_model_uses_reroute_runtime(monkeypatch):
+    captured = {}
+
+    def _fake_resolve_model_runtime(stage, **kwargs):
+        captured["stage"] = stage
+        captured["kwargs"] = kwargs
+        return {
+            "model": "reroute-only-model",
+            "base_url": "https://reroute.example/v1",
+            "api_key": "reroute-secret-value",
+        }
+
+    class _FakeAdapter:
+        def __init__(self, **kwargs):
+            captured["adapter_kwargs"] = kwargs
+
+        def generate(self, prompt_bundle, generation_config):
+            captured["prompt_bundle"] = prompt_bundle
+            captured["generation_config"] = generation_config
+            return (
+                json.dumps(
+                    {
+                        "kicadPatch": (
+                            "(segment (start 1 1) (end 2 2) "
+                            "(width 0.1524) (layer Top) (net 1))"
+                        )
+                    }
+                ),
+                {"model": "reroute-only-model"},
+            )
+
+    from tools import pcb_chunking_tool
+
+    monkeypatch.setattr(pcb_tools.pcb_model_runtime, "resolve_model_runtime", _fake_resolve_model_runtime)
+    monkeypatch.setattr(
+        pcb_chunking_tool,
+        "_make_openai_compatible_chat_adapter",
+        lambda **kwargs: _FakeAdapter(**kwargs),
+    )
+
+    payload = pcb_tools._generate_reroute_with_model(
+        nets=["N1"],
+        selected_trace_ids=["trace-1"],
+        dropped_board_data=(
+            '(segment (start 0 0) (end 1 1) (width 0.1524) (layer "Top") (net 1))'
+        ),
+        dropped_board_path="board-after-drop.txt",
+        dropped_objects=[],
+        local_context={},
+        constraints={},
+        check_report={},
+        session_id="sess-reroute-model",
+    )
+
+    assert captured["stage"] == pcb_model_runtime.STAGE_REROUTE
+    assert captured["kwargs"]["require_api_key"] is True
+    assert captured["adapter_kwargs"]["model"] == "reroute-only-model"
+    assert payload["kicadPatch"]
 
 
 def test_get_project_data_allowed_in_pcb_mode(monkeypatch):

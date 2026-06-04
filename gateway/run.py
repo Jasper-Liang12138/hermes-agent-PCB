@@ -32,6 +32,36 @@ def _resolve_local_config_ini() -> _pl.Path:
     return module_root / "config.ini"
 
 
+def _resolve_local_model_config_txt(config_ini_path: _pl.Path) -> _pl.Path:
+    env_path = _os.getenv("PCB_AGENT_MODEL_CONFIG_TXT", "").strip()
+    if env_path:
+        return _pl.Path(env_path)
+    config_dir = _pl.Path(config_ini_path).resolve().parent
+    return config_dir / "model_config.txt"
+
+
+def _apply_model_config_txt_primary_model(cfg: _cp.ConfigParser, config_ini_path: _pl.Path) -> None:
+    model_config_path = _resolve_local_model_config_txt(config_ini_path)
+    if not model_config_path.is_file():
+        return
+    parser = _cp.ConfigParser()
+    parser.read(model_config_path, encoding="utf-8-sig")
+    primary_section = None
+    for section in ("tool-planning-chat-model", "tool_planning_chat_model", "tool_planning_chat", "model"):
+        if parser.has_section(section):
+            primary_section = section
+            break
+    if not primary_section:
+        return
+    if not cfg.has_section("model"):
+        cfg.add_section("model")
+    for key in ("api_key", "model", "base_url"):
+        value = parser.get(primary_section, key, fallback="").strip()
+        if value:
+            cfg.set("model", key, value)
+    _os.environ["PCB_AGENT_MODEL_CONFIG_TXT"] = str(model_config_path)
+
+
 def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None:
     cfg = cfg or _config_ini_cfg
     if not isinstance(cfg, _cp.ConfigParser):
@@ -62,6 +92,7 @@ def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None
 _config_ini = _resolve_local_config_ini()
 _config_ini_cfg = _cp.ConfigParser()
 _config_ini_cfg.read(_config_ini, encoding="utf-8-sig")
+_apply_model_config_txt_primary_model(_config_ini_cfg, _config_ini)
 _apply_config_ini_env_overrides(_config_ini_cfg)
 
 if _config_ini_cfg.has_section("model"):

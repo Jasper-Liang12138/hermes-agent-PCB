@@ -740,7 +740,7 @@ def _build_board_context(board_text: str, token_counter: Any = None) -> dict[str
 
 def _resolve_model_runtime_config() -> dict[str, str]:
     return pcb_model_runtime.resolve_model_runtime(
-        pcb_model_runtime.STAGE_REROUTE,
+        pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
         project_config_paths=_candidate_project_config_paths(),
     )
 

@@ -1,5 +1,6 @@
 param(
     [string]$OutputDir = (Join-Path $PSScriptRoot "..\dist\PCB-AGENT"),
+    [string]$ModelConfigPath = $env:PCB_AGENT_MODEL_CONFIG_TXT,
     [switch]$SkipBuild,
     [switch]$SkipDeps
 )
@@ -12,6 +13,7 @@ $DeliverySrc = Join-Path $RepoRoot ".github\delivery"
 $HardwareSkillsSrc = Join-Path $RepoRoot "skills\hardware"
 $DocsSrc = Join-Path $RepoRoot "docs"
 $ConfigSrc = Join-Path $RepoRoot "config.ini"
+$ModelConfigSrc = if ($ModelConfigPath) { $ModelConfigPath } else { Join-Path $RepoRoot "model_config.txt" }
 $DefaultMemoriesSrc = Join-Path $DeliverySrc "memories"
 
 function Write-Info($msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
@@ -73,6 +75,11 @@ if (Test-Path $ConfigSrc) {
     Copy-Item -Force $ConfigSrc $OutputDir
 } else {
     Write-Warn "未找到 config.ini: $ConfigSrc"
+}
+
+if (Test-Path $ModelConfigSrc) {
+    Write-Info "Copying editable model_config.txt..."
+    Copy-Item -Force $ModelConfigSrc $OutputDir
 }
 
 Write-Info "Copying default memories..."

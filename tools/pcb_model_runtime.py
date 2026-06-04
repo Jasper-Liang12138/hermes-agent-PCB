@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 STAGE_REROUTE = "reroute"
 STAGE_EXPLAIN = "explain"
+STAGE_TOOL_PLANNING_CHAT = "tool_planning_chat"
 
 DEFAULT_BASE_URL = "https://wishub-x5.ctyun.cn/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -28,6 +29,7 @@ BUILTIN_OPENROUTER_API_KEY = (
 DEFAULT_STAGE_MODELS = {
     STAGE_REROUTE: "",
     STAGE_EXPLAIN: "",
+    STAGE_TOOL_PLANNING_CHAT: "",
 }
 
 _OPENAI_CHAT_COMPLETIONS_SUFFIX_RE = re.compile(r"/chat/completions/?$", re.IGNORECASE)
@@ -48,6 +50,17 @@ def _candidate_project_config_paths() -> list[Path]:
         paths.append(Path(bundled_root) / "config.ini")
     paths.append(Path(__file__).resolve().parents[1] / "config.ini")
     return paths
+
+
+def _candidate_model_config_paths(project_config_paths: Iterable[Path] | None = None) -> list[Path]:
+    paths: list[Path] = []
+    env_path = os.getenv("PCB_AGENT_MODEL_CONFIG_TXT", "").strip()
+    if env_path:
+        paths.append(Path(env_path))
+    for config_path in project_config_paths or _candidate_project_config_paths():
+        paths.append(Path(config_path).parent / "model_config.txt")
+    paths.append(Path(__file__).resolve().parents[1] / "model_config.txt")
+    return list(dict.fromkeys(paths))
 
 
 def _candidate_model_doc_paths(project_config_paths: Iterable[Path] | None = None) -> list[Path]:
@@ -237,6 +250,9 @@ def _runtime_from_env(stage: str, *, stage_specific: bool) -> dict[str, str]:
             }
         return {}
 
+    if stage == STAGE_TOOL_PLANNING_CHAT and stage_specific:
+        return {}
+
     if stage_specific:
         return {
             "model": _env_first("CTYUN_REROUTE_MODEL", "PCB_REROUTE_MODEL"),
@@ -279,7 +295,7 @@ def _runtime_from_project_config(
     if not parser:
         return {}
 
-    sections = ["model"] if stage == STAGE_REROUTE else []
+    sections = ["model"] if stage in (STAGE_REROUTE, STAGE_TOOL_PLANNING_CHAT) else []
     sections.extend((f"{stage}_model", stage))
     result = {"model": "", "base_url": "", "api_key": ""}
     for section in sections:
@@ -290,6 +306,54 @@ def _runtime_from_project_config(
         api_key = parser.get(section, "api_key", fallback="").strip()
         _merge_config(result, {"model": model, "base_url": base_url, "api_key": api_key})
     return result
+
+
+def _runtime_from_model_config_txt(
+    stage: str,
+    project_config_paths: Iterable[Path] | None = None,
+) -> dict[str, str]:
+    section_map = {
+        STAGE_TOOL_PLANNING_CHAT: (
+            "tool-planning-chat-model",
+            "tool_planning_chat_model",
+            "tool_planning_chat",
+            "model",
+        ),
+        STAGE_REROUTE: (
+            "reroute-model",
+            "reroute_model",
+            "reroute",
+        ),
+        STAGE_EXPLAIN: (
+            "explain-model",
+            "explain_model",
+            "explain",
+        ),
+    }
+    parser = configparser.ConfigParser()
+    for path in _candidate_model_config_paths(project_config_paths):
+        if not path.is_file():
+            continue
+        try:
+            parser.read(path, encoding="utf-8-sig")
+        except Exception as exc:
+            logger.warning("Failed reading PCB model_config.txt from %s: %s", path, exc)
+            continue
+        result = {"model": "", "base_url": "", "api_key": ""}
+        for section in section_map.get(stage, ()):
+            if not parser.has_section(section):
+                continue
+            _merge_config(
+                result,
+                {
+                    "model": parser.get(section, "model", fallback=""),
+                    "base_url": parser.get(section, "base_url", fallback=""),
+                    "api_key": parser.get(section, "api_key", fallback=""),
+                },
+            )
+        if any(result.values()):
+            return result
+    return {}
 
 
 def _runtime_from_global_config() -> dict[str, str]:
@@ -316,14 +380,15 @@ def resolve_model_runtime(
     doc_paths: Iterable[Path] | None = None,
     require_api_key: bool = False,
 ) -> dict[str, str]:
-    if stage not in (STAGE_REROUTE, STAGE_EXPLAIN):
+    if stage not in (STAGE_REROUTE, STAGE_EXPLAIN, STAGE_TOOL_PLANNING_CHAT):
         raise ValueError(f"unsupported PCB model stage: {stage}")
 
     runtime = {"model": "", "base_url": "", "api_key": ""}
-    if stage == STAGE_REROUTE:
+    if stage in (STAGE_REROUTE, STAGE_TOOL_PLANNING_CHAT):
         _merge_config(runtime, _runtime_from_global_config())
         _merge_config(runtime, _runtime_from_env(stage, stage_specific=False))
     _merge_config(runtime, _runtime_from_project_config(stage, project_config_paths))
+    _merge_config(runtime, _runtime_from_model_config_txt(stage, project_config_paths))
     _merge_config(runtime, _runtime_from_env(stage, stage_specific=True))
 
     doc_config = extract_stage_runtime_config_from_doc(
@@ -350,7 +415,12 @@ def resolve_model_runtime(
     runtime["base_url"] = normalize_openai_base_url(runtime["base_url"])
 
     if not runtime["model"]:
-        model_hint = "CTYUN_EXPLAIN_MODEL" if stage == STAGE_EXPLAIN else "CTYUN_REROUTE_MODEL/CTYUN_MODEL"
+        if stage == STAGE_EXPLAIN:
+            model_hint = "CTYUN_EXPLAIN_MODEL"
+        elif stage == STAGE_REROUTE:
+            model_hint = "CTYUN_REROUTE_MODEL/CTYUN_MODEL"
+        else:
+            model_hint = "CTYUN_MODEL/OPENAI_MODEL"
         raise RuntimeError(f"{stage} model is not configured; set {model_hint} or provide it in controlled config")
     if require_api_key and not runtime["api_key"]:
         env_hint = "CTYUN_EXPLAIN_APP_KEY" if stage == STAGE_EXPLAIN else "CTYUN_APP_KEY"

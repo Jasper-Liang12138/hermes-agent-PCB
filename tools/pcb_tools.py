@@ -2709,7 +2709,10 @@ def _generate_reroute_with_model(
     try:
         from tools import pcb_chunking_tool as chunking
 
-        runtime = chunking._resolve_model_runtime_config()
+        runtime = pcb_model_runtime.resolve_model_runtime(
+            pcb_model_runtime.STAGE_REROUTE,
+            require_api_key=True,
+        )
         adapter_factory = getattr(chunking, "_make_openai_compatible_chat_adapter", None)
         if adapter_factory is None:
             adapter_factory = chunking._OpenAICompatibleChatAdapter

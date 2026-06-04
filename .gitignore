@@ -9,6 +9,7 @@ __pycache__/
 .env.development.local
 .env.test.local
 .env.production.local
+model_config.txt
 .env.development
 .env.test
 export*
