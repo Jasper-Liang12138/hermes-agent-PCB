@@ -172,6 +172,50 @@ def test_model_config_txt_keeps_primary_and_reroute_models_separate(monkeypatch,
     }
 
 
+def test_config_ini_keeps_primary_and_reroute_models_separate(monkeypatch, tmp_path):
+    _clear_model_env(monkeypatch)
+    monkeypatch.setattr(pcb_model_runtime, "_runtime_from_global_config", lambda: {})
+    monkeypatch.setenv("PCB_DISABLE_OPENROUTER_QWEN", "1")
+    project_config = tmp_path / "config.ini"
+    project_config.write_text(
+        "[model]\n"
+        "api_key = legacy-secret-value\n"
+        "model = legacy-model\n"
+        "base_url = https://legacy.example/v1\n\n"
+        "[tool-planning-chat-model]\n"
+        "api_key = primary-secret-value\n"
+        "model = primary-model\n"
+        "base_url = https://primary.example/v1/chat/completions\n\n"
+        "[reroute-model]\n"
+        "api_key = reroute-secret-value\n"
+        "model = reroute-model\n"
+        "base_url = https://reroute.example/v1/chat/completions\n",
+        encoding="utf-8",
+    )
+
+    primary = pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        project_config_paths=[project_config],
+        require_api_key=True,
+    )
+    reroute = pcb_model_runtime.resolve_model_runtime(
+        pcb_model_runtime.STAGE_REROUTE,
+        project_config_paths=[project_config],
+        require_api_key=True,
+    )
+
+    assert primary == {
+        "model": "primary-model",
+        "base_url": "https://primary.example/v1",
+        "api_key": "primary-secret-value",
+    }
+    assert reroute == {
+        "model": "reroute-model",
+        "base_url": "https://reroute.example/v1",
+        "api_key": "reroute-secret-value",
+    }
+
+
 def test_builtin_openrouter_fallback_makes_stages_ready_without_export(monkeypatch, tmp_path):
     _clear_model_env(monkeypatch)
     monkeypatch.setattr(pcb_model_runtime, "_runtime_from_global_config", lambda: {})

@@ -295,8 +295,28 @@ def _runtime_from_project_config(
     if not parser:
         return {}
 
-    sections = ["model"] if stage in (STAGE_REROUTE, STAGE_TOOL_PLANNING_CHAT) else []
-    sections.extend((f"{stage}_model", stage))
+    if stage == STAGE_TOOL_PLANNING_CHAT:
+        sections = [
+            "model",
+            "tool-planning-chat-model",
+            "tool_planning_chat_model",
+            "tool_planning_chat",
+        ]
+    elif stage == STAGE_REROUTE:
+        sections = [
+            "model",
+            "reroute-model",
+            "reroute_model",
+            "reroute",
+        ]
+    elif stage == STAGE_EXPLAIN:
+        sections = [
+            "explain-model",
+            "explain_model",
+            "explain",
+        ]
+    else:
+        sections = [f"{stage}_model", stage]
     result = {"model": "", "base_url": "", "api_key": ""}
     for section in sections:
         if not parser.has_section(section):

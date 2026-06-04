@@ -31,6 +31,34 @@ rl_root_dir = F:/PCB/routers/bk_routing
     assert gateway_run.os.environ["ROUTER_RL_ROOT_DIR"] == "F:/PCB/routers/bk_routing"
 
 
+def test_config_ini_primary_model_section_overrides_legacy_model(monkeypatch):
+    import gateway.run as gateway_run
+
+    cfg = configparser.ConfigParser()
+    cfg.read_string(
+        """
+[model]
+api_key = legacy-key
+model = legacy-model
+base_url = https://legacy.example/v1
+
+[tool-planning-chat-model]
+api_key = primary-key
+model = primary-model
+base_url = https://primary.example/v1
+"""
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://your-endpoint/v1")
+
+    gateway_run._apply_config_ini_env_overrides(cfg)
+
+    assert gateway_run.os.environ["OPENAI_API_KEY"] == "primary-key"
+    assert gateway_run.os.environ["OPENAI_BASE_URL"] == "https://primary.example/v1"
+    assert cfg["model"]["model"] == "primary-model"
+
+
 def test_config_ini_override_ignores_dict_argument(monkeypatch):
     import gateway.run as gateway_run
 

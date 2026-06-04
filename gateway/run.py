@@ -62,10 +62,29 @@ def _apply_model_config_txt_primary_model(cfg: _cp.ConfigParser, config_ini_path
     _os.environ["PCB_AGENT_MODEL_CONFIG_TXT"] = str(model_config_path)
 
 
+def _apply_config_ini_primary_model_section(cfg: _cp.ConfigParser) -> None:
+    if not isinstance(cfg, _cp.ConfigParser):
+        return
+    primary_section = None
+    for section in ("tool-planning-chat-model", "tool_planning_chat_model", "tool_planning_chat"):
+        if cfg.has_section(section):
+            primary_section = section
+            break
+    if not primary_section:
+        return
+    if not cfg.has_section("model"):
+        cfg.add_section("model")
+    for key in ("api_key", "model", "base_url"):
+        value = cfg.get(primary_section, key, fallback="").strip()
+        if value:
+            cfg.set("model", key, value)
+
+
 def _apply_config_ini_env_overrides(cfg: _cp.ConfigParser | None = None) -> None:
     cfg = cfg or _config_ini_cfg
     if not isinstance(cfg, _cp.ConfigParser):
         cfg = _config_ini_cfg
+    _apply_config_ini_primary_model_section(cfg)
     if cfg.has_section("model"):
         model_cfg = cfg["model"]
         if model_cfg.get("api_key", "").strip():
