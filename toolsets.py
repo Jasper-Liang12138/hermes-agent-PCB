@@ -385,13 +385,13 @@ TOOLSETS = {
 
     "hermes-websocket": {
         "description": "WebSocket toolset - PCB BGA fanout routing agent (Qiyunfang protocol)",
-        "tools": _HERMES_CORE_TOOLS + ["getProjectData", "getSelectedElements", "GetSelectedElements", "deleteTracesById", "generateFanoutParams", "route", "pcb_extract_bga", "drop_net", "reroute"],
+        "tools": _HERMES_CORE_TOOLS + ["getProjectData", "getSelectedElements", "GetSelectedElements", "deleteTracesById", "deleteTracesForRerouting", "generateFanoutParams", "route", "pcb_extract_bga", "drop_net", "reroute"],
         "includes": []
     },
 
     "hermes-websocket-pcb": {
         "description": "WebSocket PCB-focused toolset with only PCB routing primitives",
-        "tools": ["getProjectData", "getSelectedElements", "GetSelectedElements", "deleteTracesById", "generateFanoutParams", "route", "pcb_extract_bga", "drop_net", "reroute", "memory", "todo"],
+        "tools": ["getProjectData", "getSelectedElements", "GetSelectedElements", "deleteTracesById", "deleteTracesForRerouting", "generateFanoutParams", "route", "pcb_extract_bga", "drop_net", "reroute", "memory", "todo"],
         "includes": []
     },
 

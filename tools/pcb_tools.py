@@ -2023,112 +2023,143 @@ def _nested_text_value(data: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def drop_net(userText: str, projectID: str = "", session_id: Optional[str] = None) -> str:
-    """
-    Rip up currently selected traces and cache the post-delete board for reroute.
+def _parse_reroute_tool_result(raw: Any) -> Any:
+    if isinstance(raw, dict) and "result" in raw:
+        return _parse_reroute_tool_result(raw.get("result"))
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"rawResult": raw}
+    return raw
 
-    Flow: getSelectedElements(PFindType=TRACES) -> deleteTracesById -> getProjectData.
-    If no frontend trace ids are selected, explicit net names in userText can seed selectedNets.
-    """
+
+def _normalize_delete_for_rerouting_payload(
+    raw_result: Any,
+    *,
+    user_text: str,
+    project_id: str,
+) -> Dict[str, Any]:
+    parsed = _parse_reroute_tool_result(raw_result)
+    if not isinstance(parsed, dict):
+        parsed = {"rawResult": parsed}
+
+    missing_routes = parsed.get("missing_routes") or parsed.get("missingRoutes") or []
+    if not isinstance(missing_routes, list):
+        missing_routes = []
+
+    selected_nets = []
+    for route in missing_routes:
+        if isinstance(route, dict):
+            net = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+            if net:
+                selected_nets.append(net)
+    for net in extract_reroute_nets(user_text):
+        if net not in selected_nets:
+            selected_nets.append(net)
+
+    project_data = str(
+        parsed.get("projectData")
+        or parsed.get("project_data")
+        or parsed.get("projectDataFilePath")
+        or parsed.get("boardDataFilePath")
+        or ""
+    ).strip()
+    dropped_board_data = ""
+    dropped_board_path = ""
+    if project_data:
+        dropped_board_data, dropped_board_path = _read_board_file(project_data)
+        if not dropped_board_data and ("\n" in project_data or "(" in project_data):
+            dropped_board_data = project_data
+            dropped_board_path = ""
+
+    error = str(parsed.get("error") or parsed.get("message") or "").strip()
+    if not error and not missing_routes:
+        error = "deleteTracesForRerouting did not return missing_routes."
+    if not error and not (dropped_board_data or dropped_board_path):
+        error = "deleteTracesForRerouting did not return a readable projectData file."
+
+    payload = {
+        "selectedNets": selected_nets,
+        "selectedTraceIds": [],
+        "missingRoutes": missing_routes,
+        "dropResult": parsed,
+        "deleteResult": parsed,
+        "droppedBoardData": dropped_board_data,
+        "droppedBoardDataFilePath": dropped_board_path or project_data,
+        "originalBoardDataFilePath": dropped_board_path or project_data,
+        "droppedObjects": [
+            {"net": net, "type": "missing_route", "deleted": True}
+            for net in selected_nets
+        ],
+        "localContext": {
+            "source": "deleteTracesForRerouting",
+            "selectionCount": len(missing_routes),
+            "selectedNetCount": len(selected_nets),
+            "projectID": project_id,
+        },
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def delete_traces_for_rerouting(userText: str = "", projectID: str = "", session_id: Optional[str] = None) -> str:
+    """Call the frontend one-shot reroute deletion tool and cache its returned reroute parameters."""
     session_id = _transport.resolve_session_id(session_id)
     if not _transport.is_pcb_mode(session_id):
-        msg = _session_mode_error("drop_net", session_id)
+        msg = _session_mode_error("deleteTracesForRerouting", session_id)
         logger.warning(msg)
         return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": msg}, ensure_ascii=False)
 
     try:
-        selected_nets = extract_reroute_nets(userText)
-        selected_result = _transport.call_tool_sync(
-            tool_name="getSelectedElements",
-            arguments={"PFindType": "TRACES"},
-            timeout=30.0,
+        raw_result = _transport.call_tool_sync(
+            tool_name="deleteTracesForRerouting",
+            arguments={},
+            timeout=120.0,
             session_id=session_id,
         )
-        selected_trace_ids = _normalize_id_list(selected_result)
-        if not selected_trace_ids:
-            if selected_nets:
-                dropped_board_data = get_project_data(session_id=session_id)
-                original_board_path = _extract_board_file_path_from_text(userText)
-                payload = {
-                    "selectedNets": selected_nets,
-                    "selectedTraceIds": [],
-                    "dropResult": {"selectedResult": selected_result, "deleteResult": None},
-                    "deleteResult": None,
-                    "droppedBoardData": dropped_board_data,
-                    "droppedBoardDataFilePath": "",
-                    "originalBoardDataFilePath": original_board_path,
-                    "droppedObjects": [{"net": net, "type": "net", "deleted": False} for net in selected_nets],
-                    "localContext": {
-                        "source": "userText/getProjectData",
-                        "selectionCount": 0,
-                        "selectedNetCount": len(selected_nets),
-                        "PFindType": "TRACES",
-                        "projectID": projectID,
-                    },
-                }
-                _transport.cache_reroute_context(payload, session_id=session_id)
-                return json.dumps(payload, ensure_ascii=False)
-            return json.dumps(
-                {
-                    "selectedNets": [],
-                    "selectedTraceIds": [],
-                    "error": "No selected traces were returned. Please box-select the traces to reroute first.",
-                },
-                ensure_ascii=False,
-            )
-        if len(selected_trace_ids) > 40:
-            return json.dumps(
-                {
-                    "selectedNets": [],
-                    "selectedTraceIds": selected_trace_ids,
-                    "error": "Selected trace count exceeds 40. Please reduce the box selection and rerun this skill.",
-                    "tooManySelectedElements": True,
-                    "selectionCount": len(selected_trace_ids),
-                },
-                ensure_ascii=False,
-            )
-
-        delete_result = _transport.call_tool_sync(
-            tool_name="deleteTracesById",
-            arguments={"ids": selected_trace_ids},
-            timeout=60.0,
-            session_id=session_id,
-        )
-        if not _delete_traces_succeeded(delete_result):
-            return json.dumps(
-                {
-                    "selectedNets": [],
-                    "selectedTraceIds": selected_trace_ids,
-                    "deleteResult": delete_result,
-                    "error": "deleteTracesById failed.",
-                },
-                ensure_ascii=False,
-            )
-
-        dropped_board_data = get_project_data(session_id=session_id)
-        original_board_path = _extract_board_file_path_from_text(userText)
-        payload = {
-            "selectedNets": selected_nets,
-            "selectedTraceIds": selected_trace_ids,
-            "dropResult": {"selectedResult": selected_result, "deleteResult": delete_result},
-            "deleteResult": delete_result,
-            "droppedBoardData": dropped_board_data,
-            "droppedBoardDataFilePath": "",
-            "originalBoardDataFilePath": original_board_path,
-            "droppedObjects": [{"id": trace_id, "type": "trace", "deleted": True} for trace_id in selected_trace_ids],
-            "localContext": {
-                "source": "getSelectedElements/deleteTracesById/getProjectData",
-                "selectionCount": len(selected_trace_ids),
-                "selectedNetCount": len(selected_nets),
-                "PFindType": "TRACES",
-                "projectID": projectID,
-            },
-        }
+        payload = _normalize_delete_for_rerouting_payload(raw_result, user_text=userText, project_id=projectID)
         _transport.cache_reroute_context(payload, session_id=session_id)
         return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
-        logger.error("drop_net failed: %s", e)
+        logger.error("deleteTracesForRerouting failed: %s", e)
         return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": str(e)}, ensure_ascii=False)
+
+
+def drop_net(userText: str = "", projectID: str = "", session_id: Optional[str] = None) -> str:
+    """Backward-compatible alias for deleteTracesForRerouting."""
+    return delete_traces_for_rerouting(userText=userText, projectID=projectID, session_id=session_id)
+
+
+registry.register(
+    name="deleteTracesForRerouting",
+    toolset="pcb",
+    schema={
+        "name": "deleteTracesForRerouting",
+        "description": (
+            "Call the PCB frontend one-shot tool to delete the selected BGA escape traces "
+            "and return missing_routes plus projectData for local reroute."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "userText": {"type": "string", "description": "Original user reroute request text."},
+                "projectID": {"type": "string", "description": "Current PCB project id."},
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kwargs: delete_traces_for_rerouting(
+        args.get("userText", ""),
+        args.get("projectID", ""),
+        session_id=kwargs.get("session_id"),
+    ),
+    check_fn=lambda: True,
+)
 
 
 registry.register(
@@ -2137,10 +2168,8 @@ registry.register(
     schema={
         "name": "drop_net",
         "description": (
-            "Use the frontend selection to rip up traces for local reroute. "
-            "Calls getSelectedElements(PFindType=TRACES), rejects selections over 40 ids, "
-            "then calls deleteTracesById and refreshes getProjectData. "
-            "If no trace ids are selected, explicit net names in userText can be used as selectedNets."
+            "Compatibility alias for deleteTracesForRerouting. "
+            "Use deleteTracesForRerouting for the normal one-shot frontend delete/reroute-parameter flow."
         ),
         "parameters": {
             "type": "object",
@@ -2649,7 +2678,7 @@ def _build_reroute_generation_prompts(
         "前端框选信息：\n"
         f"- selectedNets: {json.dumps(nets or [], ensure_ascii=False)}\n"
         f"- selectedTraceIds: {json.dumps(selected_trace_ids or [], ensure_ascii=False)}\n"
-        f"- actions: deleteTracesById -> reroute -> DRC -> txt -> importLines only if DRC passes\n"
+        f"- actions: deleteTracesForRerouting -> reroute -> DRC -> txt -> importLines only if DRC passes\n"
         f"- boardInputState: {json.dumps(board_input_state, ensure_ascii=False)}\n"
         f"- chunkStats: {json.dumps(context_stats, ensure_ascii=False)}\n"
         f"- constraints: {json.dumps(constraints or {}, ensure_ascii=False)}\n"
@@ -3263,4 +3292,4 @@ registry.register(
 )
 
 
-logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, generateFanoutParams, route, drop_net, reroute")
+logger.info("PCB tools registered: getProjectData, getSelectedElements, GetSelectedElements, deleteTracesById, deleteTracesForRerouting, generateFanoutParams, route, drop_net, reroute")

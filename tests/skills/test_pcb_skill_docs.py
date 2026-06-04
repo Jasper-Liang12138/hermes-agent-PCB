@@ -18,16 +18,16 @@ def test_pcb_intelligence_documents_dual_router_bga_flow():
     assert '"arc"' in content
     assert '"135"' in content
     assert "hardware/pcb-reroute" in content
-    assert "不要在本技能中调用 `drop_net` 或 `reroute`" in content
+    assert "不要在本技能中调用 `deleteTracesForRerouting`、`drop_net` 或 `reroute`" in content
 
 
 def test_pcb_reroute_documents_selected_trace_flow():
     content = _read_skill("pcb-reroute")
 
     assert content.startswith("---\n")
-    assert "getSelectedElements" in content
-    assert 'PFindType="TRACES"' in content
-    assert "deleteTracesById" in content
+    assert "deleteTracesForRerouting" in content
+    assert "missing_routes" in content
+    assert "projectData" in content
     assert "Do not call `route`" in content
     assert "Do not ask the user to choose `arc` or `135`" in content
     assert "rerouteResult" in content

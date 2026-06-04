@@ -1736,7 +1736,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         forced_line = (
             "forced_skill: global_fanout\n"
             "本轮用户使用 #逃逸布线、#全局fanout 或短命令“逃逸布线”强制进入全局 BGA fanout/逃逸布线；"
-            "即使前端当前有选中 traces，也禁止调用 getSelectedElements、drop_net 或 reroute。\n"
+            "即使前端当前有选中 traces，也禁止调用 deleteTracesForRerouting、getSelectedElements、drop_net 或 reroute。\n"
             if forced_global_fanout
             else ""
         )
@@ -1757,7 +1757,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             "如果用户只是普通聊天、概念咨询或明确要求不要操作，直接回答，不要调用 PCB 工具。\n"
             "如果用户要求 BGA 逃逸/fanout，按 hardware/pcb-intelligence："
             "getProjectData -> pcb_extract_bga -> generateFanoutParams -> route。\n"
-            "如果用户要求局部拆线重布/reroute，按 hardware/pcb-reroute：drop_net -> reroute；"
+            "如果用户要求局部拆线重布/reroute，按 hardware/pcb-reroute：deleteTracesForRerouting -> reroute；"
             "删除目标只能来自前端选中 traces，不要从文本臆造。]\n\n"
             f"{user_text}"
         )
@@ -2238,17 +2238,22 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._pending_tool_calls[call_id] = future
         self._pending_tool_names[call_id] = tool_name
 
+        content = {
+            "id": call_id,
+            "name": tool_name,
+        }
+        if arguments or tool_name != "deleteTracesForRerouting":
+            content["arguments"] = arguments
+
+        project_id = self._connections.get(session_id, (None, ""))[1]
         message = {
             "sessionId": session_id,
-            "projectid": self._connections.get(session_id, (None, ""))[1],
+            "projectid": project_id,
+            "projectID": project_id,
             "type": "tool-calls",
             "body": {
                 "role": "agent",
-                "content": {
-                    "id": call_id,
-                    "name": tool_name,
-                    "arguments": arguments,
-                },
+                "content": content,
             },
         }
 

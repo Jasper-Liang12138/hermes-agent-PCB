@@ -5,7 +5,7 @@
 本文面向前端、PCB Builder 和联调人员，说明当前 PCB Agent 的 WebSocket 协议和两条业务链路：
 
 1. BGA 扇出布线链路：`getProjectData` → `selection` → `fanoutParams` → 本地 `route` → `routingResult`
-2. 选中走线拆线重布链路：`getSelectedElements` → `deleteTracesById` → `getProjectData` → `reroute` → `rerouteResult`
+2. 选中走线拆线重布链路：`deleteTracesForRerouting` → `reroute` → `rerouteResult`
 
 当前实现基于“前端工具调用 + Agent 结构化字段下发”的方式。BGA 扇出布线的最终 `routingResult` 是输出文件路径，不是 S-expression 正文。
 
@@ -299,130 +299,87 @@ reroute selected traces
 
 ### 步骤 0：前端选择要求
 
-用户必须先在 PCB 前端框选走线。Agent 不从自然语言里推断要删除的对象 ID。
+用户必须先在 PCB 前端框选需要重布的 BGA 逃逸走线，可以是部分线段。Agent 不从自然语言里推断要删除的对象 ID，也不直接删除非 BGA 逃逸场景的走线。
 
-选择对象类型必须是 traces。当前建议前端实现：
-
-```json
-{
-  "PFindType": "TRACES"
-}
-```
-
-### 步骤 1：Agent 调用 getSelectedElements
+### 步骤 1：Agent 调用 deleteTracesForRerouting
 
 ```json
 {
+  "projectID": "project-001",
   "type": "tool-calls",
   "body": {
+    "role": "agent",
     "content": {
-      "id": "call_get_selected",
-      "name": "getSelectedElements",
-      "arguments": {
-        "PFindType": "TRACES",
-        "projectID": "project-001"
-      }
+      "id": "call_delete_reroute",
+      "name": "deleteTracesForRerouting"
     }
   }
 }
 ```
 
-前端返回：
+前端收到后完成同步操作：提示/使用用户框选走线，删除相关线和经过的孔，导出删除后的版图数据，并返回重布所需参数。
+
+前端返回 `tool-results`，其中 `result` 是 JSON 字符串：
 
 ```json
 {
   "type": "tool-results",
   "body": {
+    "role": "tool",
     "content": {
-      "id": "call_get_selected",
-      "result": ["2386476278", "3424247826"]
+      "id": "call_delete_reroute",
+      "result": "{\"missing_routes\":[{\"net_name\":\"NET_U1_B7\",\"start\":{\"component\":\"U1\",\"pad\":\"B7\",\"layer\":\"Top\",\"x\":47.3,\"y\":62.3},\"end\":{\"layer\":\"Top\",\"x\":47.3,\"y\":68.3}}],\"projectData\":\"F:\\\\path\\\\to\\\\after_delete_board.txt\"}"
     }
   }
 }
 ```
 
-兼容返回字符串形式：
+`result` JSON 字符串内容：
 
 ```json
-"[\"2386476278\", \"3424247826\"]"
+{
+  "missing_routes": [
+    {
+      "net_name": "NET_U1_B7",
+      "start": {
+        "component": "U1",
+        "pad": "B7",
+        "layer": "Top",
+        "x": 47.3,
+        "y": 62.3
+      },
+      "end": {
+        "layer": "Top",
+        "x": 47.3,
+        "y": 68.3
+      }
+    }
+  ],
+  "projectData": "F:\\path\\to\\after_delete_board.txt"
+}
 ```
 
 约束：
 
-- 0 条：Agent 停止并提示用户先框选走线。
-- 1 到 40 条：继续。
-- 超过 40 条：Agent 停止并提示缩小选择范围。
+- 未框选：前端返回错误，Agent 停止并提示用户先框选走线。
+- 框选线不属于 BGA 逃逸场景：前端返回错误，Agent 停止。
+- 超过 40 Pin：前端返回错误，Agent 停止并提示缩小选择范围。
+- 删除或导出版图失败：前端返回错误，Agent 停止。
+- `missing_routes` 为空或 `projectData` 不可读取：Agent 停止，不调用 `reroute`。
 
-### 步骤 2：Agent 调用 deleteTracesById
-
-```json
-{
-  "type": "tool-calls",
-  "body": {
-    "content": {
-      "id": "call_delete",
-      "name": "deleteTracesById",
-      "arguments": {
-        "ids": ["2386476278", "3424247826"],
-        "projectID": "project-001"
-      }
-    }
-  }
-}
-```
-
-前端返回：
-
-```json
-{
-  "type": "tool-results",
-  "body": {
-    "content": {
-      "id": "call_delete",
-      "result": {
-        "success": true,
-        "deleted": ["2386476278", "3424247826"]
-      }
-    }
-  }
-}
-```
-
-如果删除失败，Agent 不会继续调用 `reroute`。
-
-### 步骤 3：Agent 调用 getProjectData
-
-删除成功后，Agent 再次调用：
-
-```json
-{
-  "type": "tool-calls",
-  "body": {
-    "content": {
-      "id": "call_get_project_after_delete",
-      "name": "getProjectData",
-      "arguments": {
-        "projectID": "project-001"
-      }
-    }
-  }
-}
-```
-
-前端应返回删除后的新版图数据或文件路径。Agent 会把该数据缓存为 reroute 上下文。
-
-### 步骤 4：Agent 本地调用 reroute
+### 步骤 2：Agent 本地调用 reroute
 
 这是 Agent 内部工具，不是前端工具。`reroute` 会读取前面缓存的：
 
-- `selectedTraceIds`
+- `missingRoutes`
+- `selectedNets`
 - `droppedBoardData`
 - `droppedObjects`
 - `localContext`
 
 然后生成局部重布结果、检查报告和可选的新板文件。
 
-### 步骤 5：Agent 返回 rerouteResult
+### 步骤 3：Agent 返回 rerouteResult
 
 ```json
 {
@@ -434,10 +391,11 @@ reroute selected traces
     "rerouteResult": {
       "type": "local_reroute",
       "mode": "selected_traces_after_delete",
-      "selectedTraceIds": ["2386476278", "3424247826"],
+      "selectedNets": ["NET_U1_B7"],
       "operations": [
         {
-          "action": "reroute_selected_traces",
+          "action": "reroute_net",
+          "net": "NET_U1_B7",
           "scope": "local",
           "preserveOtherNets": true
         }
@@ -470,7 +428,7 @@ reroute selected traces
 | 意图 | 全局/目标 BGA 逃逸扇出 | 局部选中走线删除后重走 |
 | Skill | `hardware/pcb-intelligence` | `hardware/pcb-reroute` |
 | 用户前置动作 | 不需要框选走线 | 必须先框选 traces |
-| 前端工具 | `getProjectData` | `getSelectedElements`、`deleteTracesById`、`getProjectData` |
+| 前端工具 | `getProjectData` | `deleteTracesForRerouting` |
 | 本地工具 | `route` | `reroute` |
 | 是否选择 `arc`/`135` | 是 | 否 |
 | 最终字段 | `routingResult` | `rerouteResult`、`routedLayoutTxtFilePath`、`checkReport`、`explanation` |
@@ -523,9 +481,9 @@ BGA 扇出布线：
 
 拆线重布：
 
-- 用户框选 traces 后，`getSelectedElements(PFindType="TRACES")` 返回正确 ID。
-- `deleteTracesById(ids)` 能删除选中走线并返回成功。
-- 删除后 `getProjectData` 返回新版图数据。
+- 用户框选 traces 后，能收到 `deleteTracesForRerouting` 工具调用。
+- `deleteTracesForRerouting` 能删除选中走线并返回 `missing_routes`。
+- `deleteTracesForRerouting` 返回的 `projectData` 是可读取的删除后版图数据或文件路径。
 - 能读取 `rerouteResult`。
 - 能读取并导入 `routedLayoutTxtFilePath`。
 - 能展示 `checkReport` 和 `explanation`。
@@ -537,7 +495,7 @@ BGA 扇出布线：
 通常说明请求走到了 BGA 扇出链路，而不是拆线重布链路。检查用户话术和 trace：
 
 - BGA 链路会出现 `fanoutParams`、`routingResult`。
-- reroute 链路应出现 `getSelectedElements`、`deleteTracesById`、`rerouteResult`。
+- reroute 链路应出现 `deleteTracesForRerouting`、`rerouteResult`。
 
 ### routingResult 收到了但版图无变化
 
@@ -552,7 +510,7 @@ Agent 已经完成布线器调用并下发路径。继续检查：
 
 检查：
 
-- 前端是否支持 `getSelectedElements(PFindType="TRACES")`。
-- 返回 ID 是否为空。
-- ID 是否超过 40 条。
-- `deleteTracesById` 是否返回失败。
+- 前端是否支持 `deleteTracesForRerouting`。
+- 用户是否已经框选 BGA 逃逸走线。
+- 返回的 `missing_routes` 是否为空。
+- 返回的 `projectData` 是否可读取。

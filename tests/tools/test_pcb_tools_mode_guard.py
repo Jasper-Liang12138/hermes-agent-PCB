@@ -593,12 +593,22 @@ def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
         calls.append((tool_name, arguments, timeout, session_id))
-        if tool_name == "getSelectedElements":
-            return {"ids": ["2386476278", "3424247826"]}
-        if tool_name == "deleteTracesById":
-            return "已成功删除"
-        if tool_name == "getProjectData":
-            return "(pcb after delete)"
+        if tool_name == "deleteTracesForRerouting":
+            return {
+                "result": json.dumps(
+                    {
+                        "missing_routes": [
+                            {
+                                "net_name": "NET_U1_B7",
+                                "start": {"component": "U1", "pad": "B7", "layer": "Top", "x": 47.3, "y": 62.3},
+                                "end": {"layer": "Top", "x": 47.3, "y": 68.3},
+                            }
+                        ],
+                        "projectData": "(pcb after delete)",
+                    },
+                    ensure_ascii=False,
+                )
+            }
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
@@ -607,18 +617,18 @@ def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
     payload = json.loads(result)
 
     assert calls == [
-        ("getSelectedElements", {"PFindType": "TRACES"}, 30.0, "sess-pcb-drop"),
-        ("deleteTracesById", {"ids": ["2386476278", "3424247826"]}, 60.0, "sess-pcb-drop"),
-        ("getProjectData", {}, 30.0, "sess-pcb-drop"),
+        ("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop"),
     ]
-    assert payload["selectedTraceIds"] == ["2386476278", "3424247826"]
+    assert payload["selectedNets"] == ["NET_U1_B7"]
+    assert payload["selectedTraceIds"] == []
+    assert payload["missingRoutes"][0]["net_name"] == "NET_U1_B7"
     assert payload["droppedBoardData"] == "(pcb after delete)"
     cached = transport.get_cached_reroute_context("sess-pcb-drop")
-    assert cached["selectedTraceIds"] == ["2386476278", "3424247826"]
-    assert cached["localContext"]["source"] == "getSelectedElements/deleteTracesById/getProjectData"
+    assert cached["selectedNets"] == ["NET_U1_B7"]
+    assert cached["localContext"]["source"] == "deleteTracesForRerouting"
 
 
-def test_drop_net_uses_explicit_user_text_nets_when_no_traces_selected(monkeypatch):
+def test_delete_traces_for_rerouting_combines_frontend_routes_and_user_text_nets(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-text-nets"
     transport.set_session_mode("sess-pcb-drop-text-nets", "pcb")
@@ -626,72 +636,73 @@ def test_drop_net_uses_explicit_user_text_nets_when_no_traces_selected(monkeypat
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
         calls.append((tool_name, arguments, timeout, session_id))
-        if tool_name == "getSelectedElements":
-            return {"ids": []}
-        if tool_name == "getProjectData":
-            return "(pcb before text-net reroute)"
+        if tool_name == "deleteTracesForRerouting":
+            return {
+                "missing_routes": [
+                    {"net_name": "net13", "start": {"layer": "Top", "x": 1, "y": 2}, "end": {"layer": "Top", "x": 3, "y": 4}}
+                ],
+                "projectData": "(pcb before text-net reroute)",
+            }
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
 
-    result = pcb_tools.drop_net("请把 net13、net17 拆线后重布", projectID="proj1")
+    result = pcb_tools.delete_traces_for_rerouting("请把 net13、net17 拆线后重布", projectID="proj1")
     payload = json.loads(result)
 
     assert calls == [
-        ("getSelectedElements", {"PFindType": "TRACES"}, 30.0, "sess-pcb-drop-text-nets"),
-        ("getProjectData", {}, 30.0, "sess-pcb-drop-text-nets"),
+        ("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-text-nets"),
     ]
     assert payload["selectedNets"] == ["net13", "net17"]
     assert payload["selectedTraceIds"] == []
     assert payload["droppedBoardData"] == "(pcb before text-net reroute)"
     cached = transport.get_cached_reroute_context("sess-pcb-drop-text-nets")
     assert cached["selectedNets"] == ["net13", "net17"]
-    assert cached["localContext"]["source"] == "userText/getProjectData"
+    assert cached["localContext"]["source"] == "deleteTracesForRerouting"
 
 
-def test_drop_net_rejects_too_many_selected_traces(monkeypatch):
+def test_delete_traces_for_rerouting_surfaces_frontend_error(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-many"
     transport.set_session_mode("sess-pcb-drop-many", "pcb")
     calls = []
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
-        calls.append(tool_name)
-        if tool_name == "getSelectedElements":
-            return {"ids": [str(index) for index in range(41)]}
-        raise AssertionError("delete/getProjectData should not be called")
+        calls.append((tool_name, arguments, timeout, session_id))
+        if tool_name == "deleteTracesForRerouting":
+            return {"error": "Selected trace count exceeds 40."}
+        raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
 
-    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    result = pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert calls == ["getSelectedElements"]
-    assert payload["tooManySelectedElements"] is True
-    assert payload["selectionCount"] == 41
-    assert transport.get_cached_reroute_context("sess-pcb-drop-many") is None
+    assert calls == [("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-many")]
+    assert payload["error"] == "Selected trace count exceeds 40."
+    assert transport.get_cached_reroute_context("sess-pcb-drop-many")["error"] == "Selected trace count exceeds 40."
 
 
-def test_drop_net_rejects_non_json_selected_trace_string(monkeypatch):
+def test_delete_traces_for_rerouting_rejects_non_json_result(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-strict"
     transport.set_session_mode("sess-pcb-drop-strict", "pcb")
     calls = []
 
     def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
-        calls.append(tool_name)
-        if tool_name == "getSelectedElements":
+        calls.append((tool_name, arguments, timeout, session_id))
+        if tool_name == "deleteTracesForRerouting":
             return "['2386476278', '3424247826']"
-        raise AssertionError("strict parsing should reject non-JSON selection strings")
+        raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
 
-    result = pcb_tools.drop_net("reroute selected traces", projectID="proj1")
+    result = pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert calls == ["getSelectedElements"]
-    assert payload["selectedTraceIds"] == []
-    assert "No selected traces" in payload["error"]
+    assert calls == [("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-strict")]
+    assert payload["selectedNets"] == []
+    assert "missing_routes" in payload["error"]
 
 
 def test_reroute_uses_cached_drop_context(monkeypatch):

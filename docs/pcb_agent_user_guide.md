@@ -5,7 +5,7 @@
 本文说明当前 PCB Agent 的使用方式。当前智能体支持两条独立链路：
 
 1. BGA 扇出布线：选择 BGA，选择 `arc` 或 `135` 布线器，生成扇出参数，确认后执行布线。
-2. 选中走线拆线重布：用户在 PCB 前端框选走线，Agent 删除选中走线，刷新版图数据，生成局部重布结果。
+2. 选中走线拆线重布：用户在 PCB 前端框选走线，Agent 调用一次前端 `deleteTracesForRerouting` 删除选中走线并获取重布参数，然后生成局部重布结果。
 
 两条链路不要混用。`arc` 和 `135` 只用于 BGA 扇出布线；拆线重布不要求用户选择 `arc` 或 `135`。
 
@@ -130,13 +130,11 @@ port = 7073
 1. 用户先在 PCB 前端框选要拆线重布的走线。
 2. 用户向 Agent 发送拆线重布请求。
 3. Agent 识别为 `pcb_reroute_selected`，加载 `hardware/pcb-reroute`。
-4. Agent 调用前端 `getSelectedElements(PFindType="TRACES")` 获取选中走线 ID。
-5. 如果没有选中走线，Agent 提示用户先框选。
-6. 如果选中超过 40 条，Agent 提示减少选择范围。
-7. Agent 调用前端 `deleteTracesById(ids)` 删除选中走线。
-8. Agent 调用 `getProjectData` 获取删除后的新版图数据。
-9. Agent 生成局部重布结果和检查报告。
-10. Agent 返回 `rerouteResult`、`checkReport`、`explanation`，如果 DRC 通过并生成了可导入文件，还会返回 `routedLayoutTxtFilePath`。
+4. Agent 调用前端 `deleteTracesForRerouting`。
+5. 前端根据用户框选完成拆线，并同步返回 `missing_routes` 和 `projectData`。
+6. 如果未框选、框选不属于 BGA、超过 40 Pin、删除失败或返回参数不完整，Agent 停止并提示错误。
+7. Agent 基于返回的 `missing_routes` 和删除后的版图数据生成局部重布结果和检查报告。
+8. Agent 返回 `rerouteResult`、`checkReport`、`explanation`，如果 DRC 通过并生成了可导入文件，还会返回 `routedLayoutTxtFilePath`。
 
 推荐用户话术：
 
@@ -152,10 +150,10 @@ port = 7073
 
 注意：
 
-- 拆线目标必须来自前端选中结果，Agent 不会只根据自然语言中的 net 名称删除走线。
+- 拆线目标必须来自前端 `deleteTracesForRerouting` 的返回结果，Agent 不会只根据自然语言中的 net 名称删除走线。
 - 拆线重布不走 `route` 工具，也不调用 `arc` / `135` BGA 布线器。
 - 如果前面刚做过 BGA 扇出，用户再说“拆线重布”，当前逻辑会打断旧的 fanout 确认状态，切换到 reroute。
-- 前端需要支持 `getSelectedElements`、`deleteTracesById` 和 `getProjectData`。
+- 前端需要支持同步工具 `deleteTracesForRerouting`，返回 JSON 字符串，包含 `missing_routes` 和 `projectData`。
 
 ## 意图识别规则
 
@@ -214,8 +212,8 @@ rip-up
 检查三点：
 
 - 前端是否已经框选了走线。
-- `getSelectedElements(PFindType="TRACES")` 是否返回非空 ID。
-- `deleteTracesById(ids)` 是否成功。
+- `deleteTracesForRerouting` 是否被 Agent 调用。
+- `deleteTracesForRerouting` 返回的 `result` 是否包含 `missing_routes` 和可读取的 `projectData`。
 
 ### 4. 两条链路的最终输出有什么区别？
 
@@ -244,7 +242,7 @@ BGA 扇出布线输出：
 2. 前端连接 WebSocket。
 3. 先测普通聊天，确认不会误调用工具。
 4. 测 BGA 扇出链路：`getProjectData` → `selection` → `fanoutParams` → `routingResult`。
-5. 测拆线重布链路：框选走线 → `getSelectedElements` → `deleteTracesById` → `getProjectData` → `rerouteResult`。
+5. 测拆线重布链路：框选走线 → `deleteTracesForRerouting` → `rerouteResult`。
 6. 查看 trace 日志确认字段是否下发：
 
 ```powershell

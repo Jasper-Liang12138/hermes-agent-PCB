@@ -2222,7 +2222,8 @@ class AIAgent:
             if isinstance(tool, dict)
         }
         bga_required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
-        reroute_required = {"drop_net", "reroute"}
+        reroute_delete_tool = "deleteTracesForRerouting" if "deleteTracesForRerouting" in valid_names else "drop_net"
+        reroute_required = {reroute_delete_tool, "reroute"}
         if not (bga_required.issubset(valid_names) or reroute_required.issubset(valid_names)) or not tool_calls:
             return None
 
@@ -2286,7 +2287,7 @@ class AIAgent:
             re.search(r"(?:#|＃)\s*(?:reroute|拆线\s*重布)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
             or "forced_skill: reroute" in latest_user_envelope
         )
-        if forced_global_fanout and (proposed_names & {"drop_net", "reroute", "getSelectedElements", "GetSelectedElements", "deleteTracesById"}):
+        if forced_global_fanout and (proposed_names & {"deleteTracesForRerouting", "drop_net", "reroute", "getSelectedElements", "GetSelectedElements", "deleteTracesById"}):
             if last_extract_content:
                 return self._shim_wait_for_fanout_choice_content(last_extract_content)
             return "已进入全局 BGA fanout/逃逸布线流程，请先获取版图并识别 BGA。"
@@ -2322,7 +2323,8 @@ class AIAgent:
             if isinstance(tool, dict)
         }
         bga_required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
-        reroute_required = {"drop_net", "reroute"}
+        reroute_delete_tool = "deleteTracesForRerouting" if "deleteTracesForRerouting" in valid_names else "drop_net"
+        reroute_required = {reroute_delete_tool, "reroute"}
         if not (bga_required.issubset(valid_names) or reroute_required.issubset(valid_names)):
             return None
 
@@ -2369,7 +2371,7 @@ class AIAgent:
             {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"} & (assistant_tool_names | response_names)
         )
         has_reroute_tool_history = bool(
-            {"drop_net", "reroute"} & (assistant_tool_names | response_names)
+            {"deleteTracesForRerouting", "drop_net", "reroute"} & (assistant_tool_names | response_names)
         )
         forced_global_fanout = bool(
             re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
@@ -2388,10 +2390,10 @@ class AIAgent:
                 return None
             last_drop_net_content = None
             for name, content in tool_responses:
-                if name == "drop_net":
+                if name in {"deleteTracesForRerouting", "drop_net"}:
                     last_drop_net_content = content
-            if "drop_net" not in response_names:
-                return [self._make_shim_tool_call("drop_net", {
+            if not ({"deleteTracesForRerouting", "drop_net"} & response_names):
+                return [self._make_shim_tool_call(reroute_delete_tool, {
                     "userText": latest_user,
                     "projectID": self._shim_project_id_from_text(latest_user_envelope),
                 })]
@@ -2489,9 +2491,11 @@ class AIAgent:
             return False
         selected_nets = parsed.get("selectedNets")
         selected_trace_ids = parsed.get("selectedTraceIds")
+        missing_routes = parsed.get("missingRoutes") or parsed.get("missing_routes")
         return bool(
             (isinstance(selected_nets, list) and selected_nets)
             or (isinstance(selected_trace_ids, list) and selected_trace_ids)
+            or (isinstance(missing_routes, list) and missing_routes)
         )
 
     @staticmethod

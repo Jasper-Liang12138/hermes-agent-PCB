@@ -92,14 +92,14 @@ getProjectData -> pcb_extract_bga -> generateFanoutParams -> route
 主链路：
 
 ```text
-drop_net -> reroute
+deleteTracesForRerouting -> reroute
 ```
 
 关键规则：
 
 - 删除对象只能来自前端选中 traces。
 - 不要从文本里臆造 trace id 或 net。
-- 用户可以先进入拆线重布流程；如果没有选中对象，`drop_net` 应通过 `getSelectedElements` 得到空选择后要求用户先在前端框选。
+- 用户可以先进入拆线重布流程；如果没有选中对象，`deleteTracesForRerouting` 应由前端返回错误，Agent 停止并提示用户先在前端框选。
 
 ### 流程中的中途意图
 
@@ -176,7 +176,7 @@ PCB intent rule: config.ini, port, logs, package, Git, and frontend debug questi
 PCB fanout rule: BGA fanout flow must be getProjectData -> pcb_extract_bga -> generateFanoutParams -> route.
 PCB fanout rule: after getProjectData, never let the model inspect raw board data; call pcb_extract_bga with board_text="__CACHED_PROJECT_DATA__".
 PCB fanout rule: after fanoutParams exist and the user confirms, route is the only allowed next tool.
-PCB reroute rule: selected-trace reroute uses drop_net -> reroute; deletion targets must come from frontend selection, not text guesses.
+PCB reroute rule: selected-trace reroute uses deleteTracesForRerouting -> reroute; deletion targets and missing routes must come from the frontend result, not text guesses.
 ```
 
 ## 如何把本文经验接入 Agent
@@ -246,7 +246,7 @@ Hermes memory 是 session 启动时注入 system prompt 的快照。安装或修
 
 - 普通问题是否没有暴露或调用 PCB 工具。
 - BGA 操作是否严格进入 `getProjectData -> pcb_extract_bga -> generateFanoutParams -> route`。
-- 选中走线重布是否严格进入 `drop_net -> reroute`。
+- 选中走线重布是否严格进入 `deleteTracesForRerouting -> reroute`。
 - 用户确认后是否不会回退到上一步。
 - 是否没有臆造 BGA、网络、层、线宽、间距、文件路径。
 

@@ -148,6 +148,7 @@ class TestToolsetConsistency:
             "getSelectedElements",
             "GetSelectedElements",
             "deleteTracesById",
+            "deleteTracesForRerouting",
             "generateFanoutParams",
             "route",
             "pcb_extract_bga",

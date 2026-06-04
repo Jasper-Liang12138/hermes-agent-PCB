@@ -1487,6 +1487,7 @@ async def test_send_tool_call_includes_session_and_project():
     sent = ws.sent[-1]
     assert sent["sessionId"] == "sess-tool-1"
     assert sent["projectid"] == "proj-tool-1"
+    assert sent["projectID"] == "proj-tool-1"
     assert sent["type"] == "tool-calls"
     assert sent["body"]["content"]["name"] == "getProjectData"
     assert sent["body"]["content"]["arguments"] == {}
@@ -1494,6 +1495,37 @@ async def test_send_tool_call_includes_session_and_project():
     adapter._resolve_tool_result(json.loads(_tool_result("call_tool_1", "(pcb_data)")))
     result = await task
     assert result == "(pcb_data)"
+
+
+@pytest.mark.asyncio
+async def test_send_delete_traces_for_rerouting_omits_empty_arguments():
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    adapter._connections["sess-reroute-tool"] = (ws, "proj-reroute-tool")
+
+    task = asyncio.create_task(
+        adapter.send_tool_call(
+            session_id="sess-reroute-tool",
+            call_id="call_delete_reroute",
+            tool_name="deleteTracesForRerouting",
+            arguments={},
+            timeout=1.0,
+        )
+    )
+    await asyncio.sleep(0)
+    sent = ws.sent[-1]
+    assert sent["sessionId"] == "sess-reroute-tool"
+    assert sent["projectid"] == "proj-reroute-tool"
+    assert sent["projectID"] == "proj-reroute-tool"
+    assert sent["type"] == "tool-calls"
+    assert sent["body"]["content"] == {
+        "id": "call_delete_reroute",
+        "name": "deleteTracesForRerouting",
+    }
+
+    adapter._resolve_tool_result(json.loads(_tool_result("call_delete_reroute", "{}")))
+    result = await task
+    assert result == "{}"
 
 
 @pytest.mark.asyncio

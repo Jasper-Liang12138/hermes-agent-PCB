@@ -161,7 +161,7 @@ Step 8: 布线完成，返回 routingResult 文件路径 + 报告
 - `##PCB_FIELDS##` 内的 JSON 必须完整、闭合、不可截断；不要在该区域内写解释文字或 Markdown
 - 不要重复输出同一段说明；流式回复时只输出一次最终说明
 - `routingResult` 必须是绝对文件路径字符串，指向 `routing_input.txt`，不是 S 表达式正文；正文只写简短总结
-- 本技能只做全局 BGA fanout/逃逸布线。局部拆线重布请求必须切换到 `hardware/pcb-reroute`，不要在本技能中调用 `drop_net` 或 `reroute`
+- 本技能只做全局 BGA fanout/逃逸布线。局部拆线重布请求必须切换到 `hardware/pcb-reroute`，不要在本技能中调用 `deleteTracesForRerouting`、`drop_net` 或 `reroute`
 
 ## fanoutParams 格式规范（重要）
 
