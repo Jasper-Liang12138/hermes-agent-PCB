@@ -26,6 +26,7 @@ import ast
 import json
 import os
 import re
+import sys
 import time
 import uuid
 import logging
@@ -61,8 +62,10 @@ _PCB_BODY_FIELD_KEYS = (
     "explanation",
     "boardSummary",
     "fanoutContext",
+    "frontendError",
 )
 _IMPORT_LINES_TIMEOUT_SECONDS = 300.0
+_RL_FANOUT_PROGRESS_INTERVAL_SECONDS = 30.0
 _PCB_STRUCTURED_KEYS = frozenset(
     _PCB_BODY_FIELD_KEYS
     + (
@@ -146,6 +149,7 @@ _FLOW_WAIT_SELECTION = "wait_selection"
 _FLOW_WAIT_ROUTER_TYPE = "wait_router_type"
 _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
+_FLOW_REROUTE = "reroute"
 _REROUTE_RE = re.compile(
     r"(拆线|删除.*(?:net|走线|线|trace|traces|框选|选中)|删.*(?:net|走线|线|trace|traces|框选|选中)|"
     r"重布|重新布|重走|重新走线|\breroute\b|\bripup\b|\brip-up\b)",
@@ -309,8 +313,11 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         # call_id -> tool_name，用于 BOARD_DATA_USE_FILE_PATH 文件路径模式
         self._pending_tool_names: Dict[str, str] = {}
+        self._pending_tool_sessions: Dict[str, str] = {}
         self._ws_bound_sessions: Dict[int, str] = {}
         self._ws_bound_projects: Dict[int, str] = {}
+        self._import_lines_results: Dict[Tuple[str, str], str] = {}
+        self._import_lines_inflight: Dict[Tuple[str, str], asyncio.Task[str]] = {}
 
         # 流式输出：session_id -> 当前 msgId（同一次回复的多帧共享同一 msgId）
         self._stream_msg_ids: Dict[str, str] = {}
@@ -416,6 +423,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._connections.clear()
         self._pending_tool_calls.clear()
         self._pending_tool_names.clear()
+        self._pending_tool_sessions.clear()
         self._ws_bound_sessions.clear()
         self._ws_bound_projects.clear()
         self._stream_msg_ids.clear()
@@ -861,6 +869,27 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not isinstance(turn_options, dict):
             turn_options = {}
 
+        flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        body_fanout_params = self._body_fanout_params(body.get("fanoutParams"))
+        content_fanout_params = (
+            self._body_fanout_params(user_text)
+            if flow_state == _FLOW_WAIT_CONFIRM and isinstance(user_text, str)
+            else {}
+        )
+        frontend_fanout_params = body_fanout_params or content_fanout_params
+        if frontend_fanout_params and flow_state == _FLOW_WAIT_CONFIRM:
+            self._remember_fanout_params_from_frontend(session_id, frontend_fanout_params)
+            if await self._run_cached_fanout_route(session_id):
+                return
+        if body_fanout_params:
+            self._remember_fanout_params_from_frontend(session_id, body_fanout_params)
+            if self._is_frontend_fanout_config_confirmed(str(user_text or "")):
+                if await self._run_cached_fanout_route(session_id):
+                    return
+        elif self._is_frontend_fanout_config_confirmed(str(user_text or "")):
+            if await self._run_cached_fanout_route(session_id):
+                return
+
         decision = self._decide_route(session_id, str(user_text or ""), llm_intent=None)
         if decision.immediate_reply:
             await self._send_router_reply(session_id, decision.immediate_reply)
@@ -872,12 +901,35 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
             return
 
+        if decision.mode == _ROUTE_MODE_PCB:
+            if decision.reason == "router_type_step":
+                if await self._run_direct_fanout_param_step(session_id, str(user_text or "")):
+                    return
+            if decision.reason == "confirm_route":
+                if await self._run_cached_fanout_route(session_id):
+                    return
+            if (
+                decision.bootstrap_get_project
+                and self._bootstrap_get_project_enabled
+                and session_id in self._connections
+            ):
+                bootstrap_context = await self._bootstrap_get_project_data(
+                    session_id=session_id,
+                    project_id=project_id,
+                    user_text=str(user_text or ""),
+                )
+                if await self._run_direct_bga_analysis(session_id, bootstrap_context or {}):
+                    return
+
         turn_options = dict(turn_options)
         turn_options["route_mode"] = decision.mode
         turn_options["pcb_agent_loop"] = decision.mode == _ROUTE_MODE_PCB
         if decision.mode == _ROUTE_MODE_PCB:
             forced_global_fanout = decision.reason == "forced_global_fanout"
-            forced_reroute = bool(_FORCE_REROUTE_TAG_RE.search(str(user_text or "")))
+            forced_reroute = (
+                decision.reason == "pcb_reroute_selected"
+                or bool(_FORCE_REROUTE_TAG_RE.search(str(user_text or "")))
+            )
             if forced_global_fanout:
                 auto_skill = ["hardware/pcb-intelligence"]
             elif forced_reroute:
@@ -989,6 +1041,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
         visible = "已识别到 BGA 候选，请选择目标器件。"
+        if labels:
+            visible += "\n候选 BGA：" + "、".join(labels)
 
         await self.send(
             chat_id=session_id,
@@ -1041,16 +1095,43 @@ class WebSocketAdapter(BasePlatformAdapter):
                     "LineWidth": self._safe_positive_number(fanout_context.get("recommendedLineWidth"), 4),
                     "LineSpacing": self._safe_positive_number(fanout_context.get("recommendedLineSpacing"), 3),
                 }
-                bjut_fanout = await asyncio.to_thread(
-                    generate_fanout_params,
-                    project_data=project_data,
-                    selected_bga=selected,
-                    router_type=router_type,
-                    work_dir=work_dir,
-                    constraints=constraints,
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        generate_fanout_params,
+                        project_data=project_data,
+                        selected_bga=selected,
+                        router_type=router_type,
+                        work_dir=work_dir,
+                        constraints=constraints,
+                    )
                 )
+                if self._fanout_module_from_type(router_type) == "RL":
+                    await self._send_router_reply(
+                        session_id,
+                        "正在运行 RL 层分配和逃逸顺序搜索，请稍候。首次运行可能需要加载 Python/torch 环境。",
+                    )
+                    round_index = 0
+                    while not task.done():
+                        done, _pending = await asyncio.wait(
+                            {task},
+                            timeout=_RL_FANOUT_PROGRESS_INTERVAL_SECONDS,
+                        )
+                        if done:
+                            break
+                        round_index += 1
+                        await self._send_router_reply(
+                            session_id,
+                            f"RL 搜索仍在运行（约 {round_index * int(_RL_FANOUT_PROGRESS_INTERVAL_SECONDS)} 秒），"
+                            "正在评估候选层分配/逃逸顺序...",
+                        )
+                bjut_fanout = await task
         except Exception as exc:
             logger.warning("BJUT fanoutParams generation failed: session=%s error=%s", session_id, exc)
+            if self._fanout_module_from_type(router_type) == "RL":
+                await self._send_router_reply(
+                    session_id,
+                    f"RL 层分配和逃逸顺序搜索失败，已退回基础参数生成：{exc}",
+                )
 
         candidate: Dict[str, Any] = dict(bjut_fanout)
         if not candidate and self._fanout_param_llm_enabled:
@@ -1344,6 +1425,33 @@ class WebSocketAdapter(BasePlatformAdapter):
                 return parsed
         return None
 
+    def _remember_fanout_params_from_frontend(self, session_id: str, fanout_params: Dict[str, Any]) -> None:
+        if not session_id or not isinstance(fanout_params, dict) or not fanout_params:
+            return
+        params = dict(fanout_params)
+        self._session_fanout_params[session_id] = params
+        selected = str(params.get("selectedBGA") or params.get("refBGA") or "").strip()
+        if selected:
+            self._session_selected_targets[session_id] = selected
+        router_type = self._extract_router_type(str(params.get("routerType") or ""))
+        if router_type:
+            self._session_router_types[session_id] = router_type
+            algorithm = self._router_algorithm_from_type(router_type)
+            module = self._fanout_module_from_type(router_type)
+            if algorithm:
+                self._session_route_algorithms[session_id] = algorithm
+            if module:
+                self._session_fanout_modules[session_id] = module
+        self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+        self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
+
+    @staticmethod
+    def _is_frontend_fanout_config_confirmed(content: str) -> bool:
+        text = str(content or "").strip()
+        return bool(
+            re.search(r"配置.*确认|确认.*配置|参数.*提交|已完成逃逸参数配置|确认布线参数", text)
+        )
+
     def _remember_board_analysis(self, session_id: str, fields: Dict[str, Any]) -> None:
         if not isinstance(fields, dict):
             return
@@ -1486,6 +1594,35 @@ class WebSocketAdapter(BasePlatformAdapter):
         if Path(import_file).name.lower() in {"routing_input.txt", "routinginput.txt"}:
             return f"已生成布线结果，但导入文件不是布线器导入记录格式，已跳过 importLines：{import_file}"
 
+        import_key = self._import_lines_key(session_id, import_file)
+        cached = self._import_lines_results.get(import_key)
+        if cached:
+            logger.info("Skipping duplicate importLines: session=%s file=%s", session_id, import_file)
+            return cached
+        inflight = self._import_lines_inflight.get(import_key)
+        if inflight is not None:
+            logger.info("Waiting for in-flight importLines: session=%s file=%s", session_id, import_file)
+            return await inflight
+
+        task = asyncio.create_task(
+            self._import_fanout_result_once(session_id, route_params, fields, import_file)
+        )
+        self._import_lines_inflight[import_key] = task
+        try:
+            status = await task
+            if status:
+                self._import_lines_results[import_key] = status
+            return status
+        finally:
+            self._import_lines_inflight.pop(import_key, None)
+
+    async def _import_fanout_result_once(
+        self,
+        session_id: str,
+        route_params: Dict[str, Any],
+        fields: Dict[str, Any],
+        import_file: str,
+    ) -> str:
         arguments = {
             "filePath": import_file,
             "successPins": self._first_pin_list(fields.get("successPins"), route_params.get("successPins")),
@@ -1510,6 +1647,17 @@ class WebSocketAdapter(BasePlatformAdapter):
             logger.warning("importLines failed: session=%s file=%s error=%s", session_id, import_file, exc)
             return f"已生成布线结果，但调用 EDA 导入工具 importLines 失败：{exc}"
         return self._format_import_lines_status(result)
+
+    @staticmethod
+    def _import_lines_key(session_id: str, import_file: str) -> Tuple[str, str]:
+        path_text = str(import_file or "").strip()
+        try:
+            path = Path(path_text).expanduser().resolve()
+            stat = path.stat()
+            fingerprint = f"{path}|{stat.st_size}|{stat.st_mtime_ns}"
+        except (OSError, RuntimeError, ValueError):
+            fingerprint = os.path.normcase(os.path.normpath(path_text))
+        return session_id, fingerprint
 
     @staticmethod
     def _first_pin_list(*values: Any) -> list[str]:
@@ -1612,11 +1760,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         return reroute_result.get("drcPassed") is True or check_report.get("passed") is True
 
     async def _import_reroute_result(self, session_id: str, fields: Dict[str, Any]) -> str:
-        txt_path = str(fields.get("routedLayoutTxtFilePath") or "").strip()
+        txt_path = str(fields.get("importLinesFilePath") or fields.get("routedLayoutTxtFilePath") or "").strip()
         if not txt_path:
             return ""
         if not self._reroute_drc_passed(fields):
             return ""
+        invalid_reason = self._invalid_import_lines_file_reason(txt_path)
+        if invalid_reason:
+            logger.warning("Skipping reroute importLines: session=%s file=%s reason=%s", session_id, txt_path, invalid_reason)
+            return f"已生成重布结果，但导入文件不适合 importLines，已跳过导入：{invalid_reason}"
 
         call_id = f"import_reroute_{uuid.uuid4().hex[:8]}"
         logger.info("正在导入版图: session=%s file=%s timeout=%.1fs", session_id, txt_path, _IMPORT_LINES_TIMEOUT_SECONDS)
@@ -1637,6 +1789,27 @@ class WebSocketAdapter(BasePlatformAdapter):
             logger.warning("reroute importLines failed: session=%s file=%s error=%s", session_id, txt_path, exc)
             return f"已生成重布结果，但调用 EDA 导入工具 importLines 失败：{exc}"
         return self._format_import_lines_status(result)
+
+    @staticmethod
+    def _invalid_import_lines_file_reason(path_text: str) -> str:
+        path_text = str(path_text or "").strip()
+        if not path_text:
+            return "文件路径为空"
+        try:
+            path = Path(path_text)
+            if not path.is_file():
+                return f"文件不存在：{path_text}"
+            size = path.stat().st_size
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                prefix = fh.read(512).lstrip()
+        except OSError as exc:
+            return f"无法读取文件：{exc}"
+
+        if prefix.startswith("(layout"):
+            return "该文件是完整 PCB layout，不是轻量布线增量文件"
+        if size > 1_000_000 and not prefix.startswith("(wires") and "!" not in prefix:
+            return f"文件过大且不像 importLines 增量格式：{size} bytes"
+        return ""
 
     async def _bootstrap_get_project_data(
         self,
@@ -1703,6 +1876,19 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.warning("Failed to cache PCB project data for session=%s: %s", session_id, exc)
+
+    @staticmethod
+    def _cache_project_data_path_for_tools(path: str, session_id: str) -> None:
+        if not session_id:
+            return
+        try:
+            from tools.pcb_tools import WebSocketTransportSingleton
+            WebSocketTransportSingleton.get_instance().cache_project_data_path(
+                path,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to cache PCB project data path for session=%s: %s", session_id, exc)
 
     @staticmethod
     def _build_bootstrap_agent_text(user_text: str, bootstrap_context: Dict[str, Any]) -> str:
@@ -1845,7 +2031,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             result=result,
         )
 
-        # 文件路径模式：getProjectData 返回文件路径，读取内容后再传给 Agent
+        # 文件路径模式：getProjectData 返回文件路径，缓存路径并读取内容给后续布线器。
         result = self._maybe_read_file_result(call_id, result)
         self._trace_tool_result(
             data=data,
@@ -1858,6 +2044,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         future = self._pending_tool_calls.pop(call_id, None)
         self._pending_tool_names.pop(call_id, None)
+        self._pending_tool_sessions.pop(call_id, None)
         if future and not future.done():
             if self._gateway_loop and asyncio.get_running_loop() is not self._gateway_loop:
                 self._gateway_loop.call_soon_threadsafe(future.set_result, result)
@@ -1883,18 +2070,42 @@ class WebSocketAdapter(BasePlatformAdapter):
             logger.warning("BOARD_DATA_USE_FILE_PATH=1 but result is not a string: %r", type(result))
             return result
 
-        path = Path(result)
-        if not path.is_file():
+        path = self._resolve_project_data_file_path(result)
+        if path is None:
             logger.warning("BOARD_DATA_USE_FILE_PATH=1 but path is not a file: %s", result)
             return result
 
         try:
+            self._cache_project_data_path_for_tools(str(path), self._pending_tool_sessions.get(call_id, ""))
             content = path.read_text(encoding="utf-8")
-            logger.info("Read getProjectData from file: %s (%d chars)", result, len(content))
+            logger.info("Read getProjectData from file: %s (%d chars)", path, len(content))
             return content
         except OSError as e:
-            logger.warning("Failed to read getProjectData file %s: %s", result, e)
+            logger.warning("Failed to read getProjectData file %s: %s", path, e)
             return result
+
+    @staticmethod
+    def _resolve_project_data_file_path(result: str) -> Optional[Path]:
+        raw = str(result or "").strip().strip('"')
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            bases = [Path.cwd()]
+            exe_path = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2]
+            bases.append(exe_path.parent if exe_path.is_file() else exe_path)
+            for base in bases:
+                resolved = (base / candidate).resolve()
+                if resolved not in candidates:
+                    candidates.append(resolved)
+        for path in candidates:
+            try:
+                if path.is_file():
+                    return path.resolve()
+            except OSError:
+                continue
+        return None
 
     def _trace_tool_result(
         self,
@@ -2032,18 +2243,31 @@ class WebSocketAdapter(BasePlatformAdapter):
             clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
             clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
             clean_content = self._dedupe_stream_restart_content(clean_content)
+            pcb_fields = self._filter_fields_for_active_flow(chat_id, pcb_fields)
             pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
+            clean_content = self._guard_visible_content_for_active_flow(chat_id, clean_content, pcb_fields)
         clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
         pcb_fields.update(extra_fields)
         clean_content = self._strip_stream_protocol_leak(clean_content)
         if stream_is_final is None or stream_is_final:
+            pcb_fields = self._filter_fields_for_active_flow(chat_id, pcb_fields)
             pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
+            clean_content = self._guard_visible_content_for_active_flow(chat_id, clean_content, pcb_fields)
         if stream_is_final is not None and not stream_is_final and pcb_fields:
             self._remember_stream_pcb_fields(chat_id, pcb_fields)
             pcb_fields = {}
         if stream_is_final is None or stream_is_final:
             pcb_fields = await self._prepare_final_pcb_fields_for_frontend(chat_id, pcb_fields)
+            if pcb_fields.pop("_importRejected", False):
+                clean_content = "已取消导入布线。"
+                pcb_fields = {}
         clean_content = self._fallback_visible_content_for_fields(clean_content, pcb_fields)
+        if self._should_emit_reroute_error(clean_content, pcb_fields):
+            return await self._send_error_to_session(
+                chat_id,
+                message="Tool execution failed",
+                details=self._reroute_error_details(clean_content, pcb_fields),
+            )
 
         body: Dict[str, Any] = {
             "msgId": msg_id,
@@ -2160,11 +2384,15 @@ class WebSocketAdapter(BasePlatformAdapter):
             clean_content = self._guard_router_choice_before_confirm(chat_id, clean_content, pcb_fields)
             clean_content = self._strip_leaked_fanout_json(clean_content, pcb_fields)
             clean_content = self._dedupe_stream_restart_content(clean_content)
+            pcb_fields = self._filter_fields_for_active_flow(chat_id, pcb_fields)
             pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
+            clean_content = self._guard_visible_content_for_active_flow(chat_id, clean_content, pcb_fields)
             clean_content, extra_fields = self._sanitize_pcb_visible_content(clean_content)
             pcb_fields.update(extra_fields)
             clean_content = self._strip_stream_protocol_leak(clean_content)
+            pcb_fields = self._filter_fields_for_active_flow(chat_id, pcb_fields)
             pcb_fields = self._filter_unconfirmed_routing_fields(chat_id, pcb_fields)
+            clean_content = self._guard_visible_content_for_active_flow(chat_id, clean_content, pcb_fields)
             pcb_fields = await self._prepare_final_pcb_fields_for_frontend(chat_id, pcb_fields)
             self._stream_content_buffers[chat_id] = clean_content
             emitted_fields = pcb_fields
@@ -2172,10 +2400,16 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not clean_content.strip() and not emitted_fields and not is_final:
             return SendResult(success=True, message_id=self._stream_msg_ids.get(chat_id, message_id))
         clean_content = self._fallback_visible_content_for_fields(clean_content, pcb_fields)
+        msg_id = self._stream_msg_ids.get(chat_id, message_id)
         if is_final:
             self._stream_content_buffers[chat_id] = clean_content
-
-        msg_id = self._stream_msg_ids.get(chat_id, message_id)
+            if self._should_emit_reroute_error(clean_content, pcb_fields):
+                return await self._send_error_to_session(
+                    chat_id,
+                    message="Tool execution failed",
+                    details=self._reroute_error_details(clean_content, pcb_fields),
+                    message_id=msg_id,
+                )
 
         body: Dict[str, Any] = {
             "msgId": msg_id,
@@ -2237,6 +2471,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_tool_calls[call_id] = future
         self._pending_tool_names[call_id] = tool_name
+        self._pending_tool_sessions[call_id] = session_id
 
         content = {
             "id": call_id,
@@ -2262,6 +2497,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             await self._send_or_queue(session_id, message)
         except Exception as e:
             self._pending_tool_calls.pop(call_id, None)
+            self._pending_tool_names.pop(call_id, None)
+            self._pending_tool_sessions.pop(call_id, None)
             raise RuntimeError(f"Failed to send tool call: {e}") from e
 
         try:
@@ -2271,6 +2508,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             self._pending_tool_calls.pop(call_id, None)
             self._pending_tool_names.pop(call_id, None)
+            self._pending_tool_sessions.pop(call_id, None)
             raise TimeoutError(f"Tool call '{tool_name}' timed out after {timeout}s")
 
     async def _send_error(
@@ -2298,6 +2536,66 @@ class WebSocketAdapter(BasePlatformAdapter):
         except Exception as e:
             self._trace_ws_full(payload, direction="outbound", delivered=False, reason=f"send_failed:{type(e).__name__}")
             logger.error("Failed to send error message: %s", e)
+
+    async def _send_error_to_session(
+        self,
+        session_id: str,
+        *,
+        message: str,
+        details: str = "",
+        code: int = 50001,
+        message_id: str = "",
+    ) -> SendResult:
+        ws_info = self._connections.get(session_id)
+        project_id = ws_info[1] if ws_info else ""
+        body: Dict[str, Any] = {
+            "role": "agent",
+            "code": code,
+            "message": message,
+        }
+        if details:
+            body["details"] = details
+        if message_id:
+            body["msgId"] = message_id
+        payload = {
+            "sessionId": session_id,
+            "projectid": project_id,
+            "type": "error",
+            "body": body,
+        }
+        try:
+            sent = await self._send_or_queue(session_id, payload)
+            logger.info("Sent websocket error: session=%s code=%s details=%s", session_id, code, details[:160])
+            return SendResult(success=True, message_id=message_id or None, error=None if sent else "queued")
+        except Exception as exc:
+            logger.error("Failed to send error to %s: %s", session_id, exc)
+            return SendResult(success=False, message_id=message_id or None, error=str(exc))
+
+    @staticmethod
+    def _should_emit_reroute_error(content: str, pcb_fields: Dict[str, Any]) -> bool:
+        frontend_error = pcb_fields.get("frontendError") if isinstance(pcb_fields, dict) else None
+        if isinstance(frontend_error, dict):
+            return True
+        text = str(content or "").strip()
+        return bool(
+            re.search(
+                r"^拆线重布未能继续：|未检测到框选走线|框选走线不属于\s*BGA|超过\s*40Pin|"
+                r"projectData\s*不可读|deleteTracesForRerouting.*(?:失败|failed|timed out|timeout)",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _reroute_error_details(content: str, pcb_fields: Dict[str, Any]) -> str:
+        frontend_error = pcb_fields.get("frontendError") if isinstance(pcb_fields, dict) else None
+        if isinstance(frontend_error, dict):
+            return str(frontend_error.get("details") or frontend_error.get("message") or content or "").strip()
+        text = str(content or "").strip()
+        match = re.search(r"^拆线重布未能继续：(.+?)(?:\n|$)", text)
+        if match:
+            return match.group(1).strip()
+        return text
 
     # -------------------------------------------------------------------------
     # 工具方法
@@ -2334,6 +2632,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_bga_selection.pop(session_id, None)
         self._session_board_summaries.pop(session_id, None)
         self._session_fanout_contexts.pop(session_id, None)
+        self._clear_import_lines_state(session_id)
+
+    def _clear_import_lines_state(self, session_id: str) -> None:
+        for key in [key for key in self._import_lines_results if key[0] == session_id]:
+            self._import_lines_results.pop(key, None)
+        for key in [key for key in self._import_lines_inflight if key[0] == session_id]:
+            task = self._import_lines_inflight.pop(key, None)
+            if task and not task.done():
+                task.cancel()
 
     @staticmethod
     def _as_bool(value: Any) -> bool:
@@ -2612,6 +2919,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             self._session_selected_targets.setdefault(session_id, labels[0])
 
         flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        if flow_state == _FLOW_REROUTE:
+            return content
         mode = self._session_mode(session_id)
         in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
         if not in_pcb_context:
@@ -2649,6 +2958,46 @@ class WebSocketAdapter(BasePlatformAdapter):
             sorted(pcb_fields.keys()),
         )
         return filtered
+
+    def _filter_fields_for_active_flow(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(pcb_fields, dict) or not pcb_fields:
+            return pcb_fields
+        flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        if flow_state == _FLOW_REROUTE:
+            reroute_evidence_keys = {"rerouteResult", "routedLayoutTxtFilePath", "checkReport", "explanation"}
+            has_reroute_evidence = bool(reroute_evidence_keys & pcb_fields.keys())
+            fanout_keys = {
+                "selection",
+                "fanoutParams",
+                "routingResult",
+                "boardSummary",
+                "fanoutContext",
+            }
+            if not has_reroute_evidence:
+                fanout_keys.add("importLinesFilePath")
+            reroute_keys = {"rerouteResult", "routedLayoutTxtFilePath", "importLinesFilePath", "checkReport", "explanation"}
+            if fanout_keys & pcb_fields.keys():
+                filtered = {key: value for key, value in pcb_fields.items() if key not in fanout_keys}
+                if not (reroute_keys & filtered.keys()):
+                    filtered.pop("report", None)
+                logger.warning(
+                    "Dropped fanout fields during reroute flow: session=%s dropped=%s",
+                    session_id,
+                    sorted(fanout_keys & pcb_fields.keys()),
+                )
+                return filtered
+        return pcb_fields
+
+    def _guard_visible_content_for_active_flow(self, session_id: str, content: str, pcb_fields: Dict[str, Any]) -> str:
+        flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        if flow_state != _FLOW_REROUTE:
+            return content
+        text = str(content or "")
+        if re.search(r"已选择目标\s*BGA|请选择走线算法|fanoutParams|逃逸参数配置", text, re.IGNORECASE):
+            if pcb_fields.get("rerouteResult") or pcb_fields.get("routedLayoutTxtFilePath"):
+                return content
+            return "已进入拆线重布流程，请框选需要拆线的走线，或说明要拆哪根线。"
+        return content
 
     @staticmethod
     def _strip_leaked_fanout_json(content: str, pcb_fields: Dict[str, Any]) -> str:
@@ -2723,36 +3072,38 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _reroute_content_for_frontend(pcb_fields: Dict[str, Any]) -> str:
-        payload: Dict[str, Any] = {}
         report = str(pcb_fields.get("report") or "").strip()
         if report:
-            payload["report"] = report
+            return report
 
-        for key in ("rerouteResult", "routedLayoutTxtFilePath", "checkReport", "explanation"):
-            if key not in pcb_fields:
-                continue
-            value = pcb_fields.get(key)
-            if value is None or value == "" or value == {} or value == []:
-                continue
-            payload[key] = value
+        check_report = pcb_fields.get("checkReport")
+        if isinstance(check_report, dict):
+            if check_report.get("passed") is False:
+                return "局部拆线重布未通过 DRC，报告已发送到前端。"
+            if check_report.get("passed") is True:
+                return "局部拆线重布已完成，报告已发送到前端。"
 
-        return json.dumps(payload, ensure_ascii=False, indent=2) if payload else ""
+        return "局部拆线重布已完成，结果已发送到前端。"
 
     async def _prepare_final_pcb_fields_for_frontend(self, session_id: str, pcb_fields: Dict[str, Any]) -> Dict[str, Any]:
         fields = self._sanitize_public_pcb_fields(pcb_fields)
         if "routingResult" in fields:
             import_status = await self._import_fanout_result(session_id, {}, fields)
+            if import_status == _IMPORT_LINES_REJECTED:
+                return {"_importRejected": True}
             if import_status:
                 report = str(fields.get("report") or "").strip()
                 fields["report"] = f"{report}\n{import_status}".strip() if report else import_status
             return fields
-        if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields:
+        if "rerouteResult" not in fields and "routedLayoutTxtFilePath" not in fields and "importLinesFilePath" not in fields:
             return fields
-        if fields.get("routedLayoutTxtFilePath") and not self._reroute_drc_passed(fields):
+        if (fields.get("routedLayoutTxtFilePath") or fields.get("importLinesFilePath")) and not self._reroute_drc_passed(fields):
             fields.pop("routedLayoutTxtFilePath", None)
+            fields.pop("importLinesFilePath", None)
             reroute_result = fields.get("rerouteResult")
             if isinstance(reroute_result, dict):
                 reroute_result.pop("routedLayoutTxtFilePath", None)
+                reroute_result.pop("importLinesFilePath", None)
             return fields
         import_status = await self._import_reroute_result(session_id, fields)
         if import_status:
@@ -3290,6 +3641,8 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         if validated_intent == _INTENT_PCB_REROUTE_SELECTED:
             self._reset_flow(session_id)
+            self._set_flow_state(session_id, _FLOW_REROUTE)
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             return _RouteDecision(
                 mode=_ROUTE_MODE_PCB,
                 reason="pcb_reroute_selected",
@@ -3361,6 +3714,10 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
 
         if flow_state == _FLOW_WAIT_ROUTER_TYPE:
+            if _CONFIRM_RE.search(text) and self._session_fanout_params.get(session_id):
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                self._set_flow_state(session_id, _FLOW_ROUTING)
+                return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="confirm_route", intent=_INTENT_PCB_CONFIRM_ROUTE)
             selected_label = self._extract_selected_label(session_id, text)
             if selected_label:
                 self._session_selected_targets[session_id] = selected_label
@@ -3404,6 +3761,13 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         if flow_state == _FLOW_WAIT_CONFIRM:
             if _CONFIRM_RE.search(text):
+                if not self._session_fanout_params.get(session_id):
+                    return _RouteDecision(
+                        mode=_ROUTE_MODE_PCB,
+                        immediate_reply="缺少已确认的逃逸参数配置，请先重新生成逃逸参数。",
+                        reason="confirm_without_fanout_params",
+                        intent=_INTENT_PCB_CONFIRM_ROUTE,
+                    )
                 self._set_flow_state(session_id, _FLOW_ROUTING)
                 return _RouteDecision(mode=_ROUTE_MODE_PCB, reason="confirm_route", intent=_INTENT_PCB_CONFIRM_ROUTE)
             selected_label = self._extract_selected_label(session_id, text)
@@ -3760,6 +4124,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             return content
 
         clean = content
+        if clean.lstrip().startswith("[CONTEXT COMPACTION"):
+            return "当前上下文已整理，请继续当前操作。"
         marker_positions = [
             pos for pos in (
                 clean.find("##PCB_FIELDS##"),

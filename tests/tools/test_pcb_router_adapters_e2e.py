@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tools import pcb_tools
+from tools import pcb_bjut_router
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +55,26 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     elif line_output.exists():
         pending["importLinesFilePath"] = str(line_output.resolve())
     assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == pending
+
+
+def test_bjut_report_reader_uses_statistical_output_when_data_txt_missing(tmp_path):
+    (tmp_path / "statistical.out").write_text(
+        "布线连通率:68.56%\n"
+        "通孔数量:178\n"
+        "布线成功的引脚个数:3个\n"
+        "引脚名称:\n"
+        "B20\n"
+        "C20\n"
+        "F20\n",
+        encoding="utf-8",
+    )
+
+    report = pcb_bjut_router._read_report(tmp_path)
+
+    assert "布线连通率:68.56%" in report
+    assert "通孔数量:178" in report
+    assert "成功引脚: B20、C20、F20（共 3 个）" in report
+    assert "\nB20\n" not in report
 
 
 def test_arc_adapter_e2e_with_fake_router(monkeypatch, tmp_path):

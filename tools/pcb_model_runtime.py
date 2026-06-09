@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ DEFAULT_STAGE_MODELS = {
     STAGE_EXPLAIN: "",
     STAGE_TOOL_PLANNING_CHAT: "",
 }
+DEFAULT_PROXY_BYPASS_HOSTS = ("wishub-x5.ctyun.cn",)
 
 _OPENAI_CHAT_COMPLETIONS_SUFFIX_RE = re.compile(r"/chat/completions/?$", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"(?is)<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>")
@@ -148,11 +150,87 @@ def _load_project_config_ini(project_config_paths: Iterable[Path] | None = None)
         if not config_path.exists():
             continue
         try:
-            parser.read(config_path, encoding="utf-8")
+            parser.read(config_path, encoding="utf-8-sig")
             return parser
         except Exception as exc:
             logger.warning("Failed reading project config.ini from %s: %s", config_path, exc)
     return None
+
+
+def _split_config_list(value: str) -> list[str]:
+    parts = re.split(r"[,，;\s]+", str(value or "").strip())
+    return [part.strip().lower() for part in parts if part.strip()]
+
+
+def _host_matches_bypass(host: str, patterns: Iterable[str]) -> bool:
+    normalized_host = str(host or "").strip().lower().strip(".")
+    if not normalized_host:
+        return False
+    for pattern in patterns:
+        normalized_pattern = str(pattern or "").strip().lower().strip(".")
+        if not normalized_pattern:
+            continue
+        if normalized_pattern == "*":
+            return True
+        if normalized_pattern.startswith("*."):
+            suffix = normalized_pattern[1:]
+            if normalized_host.endswith(suffix):
+                return True
+            continue
+        if normalized_host == normalized_pattern or normalized_host.endswith(f".{normalized_pattern}"):
+            return True
+    return False
+
+
+def _network_config() -> dict[str, Any]:
+    parser = _load_project_config_ini()
+    section = "network"
+    proxy_mode = "auto"
+    bypass_hosts = list(DEFAULT_PROXY_BYPASS_HOSTS)
+    http_proxy = ""
+    https_proxy = ""
+    if parser is not None and parser.has_section(section):
+        configured_mode = parser.get(section, "proxy_mode", fallback=proxy_mode).strip().lower()
+        if configured_mode in ("auto", "direct", "proxy"):
+            proxy_mode = configured_mode
+        configured_bypass = _split_config_list(parser.get(section, "bypass_hosts", fallback=""))
+        if configured_bypass:
+            bypass_hosts.extend(configured_bypass)
+        http_proxy = parser.get(section, "http_proxy", fallback="").strip()
+        https_proxy = parser.get(section, "https_proxy", fallback="").strip()
+    return {
+        "proxy_mode": proxy_mode,
+        "bypass_hosts": list(dict.fromkeys(host.lower() for host in bypass_hosts if host)),
+        "http_proxy": http_proxy,
+        "https_proxy": https_proxy,
+    }
+
+
+def _open_chat_request(req: urlrequest.Request, *, timeout_s: float, base_url: str):
+    config = _network_config()
+    host = urlparse(base_url).hostname or urlparse(req.full_url).hostname or ""
+    mode = str(config.get("proxy_mode") or "auto").lower()
+    proxies = {
+        scheme: proxy
+        for scheme, proxy in (
+            ("http", str(config.get("http_proxy") or "").strip()),
+            ("https", str(config.get("https_proxy") or "").strip()),
+        )
+        if proxy
+    }
+
+    use_direct = mode == "direct" or (
+        mode == "auto" and _host_matches_bypass(host, config.get("bypass_hosts") or ())
+    )
+    if use_direct:
+        opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+        return opener.open(req, timeout=timeout_s)
+
+    if proxies:
+        opener = urlrequest.build_opener(urlrequest.ProxyHandler(proxies))
+        return opener.open(req, timeout=timeout_s)
+
+    return urlrequest.urlopen(req, timeout=timeout_s)
 
 
 def _stage_doc_section(text: str, stage: str) -> str:
@@ -567,7 +645,7 @@ def chat_completion_text(
         method="POST",
     )
     try:
-        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+        with _open_chat_request(req, timeout_s=timeout_s, base_url=base_url) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urlerror.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace").strip()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import configparser
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +34,128 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     elif line_output.exists():
         pending["importLinesFilePath"] = str(line_output.resolve())
     assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == pending
+
+
+def test_read_router_report_uses_statistical_output_when_data_txt_missing(tmp_path):
+    (tmp_path / "statistical.out").write_text(
+        "布线失败的引脚个数:2个\n"
+        "引脚名称:\n"
+        "B19\n"
+        "C19\n",
+        encoding="utf-8",
+    )
+
+    report = pcb_tools._read_router_report(tmp_path)
+
+    assert "失败引脚: B19、C19（共 2 个）" in report
+    assert "\nB19\n" not in report
+
+
+def test_read_router_report_summarizes_router_output_when_report_missing(tmp_path):
+    (tmp_path / "line.out").write_text("line 1\nline 2\n", encoding="utf-8")
+
+    report = pcb_tools._read_router_report(tmp_path)
+
+    assert "布线器未输出详细报告" in report
+    assert "line.out" in report
+    assert "2 lines" in report
+
+
+def test_reroute_report_preserves_markdown_newlines():
+    payload = {
+        "rerouteResult": {
+            "drcPassed": False,
+            "drcAttempts": [
+                {
+                    "drcResult": {
+                        "details": {
+                            "hard_issue_count": 2,
+                            "hard_rule_counts": {"HR_CONNECT_PAD_NOT_ESCAPED": 1, "HR_DRC_SEGMENT_CROSSING": 1},
+                        },
+                        "issuesPreview": [
+                            {
+                                "rule": "HR_CONNECT_PAD_NOT_ESCAPED",
+                                "message": "BGA pad U5.A5 on net N1 has no initial escape connection.",
+                            }
+                        ],
+                    }
+                }
+            ],
+        },
+        "checkReport": {
+            "passed": False,
+            "checks": [{"name": "drc", "passed": False, "detail": "短路错误\n第二行"}],
+        },
+    }
+
+    report = pcb_tools._compose_reroute_report_content(
+        payload=payload,
+        public_txt_path="",
+        explain_report="可解释性分析报告\n================\n\n预测结果: 布线较差",
+    )
+    public_payload = pcb_tools._compact_public_reroute_payload({"content": report, "report": report})
+
+    assert "DRC 分析\n========" in public_payload["report"]
+    assert "可解释性分析报告\n================" in public_payload["report"]
+    assert "- 硬 DRC 问题数：2" in public_payload["report"]
+    assert "`HR_CONNECT_PAD_NOT_ESCAPED`" in public_payload["report"]
+    assert "issues=[" not in public_payload["report"]
+    assert "DRC 分析 ========" not in public_payload["report"]
+
+
+def test_default_reroute_drc_iterations_is_three(monkeypatch):
+    monkeypatch.delenv("PCB_REROUTE_MAX_DRC_ITERATIONS", raising=False)
+
+    assert pcb_tools._get_max_drc_iterations({}) == 3
+
+
+def test_extract_reroute_nets_ignores_bare_net_word():
+    assert pcb_tools.extract_reroute_nets("请重布这个 net") == []
+    assert pcb_tools.extract_reroute_nets("请重布 NET_A 和 net") == ["NET_A"]
+
+
+def test_delete_payload_prefers_frontend_missing_route_nets():
+    payload = pcb_tools._normalize_delete_for_rerouting_payload(
+        {
+            "missing_routes": [
+                {
+                    "net_name": "Z7_SPI0_SCK",
+                    "start": {"layer": "Top", "x": 1, "y": 2},
+                    "end": {"layer": "Top", "x": 3, "y": 4},
+                }
+            ],
+            "projectData": "(pcb)",
+        },
+        user_text="请重布 NET_EXTRA 和 net",
+        project_id="proj1",
+    )
+
+    assert payload["selectedNets"] == ["Z7_SPI0_SCK"]
+
+
+def test_default_reroute_model_timeout_is_600(monkeypatch):
+    monkeypatch.delenv("PCB_REROUTE_TIMEOUT", raising=False)
+    monkeypatch.delenv("CTYUN_REROUTE_TIMEOUT", raising=False)
+
+    assert pcb_tools._get_reroute_model_timeout_seconds() == 600.0
+
+
+def test_reroute_model_max_tokens_reads_config_ini(monkeypatch):
+    monkeypatch.delenv("PCB_REROUTE_MAX_TOKENS", raising=False)
+    parser = configparser.ConfigParser()
+    parser.read_dict({"reroute-model": {"max_tokens": "1024"}})
+    monkeypatch.setattr(pcb_model_runtime, "_load_project_config_ini", lambda: parser)
+
+    assert pcb_tools._get_reroute_model_max_tokens() == 1024
+
+
+def test_reroute_model_max_tokens_env_overrides_config_and_is_capped(monkeypatch):
+    monkeypatch.setenv("PCB_REROUTE_MAX_TOKENS", "999999")
+    parser = configparser.ConfigParser()
+    parser.read_dict({"reroute-model": {"max_tokens": "1024"}})
+    monkeypatch.setattr(pcb_model_runtime, "_load_project_config_ini", lambda: parser)
+
+    assert pcb_tools._get_reroute_model_max_tokens() == 8192
 
 
 @pytest.fixture(autouse=True)
@@ -617,18 +740,25 @@ def test_drop_net_calls_frontend_and_caches_context(monkeypatch):
     payload = json.loads(result)
 
     assert calls == [
-        ("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop"),
+        (
+            "deleteTracesForRerouting",
+            {},
+            120.0,
+            "sess-pcb-drop",
+        ),
     ]
     assert payload["selectedNets"] == ["NET_U1_B7"]
     assert payload["selectedTraceIds"] == []
     assert payload["missingRoutes"][0]["net_name"] == "NET_U1_B7"
-    assert payload["droppedBoardData"] == "(pcb after delete)"
+    assert "droppedBoardData" not in payload
+    assert payload["droppedBoardDataChars"] == len("(pcb after delete)")
     cached = transport.get_cached_reroute_context("sess-pcb-drop")
     assert cached["selectedNets"] == ["NET_U1_B7"]
     assert cached["localContext"]["source"] == "deleteTracesForRerouting"
+    assert cached["localContext"]["missingRoutes"][0]["net_name"] == "NET_U1_B7"
 
 
-def test_delete_traces_for_rerouting_combines_frontend_routes_and_user_text_nets(monkeypatch):
+def test_delete_traces_for_rerouting_prefers_frontend_routes_over_user_text_nets(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
     transport.current_session_id = "sess-pcb-drop-text-nets"
     transport.set_session_mode("sess-pcb-drop-text-nets", "pcb")
@@ -651,13 +781,19 @@ def test_delete_traces_for_rerouting_combines_frontend_routes_and_user_text_nets
     payload = json.loads(result)
 
     assert calls == [
-        ("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-text-nets"),
+        (
+            "deleteTracesForRerouting",
+            {},
+            120.0,
+            "sess-pcb-drop-text-nets",
+        ),
     ]
-    assert payload["selectedNets"] == ["net13", "net17"]
+    assert payload["selectedNets"] == ["net13"]
     assert payload["selectedTraceIds"] == []
-    assert payload["droppedBoardData"] == "(pcb before text-net reroute)"
+    assert "droppedBoardData" not in payload
+    assert payload["droppedBoardDataChars"] == len("(pcb before text-net reroute)")
     cached = transport.get_cached_reroute_context("sess-pcb-drop-text-nets")
-    assert cached["selectedNets"] == ["net13", "net17"]
+    assert cached["selectedNets"] == ["net13"]
     assert cached["localContext"]["source"] == "deleteTracesForRerouting"
 
 
@@ -678,9 +814,123 @@ def test_delete_traces_for_rerouting_surfaces_frontend_error(monkeypatch):
     result = pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert calls == [("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-many")]
+    assert calls == [
+        (
+            "deleteTracesForRerouting",
+            {},
+            120.0,
+            "sess-pcb-drop-many",
+        )
+    ]
     assert payload["error"] == "Selected trace count exceeds 40."
-    assert transport.get_cached_reroute_context("sess-pcb-drop-many")["error"] == "Selected trace count exceeds 40."
+    assert payload["frontendError"]["message"] == "Tool execution failed"
+    assert transport.get_cached_reroute_context("sess-pcb-drop-many") is None
+
+
+def test_delete_traces_for_rerouting_rejects_too_many_missing_routes(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-too-many-routes"
+    transport.set_session_mode("sess-pcb-drop-too-many-routes", "pcb")
+    routes = [
+        {
+            "net_name": f"NET_{idx}",
+            "start": {"layer": "Top", "x": idx, "y": idx + 1},
+            "end": {"layer": "Top", "x": idx + 2, "y": idx + 3},
+        }
+        for idx in range(41)
+    ]
+
+    monkeypatch.setattr(
+        pcb_tools._transport,
+        "call_tool_sync",
+        lambda *args, **kwargs: {"missing_routes": routes, "projectData": "(pcb after delete)"},
+    )
+
+    payload = json.loads(pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1"))
+
+    assert "超过 40Pin" in payload["error"]
+    assert payload["frontendError"]["code"] == 50001
+    assert transport.get_cached_reroute_context("sess-pcb-drop-too-many-routes") is None
+
+
+def test_delete_traces_for_rerouting_rejects_invalid_missing_route_shape(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-invalid-route"
+    transport.set_session_mode("sess-pcb-drop-invalid-route", "pcb")
+
+    monkeypatch.setattr(
+        pcb_tools._transport,
+        "call_tool_sync",
+        lambda *args, **kwargs: {
+            "missing_routes": [
+                {
+                    "net_name": "NET_U1_B7",
+                    "start": {"layer": "Top", "x": 47.3},
+                    "end": {"layer": "Top", "x": 47.3, "y": 68.3},
+                }
+            ],
+            "projectData": "(pcb after delete)",
+        },
+    )
+
+    payload = json.loads(pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1"))
+
+    assert "start 缺少有效 y 坐标" in payload["error"]
+    assert transport.get_cached_reroute_context("sess-pcb-drop-invalid-route") is None
+
+
+def test_delete_traces_for_rerouting_accepts_non_bga_selection(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-non-bga"
+    transport.set_session_mode("sess-pcb-drop-non-bga", "pcb")
+
+    monkeypatch.setattr(
+        pcb_tools._transport,
+        "call_tool_sync",
+        lambda *args, **kwargs: {
+            "isBgaEscape": False,
+            "missing_routes": [
+                {
+                    "net_name": "NET_U1_B7",
+                    "start": {"layer": "Top", "x": 47.3, "y": 62.3},
+                    "end": {"layer": "Top", "x": 47.3, "y": 68.3},
+                }
+            ],
+            "projectData": "(pcb after delete)",
+        },
+    )
+
+    payload = json.loads(pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1"))
+
+    assert "error" not in payload
+    assert payload["selectedNets"] == ["NET_U1_B7"]
+    assert transport.get_cached_reroute_context("sess-pcb-drop-non-bga")["selectedNets"] == ["NET_U1_B7"]
+
+
+def test_delete_traces_for_rerouting_rejects_unreadable_project_data(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-drop-bad-project-data"
+    transport.set_session_mode("sess-pcb-drop-bad-project-data", "pcb")
+
+    monkeypatch.setattr(
+        pcb_tools._transport,
+        "call_tool_sync",
+        lambda *args, **kwargs: {
+            "missing_routes": [
+                {
+                    "net_name": "NET_U1_B7",
+                    "start": {"layer": "Top", "x": 47.3, "y": 62.3},
+                    "end": {"layer": "Top", "x": 47.3, "y": 68.3},
+                }
+            ],
+            "projectData": r"F:\does_not_exist\missing_board.txt",
+        },
+    )
+
+    payload = json.loads(pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1"))
+
+    assert "projectData 不可读" in payload["error"]
+    assert transport.get_cached_reroute_context("sess-pcb-drop-bad-project-data") is None
 
 
 def test_delete_traces_for_rerouting_rejects_non_json_result(monkeypatch):
@@ -700,9 +950,17 @@ def test_delete_traces_for_rerouting_rejects_non_json_result(monkeypatch):
     result = pcb_tools.delete_traces_for_rerouting("reroute selected traces", projectID="proj1")
     payload = json.loads(result)
 
-    assert calls == [("deleteTracesForRerouting", {}, 120.0, "sess-pcb-drop-strict")]
+    assert calls == [
+        (
+            "deleteTracesForRerouting",
+            {},
+            120.0,
+            "sess-pcb-drop-strict",
+        )
+    ]
     assert payload["selectedNets"] == []
-    assert "missing_routes" in payload["error"]
+    assert "未检测到框选走线" in payload["error"]
+    assert payload["frontendError"]["code"] == 50001
 
 
 def test_reroute_uses_cached_drop_context(monkeypatch):
@@ -797,6 +1055,33 @@ def test_extract_kicad_patch_from_non_json_model_text():
     assert "(segment" in patch
     assert "(via" in patch
     assert "(module" not in patch
+
+
+def test_drc_feedback_for_prompt_includes_issue_details():
+    attempt = SimpleNamespace(
+        failure_summary="hard_issue_count=2",
+        fill_detail={"segments_count": 1, "vias_count": 0},
+        drc_result={
+            "details": {
+                "hard_issue_count": 2,
+                "hard_rule_counts": {"clearance": 1, "short": 1},
+            },
+            "artifacts": {
+                "issues": [
+                    {"rule": "clearance", "message": "too close", "severity": "error"},
+                    {"rule": "short", "description": "net short", "severity": "error"},
+                ]
+            },
+        },
+    )
+
+    feedback = pcb_tools._drc_feedback_for_prompt(attempt)
+
+    assert "硬 DRC 问题数量：2" in feedback
+    assert "clearance" in feedback
+    assert "too close" in feedback
+    assert "patch 回填统计" in feedback
+    assert "不能原样重复上一轮 patch" in feedback
 
 
 def test_reroute_model_payload_ignores_model_report_fields():
@@ -1000,7 +1285,7 @@ def test_reroute_model_prompt_hides_internal_kicad_paths():
     assert "/private/tmp/secret" not in combined
     assert "originalBoardDataFilePath" not in combined
     assert "droppedBoardDataFilePath" not in combined
-    assert '"internalBoardPathHidden": true' in prompts["user"]
+    assert "internalBoardPathHidden" not in prompts["user"]
 
 
 def test_reroute_prompt_uses_single_shot_answer_contract_and_endpoint_summary():
@@ -1045,11 +1330,218 @@ def test_reroute_prompt_uses_single_shot_answer_contract_and_endpoint_summary():
         task_description=task_description,
     )
 
-    assert "请先规划，再在 <answer> 中只输出合法 KiCad 走线对象" in prompts["system"]
-    assert "最终答案必须放在 <answer>" in prompts["user"]
+    assert "只输出合法 KiCad 走线对象，不要输出推理过程" in prompts["system"]
+    assert prompts["user"].startswith("/no_think\n")
+    assert "只允许输出纯文本形式的 (segment ...)" in prompts["user"]
+    assert "最终只输出缺失走线对象，不要输出其它内容" in prompts["user"]
     assert "47.30, 62.30" in prompts["user"]
     assert "47.30, 68.30" in prompts["user"]
     assert "只输出 JSON" not in prompts["system"]
+    assert "最终答案必须放在 <answer>" not in prompts["user"]
+    assert "<answer>" not in prompts["user"]
+
+
+def test_reroute_prompt_includes_frontend_missing_route_start_and_end():
+    board_text = """
+    (kicad_pcb
+      (net 91 "Z7_SPI0_SCK")
+    )
+    """
+    local_context = {
+        "source": "deleteTracesForRerouting",
+        "missingRoutes": [
+            {
+                "net_name": "Z7_SPI0_SCK",
+                "start": {"component": "U5", "pad": "A5", "layer": "Top", "x": 558.23, "y": 132.79},
+                "end": {"layer": "Top", "x": 558.23, "y": -6.76},
+            }
+        ],
+    }
+    task_description, task_stats = pcb_tools._build_missing_route_description(
+        board_text=board_text,
+        nets=["Z7_SPI0_SCK"],
+        dropped_objects=[],
+        local_context=local_context,
+        selected_trace_ids=[],
+    )
+    context = pcb_tools._build_single_shot_reroute_context(
+        board_text=board_text,
+        task_description=task_description,
+        selected_trace_ids=[],
+        nets=["Z7_SPI0_SCK"],
+    )
+    prompts = pcb_tools._build_reroute_generation_prompts(
+        nets=["Z7_SPI0_SCK"],
+        selected_trace_ids=[],
+        dropped_board_path="after_drop.txt",
+        original_board_path="before_drop.txt",
+        dropped_objects=[],
+        local_context=local_context,
+        constraints={},
+        context_text=context["contextText"],
+        context_stats={**context["stats"], **task_stats},
+        task_description=task_description,
+    )
+
+    assert task_stats["frontendMissingRouteCount"] == 1
+    assert "前端删除线段" in prompts["user"]
+    assert "Z7_SPI0_SCK" in prompts["user"]
+    assert "KiCad net id 必须使用 91" in prompts["user"]
+    assert "U5.A5" in prompts["user"]
+    assert "558.23, 132.79" in prompts["user"]
+    assert "558.23, -6.76" in prompts["user"]
+    assert "不得改变坐标正负号" in prompts["user"]
+    assert "segment/via 必须精确连接这些端点" in prompts["user"]
+
+
+def test_bind_reroute_patch_nets_rewrites_single_selected_net_id():
+    board_text = """
+    (kicad_pcb
+      (net 58 Z7_SPI0_SCK)
+      (net 145 PHY1_RXD1)
+    )
+    """
+    patch, warnings, errors = pcb_tools._bind_reroute_patch_nets(
+        "(segment (start 558.23 132.79) (end 558.23 -6.76) (width 0.1524) (layer Top) (net 145))",
+        board_text=board_text,
+        selected_nets=["Z7_SPI0_SCK"],
+        local_context={},
+    )
+
+    assert errors == []
+    assert warnings
+    assert "(net 58)" in patch
+    assert "(net 145)" not in patch
+
+
+def test_bind_reroute_patch_nets_assigns_multiple_nets_by_missing_route_endpoint():
+    board_text = """
+    (kicad_pcb
+      (net 58 Z7_SPI0_SCK)
+      (net 77 Z7_SPI0_IO3)
+    )
+    """
+    local_context = {
+        "missingRoutes": [
+            {
+                "net_name": "Z7_SPI0_SCK",
+                "start": {"layer": "Top", "x": 558.23, "y": 132.79},
+                "end": {"layer": "Top", "x": 558.23, "y": -6.76},
+            },
+            {
+                "net_name": "Z7_SPI0_IO3",
+                "start": {"layer": "Top", "x": 526.73, "y": 132.79},
+                "end": {"layer": "Top", "x": 526.73, "y": -6.76},
+            },
+        ]
+    }
+    patch, _warnings, errors = pcb_tools._bind_reroute_patch_nets(
+        "\n".join(
+            [
+                "(segment (start 558.23 132.79) (end 558.23 -6.76) (width 0.1524) (layer Top) (net 145))",
+                "(segment (start 526.73 132.79) (end 526.73 -6.76) (width 0.1524) (layer Top) (net 145))",
+            ]
+        ),
+        board_text=board_text,
+        selected_nets=["Z7_SPI0_SCK", "Z7_SPI0_IO3"],
+        local_context=local_context,
+    )
+
+    assert errors == []
+    assert patch.count("(net 58)") == 1
+    assert patch.count("(net 77)") == 1
+    assert "(net 145)" not in patch
+
+
+def test_bind_reroute_patch_nets_rejects_unknown_selected_net_id():
+    patch, _warnings, errors = pcb_tools._bind_reroute_patch_nets(
+        "(segment (start 1 1) (end 2 2) (width 0.1524) (layer Top) (net 145))",
+        board_text="(kicad_pcb (net 58 Z7_SPI0_SCK))",
+        selected_nets=["MISSING_NET"],
+        local_context={},
+    )
+
+    assert "(net 145)" in patch
+    assert errors
+    assert "找不到 selected net" in errors[0]
+
+
+def test_endpoint_guard_corrects_single_missing_route_endpoint():
+    local_context = {
+        "missingRoutes": [
+            {
+                "net_name": "Z7_SPI0_SCK",
+                "start": {"layer": "Top", "x": 558.23, "y": 132.79},
+                "end": {"layer": "Top", "x": 558.23, "y": -6.76},
+            }
+        ]
+    }
+    bad_patch = "(segment (start 558.230000 132.790000) (end 558.230000 126.760000) (width 0.304800) (layer Top) (net 58))"
+
+    messages = pcb_tools._endpoint_guard_messages(
+        bad_patch,
+        selected_nets=["Z7_SPI0_SCK"],
+        local_context=local_context,
+    )
+    fixed, warnings = pcb_tools._correct_single_missing_route_segment_endpoints(
+        bad_patch,
+        selected_nets=["Z7_SPI0_SCK"],
+        local_context=local_context,
+    )
+
+    assert messages
+    assert "558.230000, -6.760000" in messages[0]
+    assert warnings
+    assert "(end 558.230000 -6.760000)" in fixed
+    assert "126.760000" not in fixed
+
+
+def test_reroute_drc_loop_validates_endpoint_corrected_patch(monkeypatch, tmp_path):
+    base_payload = {
+        "kicadPatch": "(segment (start 558.230000 132.790000) (end 558.230000 126.760000) (width 0.304800) (layer Top) (net 145))",
+        "rerouteResult": {},
+        "checkReport": {"passed": True, "checks": []},
+        "explanation": "",
+    }
+    original_board_data = "(kicad_pcb\n  (net 58 Z7_SPI0_SCK)\n  (net 145 PHY1_RXD1)\n)\n"
+    seen_patches: list[str] = []
+
+    def _fake_validate(**kwargs):
+        seen_patches.append(kwargs["model_output_text"])
+        return pcb_reroute_drc.RerouteDrcAttempt(
+            iteration=kwargs["iteration"],
+            passed=True,
+            filled_board_data_file_path=str(tmp_path / "routed.kicad_pcb"),
+            drc_result={"ok": True, "pass": True},
+        )
+
+    monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
+
+    payload = pcb_tools._run_reroute_drc_iterations(
+        base_payload=base_payload,
+        original_board_data=original_board_data,
+        original_board_path=str(tmp_path / "original.kicad_pcb"),
+        output_dir=str(tmp_path),
+        sample_id="sample",
+        max_iterations=1,
+        selected_nets=["Z7_SPI0_SCK"],
+        local_context={
+            "missingRoutes": [
+                {
+                    "net_name": "Z7_SPI0_SCK",
+                    "start": {"layer": "Top", "x": 558.23, "y": 132.79},
+                    "end": {"layer": "Top", "x": 558.23, "y": -6.76},
+                }
+            ]
+        },
+        regenerate=lambda feedback, history: base_payload,
+    )
+
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert seen_patches == [
+        "(segment (start 558.230000 132.790000) (end 558.230000 -6.760000) (width 0.304800) (layer Top) (net 58))"
+    ]
+    assert payload["rerouteResult"]["patchBindingWarnings"]
 
 
 def test_reroute_model_outputs_not_written_by_default(monkeypatch, tmp_path):
@@ -1156,6 +1648,12 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     assert payload["rerouteResult"]["drcPassed"] is True
     assert payload["rerouteResult"]["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
     assert payload["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
+    assert payload["importLinesFilePath"].endswith("_reroute_import.txt")
+    assert payload["rerouteResult"]["importLinesFilePath"] == payload["importLinesFilePath"]
+    import_path = Path(payload["importLinesFilePath"])
+    assert import_path.is_file()
+    assert import_path.read_text(encoding="utf-8").lstrip().startswith("(wires")
+    assert not import_path.read_text(encoding="utf-8").lstrip().startswith("(layout")
     assert "routedBoardDataFilePath" not in payload
     assert "originalBoardDataFilePath" not in payload["rerouteResult"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
@@ -1201,6 +1699,7 @@ def test_reroute_drc_pass_without_txt_marks_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
     monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", lambda **kwargs: ("", []))
+    monkeypatch.setattr(pcb_tools, "_write_reroute_incremental_import_file", lambda **kwargs: ("", []))
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-no-txt")
     payload = json.loads(result)
@@ -1215,8 +1714,9 @@ def test_reroute_drc_pass_without_txt_marks_failure(monkeypatch, tmp_path):
     pending = pcb_tools._transport.pop_pending_pcb_fields("sess-pcb-reroute-no-txt")
     assert pending["rerouteResult"]["drcPassed"] is True
     assert "routedLayoutTxtFilePath" not in pending
+    assert "importLinesFilePath" not in pending
     assert pending["checkReport"]["passed"] is False
-    assert "DRC 已通过，但未生成可导入 txt" in pending["explanation"]
+    assert "DRC 已通过，但未生成轻量增量导入文件" in pending["explanation"]
 
 
 def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):
@@ -1268,11 +1768,105 @@ def test_reroute_drc_failure_feedback_retries_until_pass(monkeypatch, tmp_path):
     assert payload["rerouteResult"]["drcPassed"] is True
     assert payload["rerouteResult"]["drcIterations"] == 2
     assert generate_feedback[0] == []
-    assert generate_feedback[1] == ['hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}']
+    assert len(generate_feedback[1]) == 1
+    assert 'hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}' in generate_feedback[1][0]
+    assert "不能原样重复上一轮 patch" in generate_feedback[1][0]
     assert generate_history[0] == []
     assert generate_history[1][0]["iteration"] == 1
     assert generate_history[1][0]["kicadPatch"].startswith("(segment")
     assert generate_history[1][0]["failureSummary"] == 'hard_rule_counts={"HR_DRC_SEGMENT_CROSSING":1}'
+
+
+def test_reroute_normalizes_frontend_endpoint_to_internal_pad_center():
+    board_text = """
+(kicad_pcb
+ (net 58 Z7_SPI0_SCK)
+ (module BGA400 (layer Top)
+  (at 102.079044 146.772884 90)
+  (fp_text reference U5 (at 0 -1))
+  (pad A5 smd circle (at 7.599934 4.400042) (size 0.4064 0.4064) (layers Top F.Paste F.Mask) (net 58 Z7_SPI0_SCK))
+ )
+)
+"""
+    local_context = {
+        "missingRoutes": [
+            {
+                "net_name": "Z7_SPI0_SCK",
+                "start": {"component": "U5", "pad": "A5", "layer": "Top", "x": 558.23, "y": 132.79},
+                "end": {"layer": "Top", "x": 558.23, "y": -6.76},
+            }
+        ]
+    }
+
+    normalized, stats = pcb_tools._normalize_reroute_local_context_coordinates(
+        local_context,
+        board_text=board_text,
+        nets=["Z7_SPI0_SCK"],
+        dropped_objects=[],
+    )
+
+    route = normalized["missingRoutes"][0]
+    assert stats["normalized"] is True
+    assert route["start"]["coordinateSource"] == "internal_pad_center"
+    assert route["start"]["x"] == pytest.approx(106.479086, abs=1e-6)
+    assert route["start"]["y"] == pytest.approx(139.17295, abs=1e-6)
+    assert route["frontendStart"]["x"] == 558.23
+    assert route["end"]["coordinateSource"] == "frontend_txt_dbu_to_internal_kicad"
+    assert route["end"]["x"] == pytest.approx(106.479086, abs=1e-6)
+    assert route["end"]["y"] == pytest.approx(135.62838, abs=1e-6)
+
+
+def test_reroute_local_drc_policy_ignores_unrelated_global_pad_issues():
+    attempt = pcb_reroute_drc.RerouteDrcAttempt(
+        iteration=1,
+        passed=False,
+        drc_result={
+            "ok": True,
+            "pass": False,
+            "artifacts": {
+                "issues": [
+                    {
+                        "rule": "HR_CONNECT_PAD_NOT_ESCAPED",
+                        "message": "BGA pad U5.B13 on net PS_MIO50_501 has no initial escape connection.",
+                        "severity": "ERROR",
+                    }
+                ]
+            },
+        },
+    )
+
+    passed, summary, detail = pcb_tools._local_reroute_drc_passes(attempt, selected_nets=["Z7_SPI0_SCK"])
+
+    assert passed is True
+    assert "ignored 1 inherited" in summary
+    assert detail["blockingIssueCount"] == 0
+    assert detail["inheritedIssueCount"] == 1
+
+
+def test_reroute_local_drc_policy_blocks_selected_net_issue():
+    attempt = pcb_reroute_drc.RerouteDrcAttempt(
+        iteration=1,
+        passed=False,
+        drc_result={
+            "ok": True,
+            "pass": False,
+            "artifacts": {
+                "issues": [
+                    {
+                        "rule": "HR_CONNECT_PAD_NOT_ESCAPED",
+                        "message": "BGA pad U5.A5 on net Z7_SPI0_SCK has no initial escape connection.",
+                        "severity": "ERROR",
+                    }
+                ]
+            },
+        },
+    )
+
+    passed, summary, detail = pcb_tools._local_reroute_drc_passes(attempt, selected_nets=["Z7_SPI0_SCK"])
+
+    assert passed is False
+    assert "selected net local DRC failed" in summary
+    assert detail["blockingIssueCount"] == 1
 
 
 def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):

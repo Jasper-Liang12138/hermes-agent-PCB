@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import json
 
 from tools import pcb_model_runtime
@@ -52,6 +53,14 @@ def _clear_model_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PCB_MODEL_RUNTIME_DISABLE_DOTENV", "1")
     pcb_model_runtime._LOCAL_ENV_LOADED = False
+
+
+def _config_with_network(**values):
+    parser = configparser.ConfigParser()
+    parser.add_section("network")
+    for key, value in values.items():
+        parser.set("network", key, str(value))
+    return parser
 
 
 def test_stage_doc_parser_keeps_reroute_and_explain_models_separate(monkeypatch, tmp_path):
@@ -292,6 +301,11 @@ def test_local_env_file_supplies_openrouter_key(monkeypatch, tmp_path):
 
 def test_chat_completion_text_sends_stage_specific_payload(monkeypatch):
     captured = {}
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
 
     class _FakeResponse:
         def __enter__(self):
@@ -345,6 +359,11 @@ def test_chat_completion_text_sends_stage_specific_payload(monkeypatch):
 
 def test_chat_completion_text_can_opt_into_disable_thinking_kwargs(monkeypatch):
     captured = {}
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
 
     class _FakeResponse:
         def __enter__(self):
@@ -375,3 +394,159 @@ def test_chat_completion_text_can_opt_into_disable_thinking_kwargs(monkeypatch):
 
     assert text == '{"ok": true}'
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_chat_completion_text_bypasses_wishub_proxy_by_default(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout):
+            captured["url"] = req.full_url
+            captured["timeout"] = timeout
+            return _FakeResponse()
+
+    def _fake_build_opener(*handlers):
+        captured["proxies"] = getattr(handlers[0], "proxies", None)
+        return _FakeOpener()
+
+    monkeypatch.setattr(pcb_model_runtime, "_load_project_config_ini", lambda project_config_paths=None: configparser.ConfigParser())
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "build_opener", _fake_build_opener)
+    monkeypatch.setattr(
+        pcb_model_runtime.urlrequest,
+        "urlopen",
+        lambda req, timeout: (_ for _ in ()).throw(AssertionError("urlopen should not be used for wishub auto bypass")),
+    )
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={"model": "m", "base_url": "https://wishub-x5.ctyun.cn/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "x"}],
+        timeout_s=12,
+    )
+
+    assert text == "ok"
+    assert captured["url"] == "https://wishub-x5.ctyun.cn/v1/chat/completions"
+    assert captured["timeout"] == 12
+    assert captured["proxies"] == {}
+
+
+def test_chat_completion_text_non_bypass_host_keeps_urlopen(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pcb_model_runtime, "_load_project_config_ini", lambda project_config_paths=None: configparser.ConfigParser())
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={"model": "m", "base_url": "https://model.example/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "x"}],
+        timeout_s=13,
+    )
+
+    assert text == "ok"
+    assert captured == {"url": "https://model.example/v1/chat/completions", "timeout": 13}
+
+
+def test_chat_completion_text_direct_mode_bypasses_proxy_for_any_host(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout):
+            return _FakeResponse()
+
+    def _fake_build_opener(*handlers):
+        captured["proxies"] = getattr(handlers[0], "proxies", None)
+        return _FakeOpener()
+
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="direct"),
+    )
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "build_opener", _fake_build_opener)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={"model": "m", "base_url": "https://model.example/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "x"}],
+    )
+
+    assert text == "ok"
+    assert captured["proxies"] == {}
+
+
+def test_chat_completion_text_proxy_mode_uses_configured_proxy(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout):
+            return _FakeResponse()
+
+    def _fake_build_opener(*handlers):
+        captured["proxies"] = getattr(handlers[0], "proxies", None)
+        return _FakeOpener()
+
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(
+            proxy_mode="proxy",
+            http_proxy="http://127.0.0.1:7897",
+            https_proxy="http://127.0.0.1:7897",
+        ),
+    )
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "build_opener", _fake_build_opener)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={"model": "m", "base_url": "https://wishub-x5.ctyun.cn/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "x"}],
+    )
+
+    assert text == "ok"
+    assert captured["proxies"] == {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}

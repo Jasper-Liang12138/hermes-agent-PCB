@@ -28,6 +28,7 @@ import logging
 import re
 import tempfile
 import importlib.util
+import math
 from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import Future as ThreadFuture
 from types import SimpleNamespace
@@ -265,7 +266,69 @@ def _router_import_lines_path(work_dir: Path, router_type: str, constraints: Any
 
 def _read_router_report(work_dir: Path, fallback: str = "布线完成（无详细报告）") -> str:
     report_file = work_dir / "data.txt"
-    return _read_text_lossy(report_file) if report_file.exists() else fallback
+    if report_file.exists() and report_file.stat().st_size > 0:
+        return _compact_statistical_report(_read_text_lossy(report_file).strip()) or fallback
+
+    for filename in ("statistical.out", "statistical.txt", "report.txt", "route_report.txt"):
+        candidate = work_dir / filename
+        if candidate.exists() and candidate.stat().st_size > 0:
+            text = _read_text_lossy(candidate).strip()
+            if text:
+                return _compact_statistical_report(text)
+
+    output_summaries: list[str] = []
+    for filename in ("line.out", "ARC_output.txt", "arc_output.txt", "routing_input.txt"):
+        candidate = work_dir / filename
+        if not candidate.exists() or candidate.stat().st_size <= 0:
+            continue
+        try:
+            line_count = sum(1 for _ in candidate.open("rb"))
+        except OSError:
+            line_count = 0
+        output_summaries.append(f"{filename}: {candidate.stat().st_size} bytes, {line_count} lines")
+    if output_summaries:
+        return "布线器未输出详细报告，已生成布线结果文件：\n" + "\n".join(output_summaries)
+    return fallback
+
+
+def _compact_statistical_report(text: str, *, pin_preview_limit: int = 30) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if "引脚名称:" not in lines:
+        return str(text or "").strip()
+
+    output: list[str] = []
+    current_pin_label = ""
+    pins: list[str] = []
+
+    def flush_pins() -> None:
+        nonlocal pins, current_pin_label
+        if not current_pin_label:
+            pins = []
+            return
+        preview = "、".join(pins[:pin_preview_limit])
+        suffix = f" 等 {len(pins)} 个" if len(pins) > pin_preview_limit else f"（共 {len(pins)} 个）"
+        output.append(f"{current_pin_label}: {preview}{suffix}" if preview else f"{current_pin_label}: 无")
+        pins = []
+        current_pin_label = ""
+
+    for line in lines:
+        if line == "引脚名称:":
+            continue
+        success_match = re.match(r"布线成功的引脚个数[:：]\s*(.+)", line)
+        failure_match = re.match(r"布线失败的引脚个数[:：]\s*(.+)", line)
+        if success_match or failure_match:
+            flush_pins()
+            output.append(line)
+            current_pin_label = "成功引脚" if success_match else "失败引脚"
+            continue
+        if current_pin_label and re.fullmatch(r"[A-Za-z]+\d+(?:[._-]?[A-Za-z0-9]+)?", line):
+            pins.append(line)
+            continue
+        flush_pins()
+        output.append(line)
+
+    flush_pins()
+    return "\n".join(output).strip()
 
 
 def _read_text_lossy(path: Path) -> str:
@@ -781,6 +844,7 @@ class WebSocketTransportSingleton:
     _main_loop: Optional[asyncio.AbstractEventLoop] = None
     current_session_id: Optional[str] = None
     _cached_project_data: Dict[str, str] = {}  # session_id -> getProjectData 结果缓存
+    _cached_project_data_paths: Dict[str, str] = {}  # session_id -> getProjectData 文件路径缓存
     _cached_reroute_context: Dict[str, Dict[str, Any]] = {}  # session_id -> drop_net 结果缓存
     _session_modes: Dict[str, str] = {}  # session_id -> chat/pcb
     _pending_pcb_fields: Dict[str, Dict[str, Any]] = {}  # session_id -> fields emitted by tools
@@ -806,7 +870,12 @@ class WebSocketTransportSingleton:
     def resolve_session_id(self, session_id: Optional[str] = None) -> Optional[str]:
         candidate = str(session_id or "").strip()
         if candidate:
-            if candidate in self._session_modes or candidate in self._cached_project_data or candidate in self._cached_reroute_context:
+            if (
+                candidate in self._session_modes
+                or candidate in self._cached_project_data
+                or candidate in self._cached_project_data_paths
+                or candidate in self._cached_reroute_context
+            ):
                 return candidate
             try:
                 connections = getattr(self._websocket_adapter, "_connections", {}) or {}
@@ -836,6 +905,7 @@ class WebSocketTransportSingleton:
     def clear_session(self, session_id: str) -> None:
         self._session_modes.pop(session_id, None)
         self._cached_project_data.pop(session_id, None)
+        self._cached_project_data_paths.pop(session_id, None)
         self._cached_reroute_context.pop(session_id, None)
         self._pending_pcb_fields.pop(session_id, None)
         if self.current_session_id == session_id:
@@ -854,12 +924,33 @@ class WebSocketTransportSingleton:
             return None
         return self._cached_project_data.get(session_id)
 
+    def cache_project_data_path(self, path: str, session_id: Optional[str] = None) -> None:
+        """保存 getProjectData 返回的版图文件路径，供 pcb_extract_bga 脚本直接读取。"""
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return
+        normalized = str(path or "").strip()
+        if normalized:
+            self._cached_project_data_paths[session_id] = normalized
+
+    def get_cached_project_data_path(self, session_id: Optional[str] = None) -> Optional[str]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return None
+        return self._cached_project_data_paths.get(session_id)
+
     def cache_reroute_context(self, data: Dict[str, Any], session_id: Optional[str] = None) -> None:
         """保存 drop_net 的拆线上下文，供 reroute 工具使用。"""
         session_id = self.resolve_session_id(session_id)
         if not session_id:
             return
         self._cached_reroute_context[session_id] = data
+
+    def clear_reroute_context(self, session_id: Optional[str] = None) -> None:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return
+        self._cached_reroute_context.pop(session_id, None)
 
     def get_cached_reroute_context(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         session_id = self.resolve_session_id(session_id)
@@ -924,6 +1015,25 @@ class WebSocketTransportSingleton:
         )
 
         return future.result(timeout=timeout + 5.0)  # 留 5s 余量
+
+    def send_status(self, content: str, session_id: Optional[str] = None) -> None:
+        """Best-effort non-final status message for long PCB tool execution."""
+        adapter = self._websocket_adapter
+        loop = self._main_loop
+        session_id = self.resolve_session_id(session_id)
+        if not adapter or not loop or not loop.is_running() or not session_id:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                adapter.send(
+                    chat_id=session_id,
+                    content=str(content or ""),
+                    metadata={"is_final": False},
+                ),
+                loop,
+            )
+        except Exception:
+            logger.debug("Failed to send PCB tool status", exc_info=True)
 
 
 _transport = WebSocketTransportSingleton.get_instance()
@@ -1491,7 +1601,7 @@ def extract_reroute_nets(user_text: str) -> list[str]:
     for raw in found:
         net = raw.strip().strip("，。,.!?！？:：;；、")
         key = net.casefold()
-        if net and key not in seen:
+        if net and key != "net" and key not in seen:
             seen.add(key)
             nets.append(net)
     return nets
@@ -1708,6 +1818,86 @@ def _convert_internal_kicad_to_public_txt(
     return str(output_path), [f"converted_output_kicad_to_txt:{output_path}"]
 
 
+def _kicad_mm_to_mil_text(value: str) -> str:
+    return f"{(float(value) / 0.0254):.2f}"
+
+
+def _kicad_layer_to_import_layer(layer: str) -> str:
+    layer = str(layer or "").strip().strip('"')
+    if not layer:
+        return "Conductor/Top"
+    convert_mod = _load_convert_module()
+    txt_layer = convert_mod.layer_kicad_to_txt(layer)
+    return convert_mod.conductor_layer_txt(txt_layer)
+
+
+def _kicad_net_id_to_name(board_text: str) -> dict[str, str]:
+    return {net_id: net_name for net_name, net_id in _parse_kicad_net_name_to_id(board_text).items()}
+
+
+def _write_reroute_incremental_import_file(
+    *,
+    patch_text: str,
+    board_text: str,
+    output_dir: str,
+    session_id: str,
+) -> tuple[str, list[str]]:
+    """Write a small importLines input containing only the reroute patch wires."""
+    patch_text = str(patch_text or "").strip()
+    if not patch_text:
+        return "", []
+
+    net_id_to_name = _kicad_net_id_to_name(board_text)
+    wire_blocks: list[str] = []
+    for block in _extract_balanced_sexpr_blocks(patch_text, "segment"):
+        start = re.search(r"\(\s*start\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        end = re.search(r"\(\s*end\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        width = re.search(r"\(\s*width\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        layer = re.search(r"\(\s*layer\s+\"?([^\s\)\"]+)\"?\s*\)", block, re.IGNORECASE)
+        net = re.search(r"\(\s*net\s+(\d+)\s*\)", block, re.IGNORECASE)
+        if not (start and end and width and layer and net):
+            continue
+
+        net_name = net_id_to_name.get(net.group(1).strip(), net.group(1).strip())
+        import_layer = _kicad_layer_to_import_layer(layer.group(1))
+        width_dbu = _scale_mils_to_int(_kicad_mm_to_mil_text(width.group(1)))
+        x1 = _scale_mils_to_int(_kicad_mm_to_mil_text(start.group(1)))
+        y1 = _scale_mils_to_int(_kicad_mm_to_mil_text(start.group(2)))
+        x2 = _scale_mils_to_int(_kicad_mm_to_mil_text(end.group(1)))
+        y2 = _scale_mils_to_int(_kicad_mm_to_mil_text(end.group(2)))
+
+        wire_blocks.extend(
+            [
+                "    (wire",
+                f'        (net "{net_name}")',
+                "        (path",
+                '            (issamewidth "true")',
+                "            (lineseg",
+                f"                (pt {x1} {y1})",
+                f"                (w {width_dbu})",
+                "            )",
+                "            (lineseg",
+                f"                (pt {x2} {y2})",
+                f"                (w {width_dbu})",
+                "            )",
+                "            (props)",
+                f'            (layer "{import_layer}")',
+                "        )",
+                "    )",
+            ]
+        )
+
+    if not wire_blocks:
+        return "", []
+
+    import_dir = Path(output_dir) / "import"
+    import_dir.mkdir(parents=True, exist_ok=True)
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id or "session").strip("_") or "session"
+    output_path = import_dir / f"{safe_session}_reroute_import.txt"
+    output_path.write_text("\n".join(["(wires", *wire_blocks, ")"]) + "\n", encoding="utf-8")
+    return str(output_path), [f"generated_reroute_incremental_import:{output_path}"]
+
+
 _INTERNAL_REROUTE_PATH_KEYS = {
     "routedBoardDataFilePath",
     "originalBoardDataFilePath",
@@ -1735,11 +1925,131 @@ def _strip_internal_reroute_paths(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_internal_reroute_paths(item) for item in value]
     if isinstance(value, str):
-        return _INTERNAL_KICAD_PATH_RE.sub("内部版图文件", value).replace(".kicad_pcb", "")
+        text = _INTERNAL_KICAD_PATH_RE.sub("内部版图文件", value).replace(".kicad_pcb", "")
+        return re.sub(r"(?i)kicad(?:_pcb)?", "PCB版图", text)
     return value
 
 
-def _public_reroute_payload(payload: Dict[str, Any], public_txt_path: str) -> Dict[str, Any]:
+def _compact_public_text(value: Any, limit: int = 1200, *, preserve_newlines: bool = False) -> str:
+    text = str(_strip_internal_reroute_paths(value or "")).strip()
+    if preserve_newlines:
+        text = "\n".join(re.sub(r"[ \t\f\v]+", " ", line).rstrip() for line in text.splitlines())
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    else:
+        text = re.sub(r"\s+", " ", text)
+    if len(text) > limit:
+        return text[:limit].rstrip() + "..."
+    return text
+
+
+def _compact_public_drc_result(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _strip_internal_reroute_paths(value)
+    result: Dict[str, Any] = {}
+    for key in ("ok", "pass", "score", "score_name", "error"):
+        if key in value:
+            result[key] = _strip_internal_reroute_paths(value.get(key))
+    details = value.get("details")
+    if isinstance(details, dict):
+        result["details"] = {
+            key: _strip_internal_reroute_paths(details.get(key))
+            for key in ("hard_issue_count", "hard_penalty", "hard_rule_counts")
+            if key in details
+        }
+    artifacts = value.get("artifacts")
+    issues = artifacts.get("issues") if isinstance(artifacts, dict) else None
+    if isinstance(issues, list):
+        result["issuesPreview"] = [
+            {
+                "rule": item.get("rule"),
+                "severity": item.get("severity"),
+                "message": _compact_public_text(item.get("message") or item.get("description"), 220),
+                "net": item.get("net"),
+                "layer": item.get("layer"),
+                "pad_id": item.get("pad_id"),
+            }
+            for item in issues[:5]
+            if isinstance(item, dict)
+        ]
+        result["issueCount"] = len(issues)
+    return result
+
+
+def _compact_public_attempt(attempt: Any) -> Any:
+    if not isinstance(attempt, dict):
+        return _strip_internal_reroute_paths(attempt)
+    result = {
+        "iteration": attempt.get("iteration"),
+        "passed": attempt.get("passed"),
+        "fillDetail": _strip_internal_reroute_paths(attempt.get("fillDetail")),
+        "failureSummary": _compact_public_text(attempt.get("failureSummary"), 700),
+    }
+    if isinstance(attempt.get("drcResult"), dict):
+        result["drcResult"] = _compact_public_drc_result(attempt.get("drcResult"))
+    return result
+
+
+def _compact_public_check_report(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _strip_internal_reroute_paths(value)
+    result = dict(_strip_internal_reroute_paths(value))
+    checks = result.get("checks")
+    if isinstance(checks, list):
+        compact_checks = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            item = dict(check)
+            if "detail" in item:
+                item["detail"] = _compact_public_text(item.get("detail"), 700)
+            compact_checks.append(item)
+        result["checks"] = compact_checks
+    errors = result.get("errors")
+    if isinstance(errors, list):
+        result["errors"] = [_compact_public_text(error, 500) for error in errors[:8]]
+        result["errorCount"] = len(errors)
+    return result
+
+
+def _compact_public_reroute_result(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _strip_internal_reroute_paths(value)
+    result = dict(_strip_internal_reroute_paths(value))
+    attempts = result.get("drcAttempts")
+    if isinstance(attempts, list):
+        result["drcAttempts"] = [_compact_public_attempt(item) for item in attempts[-3:]]
+        result["drcAttemptCount"] = len(attempts)
+    reasons = result.get("drcFailureReasons")
+    if isinstance(reasons, list):
+        result["drcFailureReasons"] = [_compact_public_text(reason, 700) for reason in reasons[-3:]]
+        result["drcFailureReasonCount"] = len(reasons)
+    operations = result.get("operations")
+    if isinstance(operations, list) and len(operations) > 12:
+        result["operations"] = operations[:12]
+        result["operationCount"] = len(operations)
+    return result
+
+
+def _compact_public_reroute_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(payload)
+    if isinstance(result.get("rerouteResult"), dict):
+        result["rerouteResult"] = _compact_public_reroute_result(result["rerouteResult"])
+    if isinstance(result.get("checkReport"), dict):
+        result["checkReport"] = _compact_public_check_report(result["checkReport"])
+    if "explanation" in result:
+        result["explanation"] = _compact_public_text(result.get("explanation"), 1800)
+    if "content" in result:
+        result["content"] = _compact_public_text(result.get("content"), 5000, preserve_newlines=True)
+    if "report" in result:
+        result["report"] = _compact_public_text(result.get("report"), 5000, preserve_newlines=True)
+    return result
+
+
+def _public_reroute_payload(
+    payload: Dict[str, Any],
+    public_txt_path: str,
+    import_lines_path: str = "",
+) -> Dict[str, Any]:
     result = _strip_internal_reroute_paths(payload)
     if not isinstance(result, dict):
         result = {}
@@ -1748,10 +2058,19 @@ def _public_reroute_payload(payload: Dict[str, Any], public_txt_path: str) -> Di
         reroute_result = dict(result.get("rerouteResult") or {})
         reroute_result["routedLayoutTxtFilePath"] = public_txt_path
         result["rerouteResult"] = reroute_result
-    return result
+    if import_lines_path:
+        result["importLinesFilePath"] = import_lines_path
+        reroute_result = dict(result.get("rerouteResult") or {})
+        reroute_result["importLinesFilePath"] = import_lines_path
+        result["rerouteResult"] = reroute_result
+    return _compact_public_reroute_payload(result)
 
 
-def _pending_reroute_fields_for_frontend(public_payload: Dict[str, Any], public_txt_path: str) -> Dict[str, Any]:
+def _pending_reroute_fields_for_frontend(
+    public_payload: Dict[str, Any],
+    public_txt_path: str,
+    import_lines_path: str = "",
+) -> Dict[str, Any]:
     if not isinstance(public_payload, dict) or not public_payload:
         return {}
 
@@ -1761,6 +2080,8 @@ def _pending_reroute_fields_for_frontend(public_payload: Dict[str, Any], public_
         fields["rerouteResult"] = reroute_result
     if public_txt_path:
         fields["routedLayoutTxtFilePath"] = public_txt_path
+    if import_lines_path:
+        fields["importLinesFilePath"] = import_lines_path
     check_report = public_payload.get("checkReport")
     if isinstance(check_report, dict):
         fields["checkReport"] = check_report
@@ -1823,6 +2144,47 @@ def _latest_reroute_failure_reason(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _latest_reroute_drc_result(payload: Dict[str, Any]) -> Dict[str, Any]:
+    reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    attempts = reroute_result.get("drcAttempts") if isinstance(reroute_result, dict) else None
+    if isinstance(attempts, list):
+        for attempt in reversed(attempts):
+            if isinstance(attempt, dict) and isinstance(attempt.get("drcResult"), dict):
+                return attempt["drcResult"]
+    return {}
+
+
+def _drc_failure_markdown_summary(payload: Dict[str, Any]) -> str:
+    drc_result = _latest_reroute_drc_result(payload)
+    details = drc_result.get("details") if isinstance(drc_result, dict) else {}
+    if not isinstance(details, dict):
+        details = {}
+    hard_count = details.get("hard_issue_count")
+    rule_counts = details.get("hard_rule_counts")
+    issues = drc_result.get("issuesPreview") if isinstance(drc_result, dict) else None
+
+    lines: list[str] = []
+    if hard_count not in (None, ""):
+        lines.append(f"- 硬 DRC 问题数：{hard_count}")
+    if isinstance(rule_counts, dict) and rule_counts:
+        rule_text = "；".join(f"{key}: {value}" for key, value in rule_counts.items())
+        lines.append(f"- 规则计数：{rule_text}")
+    if isinstance(issues, list) and issues:
+        lines.append("- 主要问题：")
+        for item in issues[:5]:
+            if not isinstance(item, dict):
+                continue
+            rule = str(item.get("rule") or "DRC").strip()
+            message = _compact_public_text(item.get("message") or item.get("description"), 220)
+            if message:
+                lines.append(f"  - `{rule}`：{message}")
+    if lines:
+        return "\n".join(lines)
+
+    failure_reason = str(_strip_internal_reroute_paths(_latest_reroute_failure_reason(payload))).strip()
+    return _compact_public_text(failure_reason, 1200) or "DRC 校验未通过，但未返回更具体的失败原因。"
+
+
 def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) -> str:
     drc_passed = _reroute_drc_passed_from_payload(payload)
     failure_reason = str(_strip_internal_reroute_paths(_latest_reroute_failure_reason(payload))).strip()
@@ -1832,15 +2194,24 @@ def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) 
     if drc_passed is True:
         status = "通过"
         conclusion_label = "成功结论"
-        conclusion = "DRC 校验通过，重布结果满足当前硬约束。"
+        reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+        local_policy = reroute_result.get("localReroutePolicy") if isinstance(reroute_result, dict) else {}
+        if isinstance(local_policy, dict) and local_policy.get("mode") == "selected_net_local":
+            inherited = local_policy.get("inheritedIssueCount", 0)
+            conclusion = (
+                "局部 DRC 校验通过，所选网络的重布结果满足导入门禁。"
+                f"原板仍有 {inherited} 个非所选网络的全局遗留问题，已作为报告信息保留，不阻止本次 importLines。"
+            )
+        else:
+            conclusion = "DRC 校验通过，重布结果满足当前硬约束。"
     elif drc_passed is False:
         status = "未通过"
         conclusion_label = "失败原因"
-        conclusion = failure_reason or "DRC 校验未通过，但未返回更具体的失败原因。"
+        conclusion = _drc_failure_markdown_summary(payload)
     else:
         status = "未执行"
         conclusion_label = "失败原因"
-        conclusion = failure_reason or "尚未进入 DRC 校验，通常是模型未生成可回填 patch 或输入数据不足。"
+        conclusion = _compact_public_text(failure_reason, 1200) or "尚未进入 DRC 校验，通常是模型未生成可回填 patch 或输入数据不足。"
 
     if txt_generated:
         txt_status = f"已生成：{public_txt_path}"
@@ -1872,6 +2243,7 @@ def _compose_reroute_report_content(
     explain_text = str(_strip_internal_reroute_paths(explain_report or "")).strip()
     if not explain_text:
         explain_text = "Explain 模型未返回可用报告。"
+    explain_text = _compact_public_text(explain_text, 3000, preserve_newlines=True)
     explain_section = (
         "Explain 模型可解释性报告\n"
         "======================\n\n"
@@ -1916,6 +2288,10 @@ def _strip_think_blocks(text: str) -> str:
 
 
 def _safe_json_for_explain(value: Any) -> Any:
+    if isinstance(value, dict) and ("drcAttempts" in value or "drcFailureReasons" in value):
+        return _compact_public_reroute_result(value)
+    if isinstance(value, dict) and "checks" in value:
+        return _compact_public_check_report(value)
     return _strip_internal_reroute_paths(value)
 
 
@@ -2057,9 +2433,10 @@ def _normalize_delete_for_rerouting_payload(
             net = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
             if net:
                 selected_nets.append(net)
-    for net in extract_reroute_nets(user_text):
-        if net not in selected_nets:
-            selected_nets.append(net)
+    if not selected_nets:
+        for net in extract_reroute_nets(user_text):
+            if net not in selected_nets:
+                selected_nets.append(net)
 
     project_data = str(
         parsed.get("projectData")
@@ -2076,11 +2453,38 @@ def _normalize_delete_for_rerouting_payload(
             dropped_board_data = project_data
             dropped_board_path = ""
 
-    error = str(parsed.get("error") or parsed.get("message") or "").strip()
-    if not error and not missing_routes:
-        error = "deleteTracesForRerouting did not return missing_routes."
-    if not error and not (dropped_board_data or dropped_board_path):
-        error = "deleteTracesForRerouting did not return a readable projectData file."
+    validation_error = _validate_delete_for_rerouting_payload(
+        parsed=parsed,
+        missing_routes=missing_routes,
+        project_data=project_data,
+        dropped_board_data=dropped_board_data,
+        dropped_board_path=dropped_board_path,
+    )
+    frontend_error_value = parsed.get("error")
+    error = str(
+        parsed.get("message")
+        or (frontend_error_value if isinstance(frontend_error_value, str) else "")
+        or validation_error
+        or ""
+    ).strip()
+    details = parsed.get("details")
+    if isinstance(details, dict):
+        skipped = details.get("skipped")
+        if isinstance(skipped, list) and skipped:
+            skipped_parts: list[str] = []
+            for item in skipped[:8]:
+                if not isinstance(item, dict):
+                    continue
+                net_name = str(item.get("netName") or item.get("net_name") or "").strip()
+                reason = str(item.get("reason") or "").strip()
+                if net_name and reason:
+                    skipped_parts.append(f"{net_name}({reason})")
+                elif net_name:
+                    skipped_parts.append(net_name)
+                elif reason:
+                    skipped_parts.append(reason)
+            if skipped_parts:
+                error = f"{error}；跳过对象：{', '.join(skipped_parts)}" if error else f"跳过对象：{', '.join(skipped_parts)}"
 
     payload = {
         "selectedNets": selected_nets,
@@ -2088,9 +2492,9 @@ def _normalize_delete_for_rerouting_payload(
         "missingRoutes": missing_routes,
         "dropResult": parsed,
         "deleteResult": parsed,
-        "droppedBoardData": dropped_board_data,
         "droppedBoardDataFilePath": dropped_board_path or project_data,
         "originalBoardDataFilePath": dropped_board_path or project_data,
+        "droppedBoardDataChars": len(dropped_board_data or ""),
         "droppedObjects": [
             {"net": net, "type": "missing_route", "deleted": True}
             for net in selected_nets
@@ -2100,11 +2504,56 @@ def _normalize_delete_for_rerouting_payload(
             "selectionCount": len(missing_routes),
             "selectedNetCount": len(selected_nets),
             "projectID": project_id,
+            "missingRoutes": missing_routes,
         },
     }
     if error:
         payload["error"] = error
+        payload["frontendError"] = {
+            "code": 50001,
+            "message": "Tool execution failed",
+            "details": error,
+        }
     return payload
+
+
+def _validate_delete_for_rerouting_payload(
+    *,
+    parsed: Dict[str, Any],
+    missing_routes: list[Any],
+    project_data: str,
+    dropped_board_data: str,
+    dropped_board_path: str,
+) -> str:
+    if not missing_routes:
+        return "未检测到框选走线，deleteTracesForRerouting 未返回 missing_routes。"
+    if len(missing_routes) > 40:
+        return f"框选走线数量超过 40Pin 限制：{len(missing_routes)}。"
+
+    for index, route in enumerate(missing_routes, start=1):
+        if not isinstance(route, dict):
+            return f"missing_routes[{index}] 不是对象。"
+        net_name = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+        if not net_name:
+            return f"missing_routes[{index}] 缺少 net_name。"
+        for endpoint_name in ("start", "end"):
+            endpoint = route.get(endpoint_name)
+            if not isinstance(endpoint, dict):
+                return f"missing_routes[{index}].{endpoint_name} 缺少对象。"
+            layer = str(endpoint.get("layer") or "").strip()
+            if not layer:
+                return f"missing_routes[{index}].{endpoint_name} 缺少 layer。"
+            for coordinate in ("x", "y"):
+                try:
+                    float(endpoint.get(coordinate))
+                except (TypeError, ValueError):
+                    return f"missing_routes[{index}].{endpoint_name} 缺少有效 {coordinate} 坐标。"
+
+    if not project_data:
+        return "deleteTracesForRerouting 未返回 projectData。"
+    if not dropped_board_data:
+        return f"projectData 不可读：{project_data}"
+    return ""
 
 
 def delete_traces_for_rerouting(userText: str = "", projectID: str = "", session_id: Optional[str] = None) -> str:
@@ -2123,7 +2572,11 @@ def delete_traces_for_rerouting(userText: str = "", projectID: str = "", session
             session_id=session_id,
         )
         payload = _normalize_delete_for_rerouting_payload(raw_result, user_text=userText, project_id=projectID)
-        _transport.cache_reroute_context(payload, session_id=session_id)
+        if payload.get("error"):
+            logger.warning("deleteTracesForRerouting returned unusable reroute context: %s", payload.get("error"))
+            _transport.clear_reroute_context(session_id)
+        else:
+            _transport.cache_reroute_context(payload, session_id=session_id)
         return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         logger.error("deleteTracesForRerouting failed: %s", e)
@@ -2141,7 +2594,7 @@ registry.register(
     schema={
         "name": "deleteTracesForRerouting",
         "description": (
-            "Call the PCB frontend one-shot tool to delete the selected BGA escape traces "
+            "Call the PCB frontend one-shot tool to delete the selected traces "
             "and return missing_routes plus projectData for local reroute."
         ),
         "parameters": {
@@ -2392,10 +2845,18 @@ def _target_reroute_nets(nets: list[str], dropped_objects: Any, local_context: A
 def _parse_reroute_net_declarations(board_text: str) -> tuple[dict[str, str], dict[str, str]]:
     id_to_name: dict[str, str] = {}
     name_to_id: dict[str, str] = {}
-    for match in re.finditer(r'\(\s*net\s+(\d+)\s+"([^"]*)"\s*\)', board_text or "", flags=re.IGNORECASE):
-        net_id, net_name = match.groups()
-        id_to_name[net_id] = net_name
-        name_to_id[net_name] = net_id
+    patterns = (
+        r'\(\s*net\s+(\d+)\s+"([^"]*)"\s*\)',
+        r'\(\s*net\s+(\d+)\s+([^\s\)]+)\s*\)',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, board_text or "", flags=re.IGNORECASE):
+            net_id, net_name = match.groups()
+            net_name = _strip_kicad_atom(net_name)
+            if not net_name:
+                continue
+            id_to_name.setdefault(net_id, net_name)
+            name_to_id.setdefault(net_name, net_id)
     return id_to_name, name_to_id
 
 
@@ -2408,6 +2869,18 @@ def _parse_float_pair(pattern: str, text: str) -> tuple[float, float] | None:
     if not match:
         return None
     return float(match.group(1)), float(match.group(2))
+
+
+def _parse_float_triplet(pattern: str, text: str) -> tuple[float, float, float] | None:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    third = match.group(3)
+    return float(match.group(1)), float(match.group(2)), float(third) if third not in (None, "") else 0.0
+
+
+def _strip_kicad_atom(value: str) -> str:
+    return str(value or "").strip().strip('"')
 
 
 def _module_pad_endpoints_for_nets(
@@ -2431,14 +2904,17 @@ def _module_pad_endpoints_for_nets(
     endpoints: list[dict[str, Any]] = []
     for module in _extract_balanced_sexpr_blocks(board_text, "module"):
         module_head = re.search(r"\(\s*module\s+([^\s)]+)", module, flags=re.IGNORECASE)
-        package = module_head.group(1) if module_head else "module"
+        package = _strip_kicad_atom(module_head.group(1) if module_head else "module")
         module_layer_match = re.search(r"\(\s*layer\s+([^\s)]+)", module, flags=re.IGNORECASE)
-        module_layer = module_layer_match.group(1) if module_layer_match else ""
+        module_layer = _strip_kicad_atom(module_layer_match.group(1) if module_layer_match else "")
         first_pad_index = module.lower().find("( pad")
         module_header = module if first_pad_index < 0 else module[:first_pad_index]
-        module_at = _parse_float_pair(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", module_header) or (0.0, 0.0)
+        module_at = _parse_float_triplet(
+            r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?:\s+(-?\d+(?:\.\d+)?))?",
+            module_header,
+        ) or (0.0, 0.0, 0.0)
         reference_match = re.search(r"\(\s*fp_text\s+reference\s+([^\s)]+)", module, flags=re.IGNORECASE)
-        reference = reference_match.group(1) if reference_match else package
+        reference = _strip_kicad_atom(reference_match.group(1) if reference_match else package)
         for pad in _extract_balanced_sexpr_blocks(module, "pad"):
             net_match = re.search(r'\(\s*net\s+(\d+)(?:\s+"([^"]*)")?', pad, flags=re.IGNORECASE)
             if not net_match:
@@ -2448,15 +2924,19 @@ def _module_pad_endpoints_for_nets(
             if net_id not in target_ids and net_name not in target_names:
                 continue
             pad_match = re.search(r"\(\s*pad\s+([^\s)]+)", pad, flags=re.IGNORECASE)
-            pad_name = pad_match.group(1) if pad_match else "pad"
+            pad_name = _strip_kicad_atom(pad_match.group(1) if pad_match else "pad")
             pad_at = _parse_float_pair(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", pad) or (0.0, 0.0)
             layers_match = re.search(r"\(\s*layers\s+([^)]+)\)", pad, flags=re.IGNORECASE)
             layer = module_layer
             if layers_match:
                 for token in layers_match.group(1).split():
                     if token not in {"F.Paste", "F.Mask", "B.Paste", "B.Mask"}:
-                        layer = token
+                        layer = _strip_kicad_atom(token)
                         break
+            theta = math.radians(-module_at[2])
+            local_y = -pad_at[1] if module_layer == "Bottom" else pad_at[1]
+            pad_x = module_at[0] + pad_at[0] * math.cos(theta) - local_y * math.sin(theta)
+            pad_y = module_at[1] + pad_at[0] * math.sin(theta) + local_y * math.cos(theta)
             endpoints.append(
                 {
                     "netId": net_id,
@@ -2465,8 +2945,8 @@ def _module_pad_endpoints_for_nets(
                     "package": package,
                     "pad": pad_name,
                     "layer": layer,
-                    "x": module_at[0] + pad_at[0],
-                    "y": module_at[1] + pad_at[1],
+                    "x": pad_x,
+                    "y": pad_y,
                 }
             )
     return endpoints
@@ -2481,6 +2961,161 @@ def _format_endpoint_for_prompt(endpoint: dict[str, Any]) -> str:
     y = float(endpoint.get("y") or 0.0)
     kind = "BGA" if "bga" in package.lower() else "模块"
     return f"{kind} {component}（{package}）的焊盘 {pad}，位于层 {layer}，坐标 {_coord_text(x, y)}"
+
+
+def _frontend_missing_routes_from_context(local_context: Any) -> list[dict[str, Any]]:
+    if not isinstance(local_context, dict):
+        return []
+    routes = local_context.get("missingRoutes") or local_context.get("missing_routes") or []
+    if not isinstance(routes, list):
+        return []
+    return [route for route in routes if isinstance(route, dict)]
+
+
+def _frontend_coord_to_internal_kicad(value: Any, *, axis: str) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        convert_mod = _load_convert_module()
+        origin = float(getattr(convert_mod, "OUTLINE_ONLY_ORIGIN_X" if axis == "x" else "OUTLINE_ONLY_ORIGIN_Y"))
+        dbu_mm = float(getattr(convert_mod, "DBU_MM"))
+    except Exception:
+        origin = 363386.0 if axis == "x" else 534646.0
+        dbu_mm = 0.000254
+    return (number * 100.0 + origin) * dbu_mm
+
+
+def _endpoint_component_pad_key(endpoint: Any) -> tuple[str, str]:
+    if not isinstance(endpoint, dict):
+        return "", ""
+    return str(endpoint.get("component") or "").strip(), str(endpoint.get("pad") or "").strip()
+
+
+def _endpoint_from_internal_pad(
+    endpoint: Any,
+    *,
+    pad_lookup: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    component, pad = _endpoint_component_pad_key(endpoint)
+    if not component or not pad:
+        return None
+    internal = pad_lookup.get((component, pad))
+    if not internal:
+        return None
+    result = dict(endpoint) if isinstance(endpoint, dict) else {}
+    result["x"] = float(internal.get("x") or 0.0)
+    result["y"] = float(internal.get("y") or 0.0)
+    result["layer"] = str(internal.get("layer") or result.get("layer") or "")
+    result["coordinateSource"] = "internal_pad_center"
+    return result
+
+
+def _normalize_frontend_endpoint_to_internal_kicad(
+    endpoint: Any,
+    *,
+    pad_lookup: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    if not isinstance(endpoint, dict):
+        return None, None, "missing_endpoint"
+    frontend = dict(endpoint)
+    internal = _endpoint_from_internal_pad(endpoint, pad_lookup=pad_lookup)
+    if internal is not None:
+        return internal, frontend, "internal_pad_center"
+    x = _frontend_coord_to_internal_kicad(endpoint.get("x"), axis="x")
+    y = _frontend_coord_to_internal_kicad(endpoint.get("y"), axis="y")
+    if x is None or y is None:
+        return dict(endpoint), frontend, "unconverted"
+    internal = dict(endpoint)
+    internal["x"] = x
+    internal["y"] = y
+    internal["coordinateSource"] = "frontend_txt_dbu_to_internal_kicad"
+    return internal, frontend, "frontend_txt_dbu_to_internal_kicad"
+
+
+def _normalize_reroute_local_context_coordinates(
+    local_context: Any,
+    *,
+    board_text: str,
+    nets: list[str],
+    dropped_objects: Any,
+) -> tuple[Any, dict[str, Any]]:
+    if not isinstance(local_context, dict):
+        return local_context, {"normalized": False, "reason": "local_context_not_dict"}
+    routes = _frontend_missing_routes_from_context(local_context)
+    if not routes:
+        return local_context, {"normalized": False, "missingRouteCount": 0}
+    target_net_names, target_net_ids = _target_reroute_nets(nets, dropped_objects, local_context)
+    endpoints = _module_pad_endpoints_for_nets(
+        board_text,
+        target_net_names=target_net_names,
+        target_net_ids=target_net_ids,
+    )
+    pad_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for endpoint in endpoints:
+        component = str(endpoint.get("component") or "").strip()
+        pad = str(endpoint.get("pad") or "").strip()
+        if component and pad:
+            pad_lookup[(component, pad)] = endpoint
+
+    normalized_routes = []
+    conversions = []
+    for route in routes:
+        new_route = dict(route)
+        for key in ("start", "end"):
+            internal, frontend, source = _normalize_frontend_endpoint_to_internal_kicad(
+                route.get(key),
+                pad_lookup=pad_lookup,
+            )
+            if frontend is not None:
+                new_route[f"frontend{key.capitalize()}"] = frontend
+            if internal is not None:
+                new_route[key] = internal
+            conversions.append(
+                {
+                    "net": route.get("net_name") or route.get("netName") or route.get("net"),
+                    "endpoint": key,
+                    "source": source,
+                    "frontend": frontend,
+                    "internal": internal,
+                }
+            )
+        normalized_routes.append(new_route)
+
+    normalized_context = dict(local_context)
+    normalized_context["missingRoutes"] = normalized_routes
+    normalized_context["coordinateSystem"] = "internal_kicad_mm"
+    normalized_context["frontendCoordinateSystem"] = "pcb_builder_txt_mils"
+    stats = {
+        "normalized": True,
+        "missingRouteCount": len(normalized_routes),
+        "padEndpointCount": len(endpoints),
+        "conversions": conversions,
+    }
+    return normalized_context, stats
+
+
+def _format_frontend_route_endpoint(endpoint: Any) -> str:
+    if not isinstance(endpoint, dict):
+        return "未知端点"
+    component = str(endpoint.get("component") or "").strip()
+    pad = str(endpoint.get("pad") or "").strip()
+    layer = str(endpoint.get("layer") or "").strip() or "未知层"
+    try:
+        x = float(endpoint.get("x"))
+        y = float(endpoint.get("y"))
+        coord = _coord_text(x, y)
+    except (TypeError, ValueError):
+        coord = "未知坐标"
+    owner = ""
+    if component and pad:
+        owner = f"{component}.{pad}，"
+    elif component:
+        owner = f"{component}，"
+    elif pad:
+        owner = f"pad {pad}，"
+    return f"{owner}层 {layer}，坐标 {coord}"
 
 
 def _build_missing_route_description(
@@ -2503,10 +3138,35 @@ def _build_missing_route_description(
         endpoints_by_net.setdefault(key, []).append(endpoint)
 
     lines: list[str] = []
+    route_index = 1
+    net_name_to_id = _parse_kicad_net_name_to_id(board_text)
+    frontend_routes = _frontend_missing_routes_from_context(local_context)
+    for route in frontend_routes:
+        net_name = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+        if not net_name:
+            continue
+        start_text = _format_frontend_route_endpoint(route.get("start"))
+        end_text = _format_frontend_route_endpoint(route.get("end"))
+        frontend_start_text = _format_frontend_route_endpoint(route.get("frontendStart") or route.get("start"))
+        frontend_end_text = _format_frontend_route_endpoint(route.get("frontendEnd") or route.get("end"))
+        net_id_text = f"，KiCad net id 必须使用 {net_name_to_id[net_name]}" if net_name in net_name_to_id else ""
+        lines.append(f"{route_index}. 网络 {net_name}{net_id_text}")
+        route_index += 1
+        lines.append(
+            "前端删除线段: "
+            f"deleteTracesForRerouting 返回该网络缺失连接，前端原始起点为 {frontend_start_text}，"
+            f"前端原始终点为 {frontend_end_text}。"
+            f"agent 已将其归一化到内部 KiCad 坐标：起点 {start_text}，终点 {end_text}。"
+            "生成重布 patch 时必须只使用内部 KiCad 坐标连接这两个端点；"
+            "不得改变坐标正负号，不得只连接到附近坐标；"
+            "前端原始坐标仅用于展示和排查，禁止直接作为 KiCad patch 坐标。"
+        )
+
     if endpoints_by_net:
-        for index, ((net_id, net_name), net_endpoints) in enumerate(endpoints_by_net.items(), start=1):
+        for (net_id, net_name), net_endpoints in endpoints_by_net.items():
             label = f"{net_id}({net_name})" if net_id and net_name else net_name or net_id
-            lines.append(f"{index}. 网络 {label}")
+            lines.append(f"{route_index}. 网络 {label}")
+            route_index += 1
             if len(net_endpoints) >= 2:
                 first, second = net_endpoints[0], net_endpoints[1]
                 lines.append(
@@ -2539,6 +3199,7 @@ def _build_missing_route_description(
         "targetNetIds": target_net_ids,
         "endpointCount": len(endpoints),
         "selectedTraceIds": selected_trace_ids or [],
+        "frontendMissingRouteCount": len(frontend_routes),
     }
     return "\n".join(lines).strip(), stats
 
@@ -2629,6 +3290,40 @@ def _format_drc_iteration_history_for_prompt(history: list[Dict[str, Any]]) -> s
     )
 
 
+def _drc_feedback_for_prompt(attempt: Any) -> str:
+    summary = str(getattr(attempt, "failure_summary", "") or "").strip()
+    drc_result = getattr(attempt, "drc_result", {}) or {}
+    fill_detail = getattr(attempt, "fill_detail", {}) or {}
+    parts = [summary] if summary else []
+    if isinstance(drc_result, dict):
+        details = drc_result.get("details") or {}
+        hard_count = details.get("hard_issue_count")
+        if hard_count is not None:
+            parts.append(f"硬 DRC 问题数量：{hard_count}")
+        rule_counts = details.get("hard_rule_counts") or {}
+        if rule_counts:
+            parts.append(f"规则计数：{json.dumps(rule_counts, ensure_ascii=False)}")
+        issues = (drc_result.get("artifacts") or {}).get("issues") or []
+        compact_issues = []
+        for issue in issues[:8]:
+            if isinstance(issue, dict):
+                compact_issues.append(
+                    {
+                        "rule": issue.get("rule"),
+                        "message": issue.get("message") or issue.get("description"),
+                        "severity": issue.get("severity"),
+                    }
+                )
+            else:
+                compact_issues.append(str(issue))
+        if compact_issues:
+            parts.append(f"前几条 DRC issue：{json.dumps(compact_issues, ensure_ascii=False)}")
+    if isinstance(fill_detail, dict) and fill_detail:
+        parts.append(f"patch 回填统计：{json.dumps(fill_detail, ensure_ascii=False)}")
+    parts.append("下一轮必须避开上述冲突/间距/短路问题，优先调整走线坐标或换层，不能原样重复上一轮 patch。")
+    return "\n".join(part for part in parts if part)
+
+
 def _build_reroute_generation_prompts(
     *,
     nets: list[str],
@@ -2647,55 +3342,39 @@ def _build_reroute_generation_prompts(
     selected_trace_ids: list[str] | None = None,
 ) -> Dict[str, str]:
     system_prompt = (
-        "你是资深 PCB 布线工程师和 KiCad 代码生成器。"
-        "请先规划，再在 <answer> 中只输出合法 KiCad 走线对象。"
+        "你是资深 PCB 布线工程师和 KiCad 代码生成器。只输出合法 KiCad 走线对象，不要输出推理过程。"
     )
-    safe_local_context = _strip_internal_reroute_paths(local_context)
-    safe_dropped_objects = _strip_internal_reroute_paths(dropped_objects)
-    board_input_state = {
-        "frontendInputConvertedToKiCad": bool(dropped_board_path),
-        "originalBoardAvailable": bool(original_board_path),
-        "internalBoardPathHidden": True,
-    }
     feedback_text = ""
     if drc_feedback or drc_iteration_history:
         feedback_text = (
-            "\n\n历史 DRC 迭代:\n"
+            "\n上一轮 DRC 反馈：\n"
+            "历史 DRC 迭代:\n"
             f"{_format_drc_iteration_history_for_prompt(drc_iteration_history or [])}\n\n"
-            "上一轮 DRC 失败反馈:\n"
-            f"{json.dumps(drc_feedback or [], ensure_ascii=False, indent=2)}\n"
+            "DRC 失败反馈（下一轮必须据此修改走线，不要重复失败 patch）:\n"
+            f"{json.dumps(drc_feedback or [], ensure_ascii=False, indent=2)}\n\n"
         )
     user_prompt = (
+        "/no_think\n"
         "你是一个 PCB 逃逸布线智能体。请根据 PCB 上下文和缺失走线描述，"
-        "先规划布线路径，再生成补全缺失网络所需的 KiCad 走线对象。\n\n"
+        "只生成补全缺失网络所需的 KiCad 走线对象。\n"
+        "只允许输出纯文本形式的 (segment ...) 和必要时的 (via ...) 对象。\n"
+        "不要输出 Markdown、代码块、解释、分析过程或 <think> 内容。\n\n"
         f"任务 ID：{task_id}\n"
         f"板卡 ID：{board_id}\n"
         "缺失走线描述：\n"
         f"{task_description.strip() or '前端已框选并删除局部走线，请根据上下文补全同网缺失连接。'}\n\n"
         "相关 KiCad 上下文片段：\n"
-        f"{context_text}"
-        f"{feedback_text}\n\n"
-        "前端框选信息：\n"
-        f"- selectedNets: {json.dumps(nets or [], ensure_ascii=False)}\n"
-        f"- selectedTraceIds: {json.dumps(selected_trace_ids or [], ensure_ascii=False)}\n"
-        f"- actions: deleteTracesForRerouting -> reroute -> DRC -> txt -> importLines only if DRC passes\n"
-        f"- boardInputState: {json.dumps(board_input_state, ensure_ascii=False)}\n"
-        f"- chunkStats: {json.dumps(context_stats, ensure_ascii=False)}\n"
-        f"- constraints: {json.dumps(constraints or {}, ensure_ascii=False)}\n"
-        f"- droppedObjects: {json.dumps(safe_dropped_objects, ensure_ascii=False)}\n"
-        f"- localContext: {json.dumps(safe_local_context, ensure_ascii=False)}\n\n"
-        "规划要求：\n"
-        "- 在 <think>...</think> 中分析缺失网络、起点终点、可用层、障碍和最短可行路径。\n"
-        "- 思考时可以比较 1-3 个候选走法，但必须选择一个最可能 DRC 通过的方案。\n"
+        f"{context_text}\n\n"
+        f"{feedback_text}"
+        "布线约束：\n"
+        "- 必须保留 PCB 上下文中的 net id、层名、线宽和坐标含义。\n"
+        "- 如果缺失走线描述中包含内部 KiCad start/end 端点，输出的 segment/via 必须精确连接这些端点。\n"
+        "- 缺失走线描述中的前端原始坐标只用于展示，禁止直接作为 KiCad patch 坐标。\n"
         "- 优先短的曼哈顿或近似曼哈顿路径，避免不同网络在同一铜层交叉。\n"
-        "- 除非必须换层，否则尽量不要使用 via。\n\n"
-        "最终输出要求：\n"
-        "- 最终答案必须放在 <answer> 和 </answer> 标签之间。\n"
-        "- <answer> 内只允许包含纯文本形式的 (segment ...) 和必要时的 (via ...) 对象。\n"
-        "- 不要在 <answer> 内输出 Markdown、代码块、解释或自然语言。\n"
-        "- 不要输出省略号、占位符或未完成内容；如果只需要一条线，也必须写完整的 (segment ...)。\n"
-        "- 必须保留 PCB 上下文中的 net id、层名、线宽和坐标含义。\n\n"
-        "KiCad 语法示例：\n"
+        "- 避免不同网络在同一铜层发生交叉。\n"
+        "- 除非必须换层，否则尽量不要使用 via。\n"
+        "- 最终只输出缺失走线对象，不要输出其它内容。\n\n"
+        "必须使用下面这种 KiCad 语法格式：\n"
         "(segment (start 47.300000 62.300000) (end 47.300000 68.300000) "
         "(width 0.152400) (layer Top) (net 73))\n"
         "(via (at 47.300000 62.300000) (size 0.457200) (drill 0.203200) "
@@ -2749,7 +3428,7 @@ def _generate_reroute_with_model(
             base_url=runtime["base_url"],
             model=runtime["model"],
             api_key=runtime["api_key"],
-            timeout_s=300,
+            timeout_s=_get_reroute_model_timeout_seconds(),
         )
         task_description, task_stats = _build_missing_route_description(
             board_text=dropped_board_data,
@@ -2864,20 +3543,45 @@ def _get_max_drc_iterations(user_data_obj: Dict[str, Any]) -> int:
             break
     if raw is None:
         env_value = os.getenv("PCB_REROUTE_MAX_DRC_ITERATIONS")
-        raw = env_value if env_value not in (None, "") else 5
+        raw = env_value if env_value not in (None, "") else 3
     try:
         return max(0, min(20, int(raw)))
     except (TypeError, ValueError):
-        return 5
+        return 3
 
 
 def _get_reroute_model_max_tokens() -> int:
     raw = os.getenv("PCB_REROUTE_MAX_TOKENS", "").strip()
+    if not raw:
+        parser = pcb_model_runtime._load_project_config_ini()
+        if parser is not None:
+            for section in ("reroute-model", "reroute_model", "reroute"):
+                if not parser.has_section(section):
+                    continue
+                raw = (
+                    parser.get(section, "max_tokens", fallback="").strip()
+                    or parser.get(section, "max_new_tokens", fallback="").strip()
+                )
+                if raw:
+                    break
     try:
-        value = int(raw) if raw else 65536
+        value = int(raw) if raw else 2048
     except ValueError:
-        value = 65536
-    return max(512, min(65536, value))
+        value = 2048
+    return max(512, min(8192, value))
+
+
+def _get_reroute_model_timeout_seconds() -> float:
+    raw = (
+        os.getenv("CTYUN_REROUTE_TIMEOUT", "").strip()
+        or os.getenv("PCB_REROUTE_TIMEOUT", "").strip()
+        or "600"
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 600.0
+    return max(60.0, min(1800.0, value))
 
 
 def _get_reroute_model_temperature() -> float:
@@ -2909,6 +3613,297 @@ def _model_patch_text(payload: Dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _parse_kicad_net_name_to_id(board_text: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not isinstance(board_text, str) or not board_text:
+        return mapping
+    quoted = re.compile(r"\(\s*net\s+(\d+)\s+\"([^\"]+)\"\s*\)", re.IGNORECASE)
+    bare = re.compile(r"\(\s*net\s+(\d+)\s+([^\s\)]+)\s*\)", re.IGNORECASE)
+    for pattern in (quoted, bare):
+        for match in pattern.finditer(board_text):
+            net_id = match.group(1).strip()
+            net_name = match.group(2).strip()
+            if net_name and net_name not in mapping:
+                mapping[net_name] = net_id
+    return mapping
+
+
+def _patch_block_points(block: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for match in re.finditer(r"\(\s*(?:start|end|at)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", block, re.IGNORECASE):
+        try:
+            points.append((float(match.group(1)), float(match.group(2))))
+        except ValueError:
+            continue
+    return points
+
+
+def _route_endpoint_points(route: dict[str, Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for key in ("start", "end"):
+        endpoint = route.get(key)
+        if not isinstance(endpoint, dict):
+            continue
+        try:
+            points.append((float(endpoint.get("x")), float(endpoint.get("y"))))
+        except (TypeError, ValueError):
+            continue
+    return points
+
+
+def _squared_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def _replace_patch_block_net_id(block: str, net_id: str) -> str:
+    if re.search(r"\(\s*net\s+\d+\s*\)", block, re.IGNORECASE):
+        return re.sub(r"\(\s*net\s+\d+\s*\)", f"(net {net_id})", block, count=1, flags=re.IGNORECASE)
+    insert_at = max(block.rfind(")"), 0)
+    return f"{block[:insert_at].rstrip()} (net {net_id}){block[insert_at:]}"
+
+
+def _format_coord_pair(point: tuple[float, float]) -> str:
+    return f"{point[0]:.6f}, {point[1]:.6f}"
+
+
+def _single_missing_route_for_endpoint_guard(
+    *,
+    selected_nets: list[str],
+    local_context: Any,
+) -> dict[str, Any] | None:
+    routes = _frontend_missing_routes_from_context(local_context)
+    selected = [str(net).strip() for net in selected_nets if str(net).strip()]
+    if len(selected) != 1 or len(routes) != 1:
+        return None
+    route = routes[0]
+    net_name = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+    if net_name and net_name != selected[0]:
+        return None
+    if len(_route_endpoint_points(route)) < 2:
+        return None
+    return route
+
+
+def _endpoint_guard_messages(
+    patch_text: str,
+    *,
+    selected_nets: list[str],
+    local_context: Any,
+    tolerance: float = 0.05,
+) -> list[str]:
+    route = _single_missing_route_for_endpoint_guard(selected_nets=selected_nets, local_context=local_context)
+    if not route:
+        return []
+    expected_points = _route_endpoint_points(route)
+    patch_points: list[tuple[float, float]] = []
+    for block in _extract_balanced_sexpr_blocks(patch_text, "segment"):
+        patch_points.extend(_patch_block_points(block))
+    if not patch_points:
+        return ["模型 patch 未输出 segment 端点，无法确认是否连接前端 missing_routes 起终点。"]
+
+    messages: list[str] = []
+    tolerance_sq = tolerance * tolerance
+    for label, expected in zip(("start", "end"), expected_points[:2]):
+        if not any(_squared_distance(point, expected) <= tolerance_sq for point in patch_points):
+            nearest = min(patch_points, key=lambda point: _squared_distance(point, expected))
+            messages.append(
+                f"模型 patch 未命中前端 {label} 端点 {_format_coord_pair(expected)}，"
+                f"最近模型端点为 {_format_coord_pair(nearest)}。"
+            )
+    return messages
+
+
+def _correct_single_missing_route_segment_endpoints(
+    patch_text: str,
+    *,
+    selected_nets: list[str],
+    local_context: Any,
+) -> tuple[str, list[str]]:
+    route = _single_missing_route_for_endpoint_guard(selected_nets=selected_nets, local_context=local_context)
+    if not route:
+        return patch_text, []
+    points = _route_endpoint_points(route)
+    if len(points) < 2:
+        return patch_text, []
+    segments = _extract_balanced_sexpr_blocks(patch_text, "segment")
+    if not segments:
+        return patch_text, []
+    start, end = points[0], points[1]
+    original = segments[0]
+
+    def _replace_point(block: str, key: str, point: tuple[float, float]) -> str:
+        return re.sub(
+            rf"\(\s*{key}\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s*\)",
+            f"({key} {point[0]:.6f} {point[1]:.6f})",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    corrected = _replace_point(original, "start", start)
+    corrected = _replace_point(corrected, "end", end)
+    if corrected == original:
+        return patch_text, []
+    fixed_text = patch_text.replace(original, corrected, 1)
+    return fixed_text, [
+        "已将模型 patch 的首段端点硬修正为前端 missing_routes："
+        f"start {_format_coord_pair(start)}，end {_format_coord_pair(end)}。"
+    ]
+
+
+def _bind_reroute_patch_nets(
+    patch_text: str,
+    *,
+    board_text: str,
+    selected_nets: list[str],
+    local_context: Any,
+) -> tuple[str, list[str], list[str]]:
+    patch_text = str(patch_text or "").strip()
+    if not patch_text:
+        return "", [], ["模型未生成可回填的重布 patch。"]
+
+    net_name_to_id = _parse_kicad_net_name_to_id(board_text)
+    if not net_name_to_id:
+        return patch_text, [], []
+    selected = [str(net).strip() for net in selected_nets if str(net).strip()]
+    selected_net_ids = {net_name_to_id[net] for net in selected if net in net_name_to_id}
+    missing_names = [net for net in selected if net not in net_name_to_id]
+    if missing_names:
+        return patch_text, [], [f"当前板图中找不到 selected net 的 KiCad net id：{', '.join(missing_names)}"]
+    if not selected_net_ids:
+        return patch_text, [], []
+
+    blocks = []
+    for head in ("segment", "via"):
+        blocks.extend(_extract_balanced_sexpr_blocks(patch_text, head))
+    if not blocks:
+        return patch_text, [], ["模型输出中未找到合法的 `(segment ...)` 或 `(via ...)` 走线对象。"]
+
+    warnings: list[str] = []
+    route_candidates: list[tuple[str, list[tuple[float, float]]]] = []
+    for route in _frontend_missing_routes_from_context(local_context):
+        net_name = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+        net_id = net_name_to_id.get(net_name)
+        points = _route_endpoint_points(route)
+        if net_id and points:
+            route_candidates.append((net_id, points))
+
+    replacements: dict[str, str] = {}
+    if len(selected_net_ids) == 1:
+        target_id = next(iter(selected_net_ids))
+        for block in blocks:
+            fixed = _replace_patch_block_net_id(block, target_id)
+            if fixed != block:
+                warnings.append(f"已将模型 patch 的 net id 绑定为 selected net id {target_id}。")
+            replacements[block] = fixed
+    else:
+        for block in blocks:
+            block_points = _patch_block_points(block)
+            target_id = ""
+            best_distance = float("inf")
+            for candidate_id, candidate_points in route_candidates:
+                for block_point in block_points:
+                    for route_point in candidate_points:
+                        distance = _squared_distance(block_point, route_point)
+                        if distance < best_distance:
+                            best_distance = distance
+                            target_id = candidate_id
+            if target_id:
+                fixed = _replace_patch_block_net_id(block, target_id)
+                if fixed != block:
+                    warnings.append(f"已按 missing_routes 端点将模型 patch 绑定到 net id {target_id}。")
+                replacements[block] = fixed
+            else:
+                replacements[block] = block
+
+    fixed_text = patch_text
+    for old, new in replacements.items():
+        fixed_text = fixed_text.replace(old, new, 1)
+
+    invalid_ids = []
+    for match in re.finditer(r"\(\s*net\s+(\d+)\s*\)", fixed_text, re.IGNORECASE):
+        net_id = match.group(1).strip()
+        if net_id not in selected_net_ids:
+            invalid_ids.append(net_id)
+    if invalid_ids:
+        return fixed_text, warnings, [
+            "模型 patch 含有不属于 selectedNets 的 net id："
+            f"{', '.join(sorted(set(invalid_ids)))}；允许的 net id：{', '.join(sorted(selected_net_ids))}"
+        ]
+    return fixed_text, warnings, []
+
+
+def _drc_issue_text(issue: Any) -> str:
+    if isinstance(issue, dict):
+        return " ".join(
+            str(issue.get(key) or "")
+            for key in ("rule", "message", "description", "net", "obj1", "obj2")
+        )
+    return str(issue or "")
+
+
+def _drc_issue_is_selected_net_related(issue: Any, selected_nets: list[str]) -> bool:
+    text = _drc_issue_text(issue)
+    lowered = text.lower()
+    for net in selected_nets:
+        clean = str(net or "").strip()
+        if clean and clean.lower() in lowered:
+            return True
+    return False
+
+
+def _local_reroute_drc_passes(attempt: Any, *, selected_nets: list[str]) -> tuple[bool, str, dict[str, Any]]:
+    drc_result = getattr(attempt, "drc_result", {}) or {}
+    if bool(drc_result.get("ok")) and bool(drc_result.get("pass")):
+        return True, "global DRC passed", {"mode": "global_pass"}
+    issues = (drc_result.get("artifacts") or {}).get("issues") if isinstance(drc_result, dict) else []
+    issues = issues if isinstance(issues, list) else []
+    selected = [str(net).strip() for net in selected_nets if str(net).strip()]
+    blocking: list[Any] = []
+    inherited: list[Any] = []
+    for issue in issues:
+        rule = str(issue.get("rule") if isinstance(issue, dict) else "").strip().upper()
+        related = _drc_issue_is_selected_net_related(issue, selected)
+        if rule == "HR_DRC_SEGMENT_CROSSING":
+            blocking.append(issue)
+        elif related:
+            blocking.append(issue)
+        else:
+            inherited.append(issue)
+    if blocking:
+        compact = [
+            {
+                "rule": item.get("rule"),
+                "message": item.get("message") or item.get("description"),
+                "severity": item.get("severity"),
+            }
+            if isinstance(item, dict)
+            else str(item)
+            for item in blocking[:5]
+        ]
+        return (
+            False,
+            f"selected net local DRC failed: {json.dumps(compact, ensure_ascii=False)}",
+            {
+                "mode": "selected_net_local",
+                "blockingIssueCount": len(blocking),
+                "inheritedIssueCount": len(inherited),
+                "blockingIssues": compact,
+            },
+        )
+    if issues:
+        return (
+            True,
+            f"local DRC passed; ignored {len(inherited)} inherited global issue(s) outside selected nets",
+            {
+                "mode": "selected_net_local",
+                "blockingIssueCount": 0,
+                "inheritedIssueCount": len(inherited),
+            },
+        )
+    return False, getattr(attempt, "failure_summary", "") or "DRC failed without issues.", {"mode": "selected_net_local"}
 
 
 def _append_reroute_check(
@@ -2952,6 +3947,10 @@ def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any
     if validation.passed:
         reroute_result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
         result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
+        if attempts:
+            local_policy = (attempts[-1].get("drcResult") or {}).get("localReroutePolicy") or {}
+            if local_policy:
+                reroute_result["localReroutePolicy"] = local_policy
     else:
         reroute_result["routedBoardDataFilePath"] = original_board_path
         result["routedBoardDataFilePath"] = original_board_path
@@ -2966,7 +3965,11 @@ def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any
         {
             "name": "drc_validation",
             "passed": validation.passed,
-            "detail": "DRC passed" if validation.passed else validation.last_failure_summary,
+            "detail": (
+                json.dumps(reroute_result.get("localReroutePolicy") or {}, ensure_ascii=False)
+                if validation.passed and reroute_result.get("localReroutePolicy")
+                else ("DRC passed" if validation.passed else validation.last_failure_summary)
+            ),
         }
     )
     check_report["checks"] = checks
@@ -2988,7 +3991,10 @@ def _run_reroute_drc_iterations(
     output_dir: str,
     sample_id: str,
     max_iterations: int,
+    selected_nets: list[str],
+    local_context: Any,
     regenerate,
+    status_callback=None,
 ) -> Dict[str, Any]:
     from tools.pcb_reroute_drc import RerouteDrcValidation, validate_kicad_patch_with_drc
 
@@ -2998,8 +4004,47 @@ def _run_reroute_drc_iterations(
     payload = base_payload
     for iteration in range(1, max_iterations + 1):
         if iteration > 1:
+            if status_callback:
+                status_callback(f"DRC 第 {iteration - 1} 轮未通过，正在根据错误反馈重新生成拆线重布结果...")
             payload = regenerate(feedback, iteration_history)
         patch_text = _model_patch_text(payload)
+        patch_text, binding_warnings, binding_errors = _bind_reroute_patch_nets(
+            patch_text,
+            board_text=original_board_data,
+            selected_nets=selected_nets,
+            local_context=local_context,
+        )
+        endpoint_messages = _endpoint_guard_messages(
+            patch_text,
+            selected_nets=selected_nets,
+            local_context=local_context,
+        )
+        endpoint_corrected = False
+        if endpoint_messages:
+            corrected_patch_text, endpoint_corrections = _correct_single_missing_route_segment_endpoints(
+                patch_text,
+                selected_nets=selected_nets,
+                local_context=local_context,
+            )
+            if endpoint_corrections and corrected_patch_text != patch_text:
+                patch_text = corrected_patch_text
+                endpoint_corrected = True
+                binding_warnings.extend(endpoint_corrections)
+        if binding_warnings:
+            reroute_result = dict(payload.get("rerouteResult") or {})
+            existing_warnings = list(reroute_result.get("patchBindingWarnings") or [])
+            reroute_result["patchBindingWarnings"] = existing_warnings + binding_warnings
+            payload["rerouteResult"] = reroute_result
+        if binding_errors:
+            return _append_reroute_check(
+                payload,
+                name="patch_net_binding",
+                passed=False,
+                detail="；".join(binding_errors),
+            )
+        payload["kicadPatch"] = patch_text
+        if status_callback:
+            status_callback(f"正在进行拆线重布 DRC 校验（第 {iteration}/{max_iterations} 轮）...")
         attempt = validate_kicad_patch_with_drc(
             original_board_data=original_board_data,
             model_output_text=patch_text,
@@ -3007,8 +4052,19 @@ def _run_reroute_drc_iterations(
             sample_id=sample_id,
             iteration=iteration,
         )
+        local_passed, local_summary, local_detail = _local_reroute_drc_passes(
+            attempt,
+            selected_nets=selected_nets,
+        )
+        if isinstance(attempt.drc_result, dict):
+            attempt.drc_result["localReroutePolicy"] = local_detail
+        if local_passed and not attempt.passed:
+            attempt.passed = True
+            attempt.failure_summary = local_summary
         attempts.append(attempt)
         if attempt.passed:
+            if status_callback:
+                status_callback(f"拆线重布 DRC 第 {iteration} 轮通过，正在生成可导入结果...")
             validation = RerouteDrcValidation(
                 passed=True,
                 routed_board_data_file_path=attempt.filled_board_data_file_path,
@@ -3016,7 +4072,15 @@ def _run_reroute_drc_iterations(
                 attempts=attempts,
             )
             return _apply_drc_validation_to_payload(payload, validation=validation, original_board_path=original_board_path)
-        feedback.append(attempt.failure_summary)
+        feedback_parts = []
+        if endpoint_messages:
+            feedback_parts.append(
+                "上一轮模型端点硬校验未通过："
+                + "；".join(endpoint_messages)
+                + ("；agent 已先修正端点并跑 DRC，但修正后仍未通过。" if endpoint_corrected else "；agent 无法自动修正该 patch。")
+            )
+        feedback_parts.append(_drc_feedback_for_prompt(attempt))
+        feedback.append("\n".join(part for part in feedback_parts if part))
         iteration_history.append(
             {
                 "iteration": iteration,
@@ -3026,6 +4090,9 @@ def _run_reroute_drc_iterations(
                 "fillDetail": attempt.fill_detail,
                 "drcResult": attempt.drc_result,
                 "failureSummary": attempt.failure_summary,
+                "localReroutePolicy": local_detail,
+                "endpointGuard": endpoint_messages,
+                "endpointCorrected": endpoint_corrected,
             }
         )
 
@@ -3058,6 +4125,7 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         )
 
     cached = _transport.get_cached_reroute_context(session_id=session_id) or {}
+    _transport.send_status("已收到拆线重布参数，正在准备局部重布上下文...", session_id=session_id)
     nets = (
         user_data_obj.get("selectedNets")
         or user_data_obj.get("nets")
@@ -3144,15 +4212,30 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         original_board_data = dropped_board_data
         original_board_path = str(dropped_board_path or original_board_path or "")
 
+    normalized_local_context, coordinate_stats = _normalize_reroute_local_context_coordinates(
+        local_context,
+        board_text=original_board_data or dropped_board_data,
+        nets=nets,
+        dropped_objects=dropped_objects,
+    )
+    if isinstance(normalized_local_context, dict):
+        local_context = normalized_local_context
+
     check_report = {
         "passed": bool(dropped_board_data),
         "checks": [
             {"name": "selection", "passed": bool(nets or selected_trace_ids), "detail": f"selectedNets={len(nets)}, selectedTraceIds={len(selected_trace_ids)}"},
             {"name": "dropped_board_data", "passed": bool(dropped_board_data), "detail": "已获得拆线后版图数据" if dropped_board_data else "未获得拆线后版图数据，按上下文请求生成"},
             {"name": "connectivity_scope", "passed": True, "detail": "仅对所选走线或 selectedNets 生成局部重布请求，不触碰其他网络"},
+            {
+                "name": "coordinate_normalization",
+                "passed": bool(coordinate_stats.get("normalized") or not _frontend_missing_routes_from_context(local_context)),
+                "detail": json.dumps(_strip_internal_reroute_paths(coordinate_stats), ensure_ascii=False)[:1200],
+            },
         ],
     }
 
+    _transport.send_status("正在调用拆线重布模型生成候选走线...", session_id=session_id)
     payload = _generate_reroute_with_model(
         nets=nets,
         selected_trace_ids=selected_trace_ids,
@@ -3218,9 +4301,13 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
             output_dir=output_dir,
             sample_id=f"{session_id or 'reroute'}_{'_'.join(nets or selected_trace_ids)}",
             max_iterations=max_drc_iterations,
+            selected_nets=nets,
+            local_context=local_context,
             regenerate=_regenerate,
+            status_callback=lambda message: _transport.send_status(message, session_id=session_id),
         )
     public_txt_path = ""
+    import_lines_path = ""
     routed_internal_path = ""
     try:
         routed_internal_path = str(payload.get("routedBoardDataFilePath") or "")
@@ -3236,12 +4323,19 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
                 session_id=session_id or "session",
             )
             conversion_notes.extend(notes)
-            if not public_txt_path:
+            import_lines_path, import_notes = _write_reroute_incremental_import_file(
+                patch_text=_model_patch_text(payload),
+                board_text=original_board_data,
+                output_dir=output_dir,
+                session_id=session_id or "session",
+            )
+            conversion_notes.extend(import_notes)
+            if not import_lines_path:
                 payload = _append_reroute_check(
                     payload,
                     name="txt_output_conversion",
                     passed=False,
-                    detail="DRC 已通过，但未生成可导入 txt，因此不会调用 importLines。",
+                    detail="DRC 已通过，但未生成轻量增量导入文件，因此不会调用 importLines。",
                 )
     except Exception as exc:
         logger.warning("Failed converting reroute result to public txt: %s", exc)
@@ -3255,10 +4349,10 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
     payload = _append_explainability_report(
         payload,
         internal_board_path=explain_board_path,
-        public_txt_path=public_txt_path,
+        public_txt_path=import_lines_path,
     )
-    public_payload = _public_reroute_payload(payload, public_txt_path)
-    pending_fields = _pending_reroute_fields_for_frontend(public_payload, public_txt_path)
+    public_payload = _public_reroute_payload(payload, public_txt_path, import_lines_path)
+    pending_fields = _pending_reroute_fields_for_frontend(public_payload, public_txt_path, import_lines_path)
     if pending_fields:
         _transport.set_pending_pcb_fields(pending_fields, session_id=session_id)
     return json.dumps(public_payload, ensure_ascii=False)

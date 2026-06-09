@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import json
 import types
 
@@ -171,6 +172,10 @@ def test_resolve_model_runtime_config_falls_back_to_model_doc(monkeypatch, tmp_p
 
 def test_ctyun_adapter_disables_thinking_and_strips_think_blocks(monkeypatch):
     captured = {}
+    parser = configparser.ConfigParser()
+    parser.add_section("network")
+    parser.set("network", "proxy_mode", "proxy")
+    monkeypatch.setattr(pcb_model_runtime, "_load_project_config_ini", lambda project_config_paths=None: parser)
 
     class _FakeResponse:
         def __enter__(self):

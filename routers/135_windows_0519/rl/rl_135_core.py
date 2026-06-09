@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
@@ -206,13 +207,18 @@ def load_board_data(
 
 def run_command(cmd: list[str], cwd: Path, log_path: Path) -> int:
     with log_path.open("w", encoding="utf-8") as handle:
+        run_args = cmd
+        if os.name == "nt":
+            run_args = [cmd[0].replace("/", "\\"), *cmd[1:]]
+            run_args = subprocess.list2cmdline(run_args)
         process = subprocess.run(
-            cmd,
+            run_args,
             cwd=cwd,
             stdout=handle,
             stderr=subprocess.STDOUT,
             text=True,
             check=False,
+            shell=os.name == "nt",
         )
     return process.returncode
 

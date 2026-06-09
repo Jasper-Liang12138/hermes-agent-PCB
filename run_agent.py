@@ -810,6 +810,7 @@ class AIAgent:
         # commentary when the provider later returns it as a completed interim
         # assistant message.
         self._current_streamed_assistant_text = ""
+        self._suppress_shim_stream_text = False
 
         # Optional current-turn user-message override used when the API-facing
         # user message intentionally differs from the persisted transcript
@@ -1692,11 +1693,25 @@ class AIAgent:
             self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
             pass
+        if (self.platform or "").lower() == "websocket" and self._suppress_websocket_lifecycle_status(message):
+            return
         if self.status_callback:
             try:
                 self.status_callback("lifecycle", message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
+
+    @staticmethod
+    def _suppress_websocket_lifecycle_status(message: str) -> bool:
+        text = str(message or "")
+        return bool(
+            re.search(
+                r"Context too large|Compressed \d+|CONTEXT COMPACTION|Empty response|"
+                r"Iteration budget exhausted|Model returned no content|Empty/malformed response",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
@@ -2020,6 +2035,14 @@ class AIAgent:
 
         if not tool_calls:
             stripped = self._strip_think_blocks(content).strip()
+            incomplete_match = re.match(r"(?is)^\s*<tool[\s_-]*call>\s*(\{.*\})\s*$", stripped)
+            if incomplete_match:
+                add_call(incomplete_match.group(1))
+                cleaned = "" if tool_calls else content
+            escaped_incomplete_match = re.match(r"(?is)^\s*<tool[\s_-]*call>\s*(\{.*\})\s*$", stripped.replace('\\"', '"'))
+            if not tool_calls and escaped_incomplete_match:
+                add_call(escaped_incomplete_match.group(1))
+                cleaned = "" if tool_calls else content
             if stripped.startswith("{") and stripped.endswith("}"):
                 add_call(stripped)
                 cleaned = "" if tool_calls else content
@@ -2229,15 +2252,22 @@ class AIAgent:
 
         latest_user = ""
         latest_user_envelope = ""
+        latest_plain_user_index = -1
         tool_responses: list[tuple[str, Any]] = []
+        tool_response_indices: list[tuple[str, int]] = []
         tool_name_by_id: dict[str, str] = {}
         assistant_tool_names: set[str] = set()
-        for msg in messages or []:
+        for msg_index, msg in enumerate(messages or []):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") == "user":
+                if self._shim_absorb_text_tool_response(msg, tool_responses, tool_name_by_id):
+                    if tool_responses:
+                        tool_response_indices.append((tool_responses[-1][0], msg_index))
+                    continue
                 latest_user_envelope = self._shim_msg_text(msg)
                 latest_user = self._shim_actual_user_text(latest_user_envelope)
+                latest_plain_user_index = msg_index
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
                     name, _ = self._shim_tool_call_name_args(tc)
@@ -2250,6 +2280,7 @@ class AIAgent:
                 name = str(msg.get("name") or tool_name_by_id.get(str(msg.get("tool_call_id") or ""), "")).strip()
                 if name:
                     tool_responses.append((name, msg.get("content", "")))
+                    tool_response_indices.append((name, msg_index))
 
         response_names = {name for name, _ in tool_responses}
         has_pcb_context = bool(
@@ -2279,6 +2310,12 @@ class AIAgent:
 
         proposed = [self._shim_tool_call_name_args(tc) for tc in tool_calls or []]
         proposed_names = {name for name, _ in proposed if name}
+        if "reroute" in response_names and (proposed_names & {"deleteTracesForRerouting", "drop_net", "reroute"}):
+            last_reroute_content = None
+            for name, content in tool_responses:
+                if name == "reroute":
+                    last_reroute_content = content
+            return self._shim_reroute_final_content(last_reroute_content)
         forced_global_fanout = bool(
             re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
             or "forced_skill: global_fanout" in latest_user_envelope
@@ -2295,6 +2332,10 @@ class AIAgent:
             return "已进入拆线重布流程，请先框选需要拆线的走线，或说明要拆哪根线。"
         if "route" in proposed_names and not last_fanout:
             return self._shim_wait_for_fanout_choice_content(last_extract_content)
+        if last_extract_content and not last_fanout and (proposed_names & {"getProjectData", "pcb_extract_bga"}):
+            return self._shim_wait_for_fanout_choice_content(last_extract_content)
+        if last_fanout and (proposed_names & {"getProjectData", "pcb_extract_bga", "generateFanoutParams"}):
+            return "已完成逃逸参数配置，请确认"
         if "generateFanoutParams" not in proposed_names:
             return None
         if not bga_required.issubset(valid_names):
@@ -2330,15 +2371,22 @@ class AIAgent:
 
         latest_user = ""
         latest_user_envelope = ""
+        latest_plain_user_index = -1
         tool_name_by_id: dict[str, str] = {}
         tool_responses: list[tuple[str, Any]] = []
+        tool_response_indices: list[tuple[str, int]] = []
         assistant_tool_names: set[str] = set()
-        for msg in messages or []:
+        for msg_index, msg in enumerate(messages or []):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") == "user":
+                if self._shim_absorb_text_tool_response(msg, tool_responses, tool_name_by_id):
+                    if tool_responses:
+                        tool_response_indices.append((tool_responses[-1][0], msg_index))
+                    continue
                 latest_user_envelope = self._shim_msg_text(msg)
                 latest_user = self._shim_actual_user_text(latest_user_envelope)
+                latest_plain_user_index = msg_index
             if msg.get("role") == "assistant":
                 for tc in msg.get("tool_calls") or []:
                     if not isinstance(tc, dict):
@@ -2354,6 +2402,7 @@ class AIAgent:
                 name = str(msg.get("name") or tool_name_by_id.get(str(msg.get("tool_call_id") or ""), "")).strip()
                 if name:
                     tool_responses.append((name, msg.get("content", "")))
+                    tool_response_indices.append((name, msg_index))
 
         response_names = {name for name, _ in tool_responses}
         pcb_agent_loop_context = any(
@@ -2389,16 +2438,25 @@ class AIAgent:
             if self._shim_is_temporary_pcb_chat(latest_user):
                 return None
             last_drop_net_content = None
+            last_drop_net_index = -1
             for name, content in tool_responses:
                 if name in {"deleteTracesForRerouting", "drop_net"}:
                     last_drop_net_content = content
-            if not ({"deleteTracesForRerouting", "drop_net"} & response_names):
+            for name, msg_index in tool_response_indices:
+                if name in {"deleteTracesForRerouting", "drop_net"}:
+                    last_drop_net_index = msg_index
+            if latest_plain_user_index > last_drop_net_index or not ({"deleteTracesForRerouting", "drop_net"} & response_names):
                 return [self._make_shim_tool_call(reroute_delete_tool, {
                     "userText": latest_user,
                     "projectID": self._shim_project_id_from_text(latest_user_envelope),
                 })]
             if "reroute" not in response_names and self._shim_drop_net_succeeded(last_drop_net_content):
-                return [self._make_shim_tool_call("reroute", {})]
+                return [
+                    self._make_shim_tool_call(
+                        "reroute",
+                        {"userData": self._shim_reroute_user_data_from_delete(last_drop_net_content)},
+                    )
+                ]
             return None
 
         bga_flow_seen = (
@@ -2446,6 +2504,129 @@ class AIAgent:
 
         return None
 
+    def _pcb_tool_call_shim_preforced_content(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        valid_names = self.valid_tool_names or {
+            tool.get("function", {}).get("name")
+            for tool in self.tools or []
+            if isinstance(tool, dict)
+        }
+        bga_required = {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}
+        reroute_delete_tool = "deleteTracesForRerouting" if "deleteTracesForRerouting" in valid_names else "drop_net"
+        reroute_required = {reroute_delete_tool, "reroute"}
+        if not (bga_required.issubset(valid_names) or reroute_required.issubset(valid_names)):
+            return None
+
+        latest_user = ""
+        latest_user_envelope = ""
+        latest_plain_user_index = -1
+        tool_name_by_id: dict[str, str] = {}
+        tool_responses: list[tuple[str, Any]] = []
+        tool_response_indices: list[tuple[str, int]] = []
+        assistant_tool_names: set[str] = set()
+        for msg_index, msg in enumerate(messages or []):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "user":
+                if self._shim_absorb_text_tool_response(msg, tool_responses, tool_name_by_id):
+                    if tool_responses:
+                        tool_response_indices.append((tool_responses[-1][0], msg_index))
+                    continue
+                latest_user_envelope = self._shim_msg_text(msg)
+                latest_user = self._shim_actual_user_text(latest_user_envelope)
+                latest_plain_user_index = msg_index
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    name, _ = self._shim_tool_call_name_args(tc)
+                    if name:
+                        assistant_tool_names.add(name)
+                        call_id = str(tc.get("id") or "") if isinstance(tc, dict) else str(getattr(tc, "id", "") or "")
+                        if call_id:
+                            tool_name_by_id[call_id] = name
+            if msg.get("role") == "tool":
+                name = str(msg.get("name") or tool_name_by_id.get(str(msg.get("tool_call_id") or ""), "")).strip()
+                if name:
+                    tool_responses.append((name, msg.get("content", "")))
+                    tool_response_indices.append((name, msg_index))
+                    tool_response_indices.append((name, msg_index))
+                    tool_response_indices.append((name, msg_index))
+                    tool_response_indices.append((name, msg_index))
+                    tool_response_indices.append((name, msg_index))
+
+        response_names = {name for name, _ in tool_responses}
+        has_reroute_history = bool({"deleteTracesForRerouting", "drop_net", "reroute"} & (assistant_tool_names | response_names))
+        has_bga_history = bool({"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"} & (assistant_tool_names | response_names))
+        pcb_agent_loop_context = any(
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and (
+                "route_mode=pcb" in self._shim_msg_text(msg)
+                or "pcb_agent_loop" in self._shim_msg_text(msg)
+                or "PCB 业务流程由 Agent loop" in self._shim_msg_text(msg)
+                or "当前消息来自启云方 WebSocket PCB 客户端" in self._shim_msg_text(msg)
+            )
+            for msg in messages or []
+        )
+
+        if reroute_required.issubset(valid_names) and has_reroute_history and pcb_agent_loop_context:
+            last_drop_net_content = None
+            last_drop_net_index = -1
+            last_reroute_content = None
+            last_reroute_index = -1
+            for name, content in tool_responses:
+                if name in {"deleteTracesForRerouting", "drop_net"}:
+                    last_drop_net_content = content
+                elif name == "reroute":
+                    last_reroute_content = content
+            for name, msg_index in tool_response_indices:
+                if name in {"deleteTracesForRerouting", "drop_net"}:
+                    last_drop_net_index = msg_index
+                elif name == "reroute":
+                    last_reroute_index = msg_index
+            if last_reroute_content is not None and latest_plain_user_index <= last_reroute_index:
+                return self._shim_reroute_final_content(last_reroute_content)
+            if last_drop_net_content is not None and "reroute" not in response_names:
+                if latest_plain_user_index > last_drop_net_index:
+                    return None
+                if not self._shim_drop_net_succeeded(last_drop_net_content):
+                    return self._shim_failed_reroute_delete_content(last_drop_net_content)
+
+        if not bga_required.issubset(valid_names):
+            return None
+        if not (has_bga_history and pcb_agent_loop_context):
+            return None
+
+        last_extract_content = None
+        last_fanout = None
+        fanout_response_count = 0
+        for name, content in tool_responses:
+            if name == "pcb_extract_bga":
+                last_extract_content = content
+            elif name == "generateFanoutParams":
+                fanout_response_count += 1
+                fanout = self._shim_extract_fanout_params(content)
+                if fanout:
+                    last_fanout = fanout
+
+        if fanout_response_count and not last_fanout:
+            return "逃逸参数生成失败，请重新选择走线算法和层分配/逃逸顺序生成模块，例如 `135 + RL` 或 `arc + 北科大`。"
+        if not last_extract_content or last_fanout:
+            return None
+        if self._shim_router_type_from_text(latest_user):
+            return None
+        if self._shim_is_temporary_pcb_chat(latest_user):
+            return None
+        forced_global_fanout = bool(
+            re.search(r"(?:#|＃)\s*(?:逃逸\s*布线|全局\s*fanout)(?=$|[\s,，。；;:：])", latest_user or "", flags=re.IGNORECASE)
+            or "forced_skill: global_fanout" in latest_user_envelope
+        )
+        plain_fanout_request = bool(
+            re.search(r"BGA|fanout|逃逸|扇出|布线", latest_user or "", flags=re.IGNORECASE)
+            and not self._shim_is_reroute_request(latest_user)
+        )
+        if forced_global_fanout or plain_fanout_request:
+            return self._shim_wait_for_fanout_choice_content(last_extract_content)
+        return None
+
     @staticmethod
     def _shim_actual_user_text(text: str) -> str:
         if not text:
@@ -2465,6 +2646,77 @@ class AIAgent:
         return match.group(1).strip() if match else ""
 
     @staticmethod
+    def _shim_tool_response_from_text(text: str) -> Optional[tuple[str, Any, str]]:
+        if not text or not re.search(r"<\s*tool_response\s*>", text, flags=re.IGNORECASE):
+            return None
+        match = re.search(r"<\s*tool_response\s*>\s*(.*?)\s*<\s*/\s*tool_response\s*>", text, flags=re.DOTALL | re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(1).strip())
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        name = str(payload.get("name") or "").strip()
+        content = payload.get("content", "")
+        call_id = str(payload.get("tool_call_id") or "").strip()
+        return name, content, call_id
+
+    def _compact_model_visible_tool_result(self, tool_name: str, function_result: str) -> str:
+        if tool_name == "reroute" and (self.platform or "").lower() == "websocket":
+            try:
+                parsed = json.loads(function_result) if isinstance(function_result, str) else {}
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                reroute_result = parsed.get("rerouteResult") if isinstance(parsed.get("rerouteResult"), dict) else {}
+                check_report = parsed.get("checkReport") if isinstance(parsed.get("checkReport"), dict) else {}
+                return json.dumps(
+                    {
+                        "tool": "reroute",
+                        "completed": True,
+                        "drcPassed": reroute_result.get("drcPassed"),
+                        "drcIterations": reroute_result.get("drcIterations"),
+                        "hasReport": bool(parsed.get("report") or parsed.get("content")),
+                        "hasRoutedLayoutTxtFilePath": bool(parsed.get("routedLayoutTxtFilePath")),
+                        "checkPassed": check_report.get("passed"),
+                        "message": "Reroute result fields were sent to the PCB frontend; do not call deleteTracesForRerouting again.",
+                    },
+                    ensure_ascii=False,
+                )
+        if tool_name != "getProjectData":
+            return function_result
+        if (self.platform or "").lower() != "websocket":
+            return function_result
+        return json.dumps(
+            {
+                "cached": True,
+                "tool": "getProjectData",
+                "chars": len(function_result or ""),
+                "message": "PCB project data cached for pcb_extract_bga/generateFanoutParams/route; do not inspect raw board text.",
+            },
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def _shim_absorb_text_tool_response(
+        cls,
+        message: Dict[str, Any],
+        tool_responses: list[tuple[str, Any]],
+        tool_name_by_id: dict[str, str],
+    ) -> bool:
+        tool_response = cls._shim_tool_response_from_text(cls._shim_msg_text(message))
+        if not tool_response:
+            return False
+        name, content, call_id = tool_response
+        if call_id and name:
+            tool_name_by_id[call_id] = name
+        if name:
+            tool_responses.append((name, content))
+        return True
+
+    @staticmethod
     def _shim_is_reroute_request(text: str) -> bool:
         if not text:
             return False
@@ -2479,14 +2731,42 @@ class AIAgent:
         )
 
     @staticmethod
-    def _shim_drop_net_succeeded(content: Any) -> bool:
+    def _shim_parse_reroute_delete_payload(content: Any) -> dict:
         if isinstance(content, dict):
             parsed = content
         else:
             try:
                 parsed = json.loads(str(content or ""))
             except Exception:
-                return False
+                return {}
+        if not isinstance(parsed, dict):
+            return {}
+
+        # WebSocket frontend tool results arrive wrapped as:
+        # {"type":"tool-results","body":{"content":{"result":"{...}"}}}
+        body = parsed.get("body")
+        if isinstance(body, dict):
+            body_content = body.get("content")
+            if isinstance(body_content, dict) and "result" in body_content:
+                return AIAgent._shim_parse_reroute_delete_payload(body_content.get("result"))
+            if "result" in body:
+                return AIAgent._shim_parse_reroute_delete_payload(body.get("result"))
+
+        if "result" in parsed and not (
+            "missingRoutes" in parsed
+            or "missing_routes" in parsed
+            or "selectedNets" in parsed
+            or "selectedTraceIds" in parsed
+            or "error" in parsed
+        ):
+            nested = AIAgent._shim_parse_reroute_delete_payload(parsed.get("result"))
+            if nested:
+                return nested
+        return parsed
+
+    @staticmethod
+    def _shim_drop_net_succeeded(content: Any) -> bool:
+        parsed = AIAgent._shim_parse_reroute_delete_payload(content)
         if not isinstance(parsed, dict) or parsed.get("error"):
             return False
         selected_nets = parsed.get("selectedNets")
@@ -2497,6 +2777,93 @@ class AIAgent:
             or (isinstance(selected_trace_ids, list) and selected_trace_ids)
             or (isinstance(missing_routes, list) and missing_routes)
         )
+
+    @staticmethod
+    def _shim_reroute_user_data_from_delete(content: Any) -> str:
+        parsed = AIAgent._shim_parse_reroute_delete_payload(content)
+        if not isinstance(parsed, dict):
+            return "{}"
+
+        missing_routes = parsed.get("missingRoutes") or parsed.get("missing_routes") or []
+        selected_nets = parsed.get("selectedNets")
+        if not isinstance(selected_nets, list):
+            selected_nets = []
+        if isinstance(missing_routes, list):
+            for route in missing_routes:
+                if not isinstance(route, dict):
+                    continue
+                net = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+                if net and net not in selected_nets:
+                    selected_nets.append(net)
+        else:
+            missing_routes = []
+
+        project_data = str(
+            parsed.get("projectData")
+            or parsed.get("project_data")
+            or parsed.get("projectDataFilePath")
+            or parsed.get("boardDataFilePath")
+            or parsed.get("droppedBoardDataFilePath")
+            or ""
+        ).strip()
+        payload = dict(parsed)
+        payload["selectedNets"] = selected_nets
+        payload["missingRoutes"] = missing_routes
+        payload.setdefault("dropResult", parsed)
+        payload.setdefault("deleteResult", parsed)
+        if project_data:
+            payload.setdefault("droppedBoardDataFilePath", project_data)
+            payload.setdefault("originalBoardDataFilePath", project_data)
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _shim_failed_reroute_delete_content(content: Any) -> str:
+        parsed = AIAgent._shim_parse_reroute_delete_payload(content)
+        error = ""
+        if isinstance(parsed, dict):
+            error = str(parsed.get("message") or "").strip()
+            details = parsed.get("details")
+            if isinstance(details, dict):
+                skipped = details.get("skipped")
+                if isinstance(skipped, list) and skipped:
+                    skipped_parts = []
+                    for item in skipped[:5]:
+                        if not isinstance(item, dict):
+                            continue
+                        net_name = str(item.get("netName") or item.get("net_name") or "").strip()
+                        reason = str(item.get("reason") or "").strip()
+                        if net_name and reason:
+                            skipped_parts.append(f"{net_name}({reason})")
+                        elif net_name:
+                            skipped_parts.append(net_name)
+                    if skipped_parts:
+                        error = f"{error}；跳过网络：{', '.join(skipped_parts)}" if error else f"跳过网络：{', '.join(skipped_parts)}"
+            if not error:
+                error_value = parsed.get("error")
+                if isinstance(error_value, str):
+                    error = error_value.strip()
+        if not error:
+            error = "未检测到可用于拆线重布的框选走线。"
+        return f"拆线重布未能继续：{error}\n请先在前端框选需要重布的走线后再试。"
+
+    @staticmethod
+    def _shim_reroute_final_content(content: Any) -> str:
+        parsed = AIAgent._shim_parse_reroute_delete_payload(content)
+        if not isinstance(parsed, dict):
+            return "拆线重布已结束。"
+        report = str(parsed.get("report") or parsed.get("content") or "").strip()
+        if report:
+            return report
+        check_report = parsed.get("checkReport")
+        if isinstance(check_report, dict):
+            checks = check_report.get("checks")
+            if isinstance(checks, list):
+                for check in reversed(checks):
+                    if isinstance(check, dict) and check.get("passed") is False:
+                        detail = str(check.get("detail") or "").strip()
+                        if detail:
+                            return f"拆线重布未通过校验：{detail}"
+        return "拆线重布已结束，结果已发送给前端。"
 
     @staticmethod
     def _shim_is_temporary_pcb_chat(text: str) -> bool:
@@ -5440,6 +5807,8 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if getattr(self, "_suppress_shim_stream_text", False):
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -7702,6 +8071,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
+            function_result = self._compact_model_visible_tool_result(name, function_result)
             function_result = maybe_persist_tool_result(
                 content=function_result,
                 tool_name=name,
@@ -7716,6 +8086,7 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
+                "name": name,
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
@@ -8024,6 +8395,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
+            function_result = self._compact_model_visible_tool_result(function_name, function_result)
             function_result = maybe_persist_tool_result(
                 content=function_result,
                 tool_name=function_name,
@@ -8039,6 +8411,7 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
+                "name": function_name,
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
@@ -8764,6 +9137,19 @@ class AIAgent:
                     new_tcs.append(tc)
                 am["tool_calls"] = new_tcs
 
+            preforced_pcb_content = self._pcb_tool_call_shim_preforced_content(api_messages)
+            if preforced_pcb_content:
+                assistant_msg = {"role": "assistant", "content": preforced_pcb_content}
+                messages.append(assistant_msg)
+                self._persist_session(messages, conversation_history)
+                self._cleanup_task_resources(effective_task_id)
+                return {
+                    "final_response": preforced_pcb_content,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": True,
+                }
+
             preforced_pcb_tool_calls = self._pcb_tool_call_shim_override(api_messages)
             if preforced_pcb_tool_calls:
                 forced_assistant = SimpleNamespace(
@@ -8889,12 +9275,17 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
-                    if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    else:
-                        response = self._interruptible_api_call(api_kwargs)
+                    previous_suppress_shim_stream_text = getattr(self, "_suppress_shim_stream_text", False)
+                    self._suppress_shim_stream_text = bool(self._tool_call_shim_enabled())
+                    try:
+                        if _use_streaming:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = self._interruptible_api_call(api_kwargs)
+                    finally:
+                        self._suppress_shim_stream_text = previous_suppress_shim_stream_text
                     
                     api_duration = time.time() - api_start_time
                     
@@ -10140,21 +10531,20 @@ class AIAgent:
                         assistant_message.tool_calls = shim_calls
                         assistant_message.content = shim_content or None
                         finish_reason = "tool_calls"
-                if self._tool_call_shim_enabled():
-                    pcb_forced_calls = self._pcb_tool_call_shim_override(api_messages)
-                    if pcb_forced_calls:
-                        assistant_message.tool_calls = pcb_forced_calls
-                        assistant_message.content = None
-                        finish_reason = "tool_calls"
-                    else:
-                        blocked_content = self._pcb_tool_call_shim_block_invalid_model_calls(
-                            api_messages,
-                            getattr(assistant_message, "tool_calls", None),
-                        )
-                        if blocked_content:
-                            assistant_message.tool_calls = None
-                            assistant_message.content = blocked_content
-                            finish_reason = "stop"
+                pcb_forced_calls = self._pcb_tool_call_shim_override(api_messages)
+                if pcb_forced_calls:
+                    assistant_message.tool_calls = pcb_forced_calls
+                    assistant_message.content = None
+                    finish_reason = "tool_calls"
+                else:
+                    blocked_content = self._pcb_tool_call_shim_block_invalid_model_calls(
+                        api_messages,
+                        getattr(assistant_message, "tool_calls", None),
+                    )
+                    if blocked_content:
+                        assistant_message.tool_calls = None
+                        assistant_message.content = blocked_content
+                        finish_reason = "stop"
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -10693,10 +11083,11 @@ class AIAgent:
                                 "retry %d/3 (model=%s)",
                                 self._empty_content_retries, self.model,
                             )
-                            self._emit_status(
-                                f"⚠️ Empty response from model — retrying "
-                                f"({self._empty_content_retries}/3)"
-                            )
+                            if (self.platform or "").lower() != "websocket":
+                                self._emit_status(
+                                    f"⚠️ Empty response from model — retrying "
+                                    f"({self._empty_content_retries}/3)"
+                                )
                             continue
 
                         # ── Exhausted retries — try fallback provider ──

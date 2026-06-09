@@ -15,7 +15,7 @@ metadata:
 
 ## Goal
 
-Use this skill when the user asks to rip up selected BGA escape traces and reroute them locally. The user should box-select the traces in the PCB frontend first; the frontend deletion tool returns the missing-route endpoints and post-delete board data needed by `reroute`.
+Use this skill when the user asks to rip up selected PCB traces and reroute them locally. The user should box-select the traces in the PCB frontend first; the frontend deletion tool returns the missing-route endpoints and post-delete board data needed by `reroute`.
 
 This skill is separate from `hardware/pcb-intelligence`:
 - BGA fanout / full escape routing uses `route` with `routerType` equal to `arc` or `135`.
@@ -38,7 +38,7 @@ Do not call tools for conceptual questions, explanations, router selection for B
 
 | Tool | Purpose |
 |------|---------|
-| `deleteTracesForRerouting` | Calls the PCB frontend one-shot synchronous tool. The frontend asks/uses the user's box selection, deletes selected BGA escape traces and vias, exports board data, and returns `missing_routes` plus `projectData`. |
+| `deleteTracesForRerouting` | Calls the PCB frontend one-shot synchronous tool. The frontend asks/uses the user's box selection, deletes selected traces and vias, exports board data, and returns `missing_routes` plus `projectData`. |
 | `reroute` | Reads the cached missing routes and post-delete board data, generates local reroute output, check report, and public txt result file for EDA import. |
 | `drop_net` | Compatibility alias only. Do not use it for the normal flow. |
 

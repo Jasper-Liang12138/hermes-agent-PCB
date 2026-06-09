@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -366,7 +368,7 @@ def test_websocket_reroute_interrupts_pending_fanout_confirmation():
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_reroute_selected"
     assert decision.reason == "pcb_reroute_selected"
-    assert adapter._session_flow_states[session_id] == "idle"
+    assert adapter._session_flow_states[session_id] == "reroute"
     assert session_id not in adapter._session_fanout_params
 
 
@@ -385,7 +387,7 @@ def test_websocket_cancel_and_reroute_phrase_switches_task():
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_reroute_selected"
     assert decision.reason == "pcb_reroute_selected"
-    assert adapter._session_flow_states[session_id] == "idle"
+    assert adapter._session_flow_states[session_id] == "reroute"
     assert session_id not in adapter._session_fanout_params
 
 
@@ -404,7 +406,7 @@ def test_websocket_natural_language_task_switch_resets_fanout_flow():
     assert decision.mode == "pcb"
     assert decision.intent == "pcb_reroute_selected"
     assert decision.reason == "pcb_reroute_selected"
-    assert adapter._session_flow_states[session_id] == "idle"
+    assert adapter._session_flow_states[session_id] == "reroute"
     assert session_id not in adapter._session_fanout_params
 
 
@@ -443,6 +445,45 @@ def test_websocket_temporary_chat_preserves_wait_confirm_flow_state():
     assert chat_decision.reason == "temporary_chat"
     assert adapter._session_flow_states[session_id] == "wait_confirm"
     assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U22"
+
+
+def test_websocket_confirm_uses_cached_fanout_params_even_if_waiting_router_type():
+    adapter = _make_adapter()
+    session_id = "sess-confirm-cached-fanout"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_router_type")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "135",
+        "orderLines": [{"net": "N1", "layer": "Top", "order": 1}],
+    }
+
+    decision = adapter._decide_route(session_id, "确认")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "confirm_route"
+    assert decision.immediate_reply is None
+    assert adapter._session_flow_states[session_id] == "routing"
+
+
+def test_websocket_body_fanout_params_are_cached_before_confirm():
+    adapter = _make_adapter()
+    session_id = "sess-body-fanout-cache"
+
+    adapter._remember_fanout_params_from_frontend(
+        session_id,
+        {
+            "selectedBGA": "U22",
+            "routerType": "rl",
+            "orderLines": [{"net": "N1", "layer": "Art03", "order": 1}],
+        },
+    )
+    decision = adapter._decide_route(session_id, "确认")
+
+    assert decision.reason == "confirm_route"
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U22"
+    assert adapter._session_router_types[session_id] == "rl"
+    assert adapter._session_flow_states[session_id] == "routing"
 
 
 def test_websocket_cancel_requires_explicit_flow_cancel_phrase():
@@ -529,6 +570,8 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
     session_id = "sess-reroute-fields"
     project_id = "proj-reroute-001"
     observed_auto_skill: list[str | None] = []
+    import_file = Path(tempfile.gettempdir()) / "hermes_test_reroute_import_fields.txt"
+    import_file.write_text("(wires\n)\n", encoding="utf-8")
 
     reroute_fields = {
         "rerouteResult": {
@@ -537,9 +580,11 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
             "operations": [{"action": "reroute_net", "net": "net13"}],
             "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
             "routedLayoutTxtFilePath": r"F:\public\routed.txt",
+            "importLinesFilePath": str(import_file),
         },
         "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
         "routedLayoutTxtFilePath": r"F:\public\routed.txt",
+        "importLinesFilePath": str(import_file),
         "checkReport": {"passed": True, "checks": []},
         "explanation": "局部重布结果已生成",
         "report": "局部拆线重布已完成，DRC 通过，已生成可导入 txt。",
@@ -579,7 +624,7 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
                 assert msg["type"] == "tool-calls"
                 assert msg["body"]["content"]["name"] == "importLines"
                 assert msg["body"]["content"]["arguments"] == {
-                    "filePath": r"F:\public\routed.txt",
+                    "filePath": str(import_file),
                     "successPins": [],
                     "failedPins": [],
                 }
@@ -597,21 +642,20 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
                     "selectedNets": ["net13", "net17"],
                     "operations": [{"action": "reroute_net", "net": "net13"}],
                     "routedLayoutTxtFilePath": r"F:\public\routed.txt",
+                    "importLinesFilePath": str(import_file),
                 }
                 assert msg["body"]["routedLayoutTxtFilePath"] == r"F:\public\routed.txt"
+                assert msg["body"]["importLinesFilePath"] == str(import_file)
                 assert "routedBoardDataFilePath" not in msg["body"]
                 assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
                 assert "导入完成" in msg["body"]["explanation"]
-                content_payload = json.loads(msg["body"]["content"])
-                assert content_payload["report"] == reroute_fields["report"]
-                assert content_payload["rerouteResult"]["type"] == "local_reroute"
-                assert content_payload["checkReport"] == reroute_fields["checkReport"]
-                assert "导入完成" in content_payload["explanation"]
+                assert msg["body"]["content"] == reroute_fields["report"]
+                assert not msg["body"]["content"].lstrip().startswith("{")
                 assert ".kicad_pcb" not in json.dumps(msg["body"], ensure_ascii=False)
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == [["hardware/pcb-reroute", "hardware/pcb-intelligence"]]
+    assert observed_auto_skill == [["hardware/pcb-reroute"]]
 
 
 def test_websocket_reroute_fields_round_trip():
@@ -658,6 +702,72 @@ async def _run_websocket_failed_reroute_does_not_import() -> None:
 
 def test_websocket_failed_reroute_does_not_import():
     asyncio.get_event_loop().run_until_complete(_run_websocket_failed_reroute_does_not_import())
+
+
+async def _run_websocket_reroute_flow_drops_fanout_fields() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-drop-fanout-fields"
+    adapter._connections[session_id] = (ws, "proj-reroute-drop-fanout")
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content=(
+            "已选择目标 BGA：U22。\n\n请选择走线算法类型。\n\n"
+            "##PCB_FIELDS##\n"
+            + json.dumps(
+                {
+                    "selection": [{"label": "U22", "detail": "BGA"}],
+                    "fanoutParams": {"selectedBGA": "U22", "routerType": "135"},
+                    "routingResult": r"F:\router_work\line.out",
+                },
+                ensure_ascii=False,
+            )
+            + "\n##PCB_FIELDS_END##"
+        ),
+        metadata={"stream_is_final": True},
+    )
+
+    assert result.success is True
+    assert len(ws.sent) == 1
+    body = ws.sent[0]["body"]
+    assert "selection" not in body
+    assert "fanoutParams" not in body
+    assert "routingResult" not in body
+    assert "拆线重布流程" in body["content"]
+
+
+def test_websocket_reroute_flow_drops_fanout_fields():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_flow_drops_fanout_fields())
+
+
+async def _run_websocket_reroute_failure_emits_error_message() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-error-protocol"
+    adapter._connections[session_id] = (ws, "proj-reroute-error-protocol")
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content="拆线重布未能继续：未检测到框选走线\n请先在前端框选需要重布的走线后再试。",
+        metadata={"stream_is_final": True},
+    )
+
+    assert result.success is True
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["type"] == "error"
+    assert ws.sent[0]["body"]["role"] == "agent"
+    assert ws.sent[0]["body"]["code"] == 50001
+    assert ws.sent[0]["body"]["message"] == "Tool execution failed"
+    assert ws.sent[0]["body"]["details"] == "未检测到框选走线"
+
+
+def test_websocket_reroute_failure_emits_error_message():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_failure_emits_error_message())
 
 
 async def _run_websocket_reroute_txt_with_failed_drc_skips_import() -> None:
@@ -734,7 +844,7 @@ async def _run_websocket_reroute_reaches_agent_loop() -> None:
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == [["hardware/pcb-reroute", "hardware/pcb-intelligence"]]
+    assert observed_auto_skill == [["hardware/pcb-reroute"]]
 
 
 def test_websocket_reroute_reaches_agent_loop():
@@ -947,6 +1057,157 @@ def test_router_type_followup_recovers_when_flow_state_was_lost():
     assert adapter._session_flow_states[session_id] == "wait_router_type"
 
 
+@pytest.mark.asyncio
+async def test_handle_user_message_router_choice_runs_direct_fanout_step(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-router-choice-direct"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_router_type")
+    adapter._session_selection_labels[session_id] = ("U22",)
+    adapter._session_selected_targets[session_id] = "U22"
+    seen = {}
+
+    async def fake_direct_fanout(sid, text):
+        seen["session_id"] = sid
+        seen["text"] = text
+        return True
+
+    async def handler(event):
+        raise AssertionError("router choice should not be sent back to the model handler")
+
+    monkeypatch.setattr(adapter, "_run_direct_fanout_param_step", fake_direct_fanout)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {"role": "user", "content": "135 + RL"},
+        },
+        session_id,
+        "proj-router-choice-direct",
+    )
+
+    assert seen == {"session_id": session_id, "text": "135 + RL"}
+
+
+@pytest.mark.asyncio
+async def test_frontend_confirmed_fanout_params_runs_cached_route(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-frontend-confirmed-fanout"
+    seen = {}
+
+    async def fake_route(sid):
+        seen["session_id"] = sid
+        return True
+
+    async def handler(event):
+        raise AssertionError("frontend-confirmed fanoutParams should not be sent to model handler")
+
+    monkeypatch.setattr(adapter, "_run_cached_fanout_route", fake_route)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "配置已确认，逃逸布线参数已提交。",
+                "fanoutParams": {
+                    "selectedBGA": "U22",
+                    "routerType": "rl",
+                    "orderLines": [{"net": "NET_A", "layer": "Top", "order": 1}],
+                },
+            },
+        },
+        session_id,
+        "proj-frontend-confirmed-fanout",
+    )
+
+    assert seen == {"session_id": session_id}
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U22"
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+
+
+@pytest.mark.asyncio
+async def test_frontend_confirmed_cached_fanout_without_body_params_runs_route(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-frontend-confirmed-cached-fanout"
+    seen = {}
+
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U22",
+        "routerType": "rl",
+        "orderLines": [{"net": "NET_A", "layer": "Top", "order": 1}],
+    }
+
+    async def fake_route(sid):
+        seen["session_id"] = sid
+        return True
+
+    async def handler(event):
+        raise AssertionError("frontend-confirmed cached fanout should not be sent to model handler")
+
+    monkeypatch.setattr(adapter, "_run_cached_fanout_route", fake_route)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "配置已确认，逃逸布线参数已提交。",
+            },
+        },
+        session_id,
+        "proj-frontend-confirmed-cached-fanout",
+    )
+
+    assert seen == {"session_id": session_id}
+
+
+@pytest.mark.asyncio
+async def test_frontend_confirmed_fanout_params_json_content_runs_cached_route(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-frontend-confirmed-fanout-json-content"
+    fanout_params = {
+        "selectedBGA": "U5",
+        "routerType": "rl",
+        "orderLines": [{"net": "NET_A", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 3.0, "LineSpacing": 4.0},
+    }
+    seen = {}
+
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+
+    async def fake_route(sid):
+        seen["session_id"] = sid
+        return True
+
+    async def handler(event):
+        raise AssertionError("fanoutParams JSON content should not be sent to model handler")
+
+    monkeypatch.setattr(adapter, "_run_cached_fanout_route", fake_route)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": json.dumps(fanout_params, ensure_ascii=False),
+            },
+        },
+        session_id,
+        "proj-frontend-confirmed-fanout-json-content",
+    )
+
+    assert seen == {"session_id": session_id}
+    assert adapter._session_fanout_params[session_id] == fanout_params
+
+
 def test_fanout_params_visible_content_is_normalized():
     content = (
         "已生成扇出参数，请确认：\n"
@@ -1109,7 +1370,7 @@ def test_routing_result_report_visible_fallback():
     assert "通孔数量：126" in content
 
 
-def test_reroute_report_visible_fallback_serializes_frontend_content():
+def test_reroute_report_visible_fallback_keeps_content_human_readable():
     content = WebSocketAdapter._fallback_visible_content_for_fields(
         "局部拆线重布已完成。",
         {
@@ -1120,11 +1381,8 @@ def test_reroute_report_visible_fallback_serializes_frontend_content():
         },
     )
 
-    payload = json.loads(content)
-    assert payload["report"] == "局部拆线重布已完成，DRC 通过，已生成可导入 txt。"
-    assert payload["rerouteResult"]["type"] == "local_reroute"
-    assert payload["checkReport"]["passed"] is True
-    assert payload["explanation"] == "DRC 通过，已生成 txt。"
+    assert content == "局部拆线重布已完成，DRC 通过，已生成可导入 txt。"
+    assert not content.lstrip().startswith("{")
 
 
 async def _run_plain_send_defaults_to_final() -> None:
@@ -1572,6 +1830,100 @@ async def test_import_fanout_result_calls_import_lines():
 
 
 @pytest.mark.asyncio
+async def test_import_fanout_result_dedupes_same_file(tmp_path):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-import-lines-dedupe"
+    adapter._connections[session_id] = (ws, "proj-import-lines-dedupe")
+    import_file = tmp_path / "line.out"
+    import_file.write_text("line records\n", encoding="utf-8")
+
+    fields = {
+        "routingResult": str(tmp_path / "routing_input.txt"),
+        "importLinesFilePath": str(import_file),
+    }
+    route_params = {"successPins": ["U27.B13"], "failedPins": []}
+
+    first_task = asyncio.create_task(adapter._import_fanout_result(session_id, route_params, fields))
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if any(item.get("type") == "tool-calls" for item in ws.sent):
+            break
+
+    first_call = next(item for item in ws.sent if item["type"] == "tool-calls")
+    adapter._resolve_tool_result(
+        json.loads(_tool_result(first_call["body"]["content"]["id"], "Imported 1 / 1 path units from line.out"))
+    )
+    first_status = await first_task
+
+    second_status = await adapter._import_fanout_result(session_id, route_params, fields)
+
+    import_calls = [item for item in ws.sent if item.get("type") == "tool-calls"]
+    assert len(import_calls) == 1
+    assert second_status == first_status
+
+
+@pytest.mark.asyncio
+async def test_import_reroute_prefers_incremental_import_file(tmp_path):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-import-incremental"
+    adapter._connections[session_id] = (ws, "proj-reroute-import-incremental")
+    layout_file = tmp_path / "routed_layout.txt"
+    layout_file.write_text("(layout routed)\n", encoding="utf-8")
+    import_file = tmp_path / "reroute_import.txt"
+    import_file.write_text("(wires\n)\n", encoding="utf-8")
+
+    fields = {
+        "rerouteResult": {
+            "type": "local_reroute",
+            "drcPassed": True,
+            "routedLayoutTxtFilePath": str(layout_file),
+            "importLinesFilePath": str(import_file),
+        },
+        "routedLayoutTxtFilePath": str(layout_file),
+        "importLinesFilePath": str(import_file),
+        "checkReport": {"passed": True},
+    }
+
+    task = asyncio.create_task(adapter._import_reroute_result(session_id, fields))
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if any(item.get("type") == "tool-calls" for item in ws.sent):
+            break
+
+    sent = next(item for item in ws.sent if item["type"] == "tool-calls")
+    assert sent["body"]["content"]["name"] == "importLines"
+    assert sent["body"]["content"]["arguments"]["filePath"] == str(import_file)
+
+    adapter._resolve_tool_result(
+        json.loads(_tool_result(sent["body"]["content"]["id"], {"success": True, "message": "导入完成"}))
+    )
+    status = await task
+    assert "导入完成" in status
+
+
+@pytest.mark.asyncio
+async def test_import_reroute_skips_full_layout_file(tmp_path):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-import-layout-skip"
+    adapter._connections[session_id] = (ws, "proj-reroute-import-layout-skip")
+    layout_file = tmp_path / "routed_layout.txt"
+    layout_file.write_text("(layout\n  (wires)\n)\n", encoding="utf-8")
+    fields = {
+        "rerouteResult": {"type": "local_reroute", "drcPassed": True},
+        "routedLayoutTxtFilePath": str(layout_file),
+        "checkReport": {"passed": True},
+    }
+
+    status = await adapter._import_reroute_result(session_id, fields)
+
+    assert "不适合 importLines" in status
+    assert not any(item.get("type") == "tool-calls" for item in ws.sent)
+
+
+@pytest.mark.asyncio
 async def test_cached_fanout_route_suppresses_report_when_import_is_rejected(monkeypatch):
     adapter = _make_adapter()
     ws = _FakeWS()
@@ -1615,6 +1967,27 @@ async def test_cached_fanout_route_suppresses_report_when_import_is_rejected(mon
     assert final["body"]["content"] == "已取消导入布线。"
     assert "布线连通率" not in final["body"]["content"]
     assert "##PCB_FIELDS##" not in final["body"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_fanout_fields_suppress_report_when_import_is_rejected():
+    adapter = _make_adapter()
+    session_id = "sess-agent-loop-import-rejected"
+
+    async def fake_import(*args, **kwargs):
+        return "__pcb_import_lines_rejected__"
+
+    adapter._import_fanout_result = fake_import
+    fields = await adapter._prepare_final_pcb_fields_for_frontend(
+        session_id,
+        {
+            "routingResult": r"F:\router_work\line.out",
+            "importLinesFilePath": r"F:\router_work\line.out",
+            "report": "布线连通率: 100%",
+        },
+    )
+
+    assert fields == {"_importRejected": True}
 
 
 def test_rule_validation_rejects_llm_chat_for_strong_pcb_request():
@@ -1793,7 +2166,7 @@ async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monk
     assert seen["options"]["route_mode"] == "pcb"
     assert seen["options"]["pcb_agent_loop"] is True
     assert "forced_skill: global_fanout" in seen["text"]
-    assert "禁止调用 getSelectedElements、drop_net 或 reroute" in seen["text"]
+    assert "禁止调用 deleteTracesForRerouting、getSelectedElements、drop_net 或 reroute" in seen["text"]
     assert content in seen["text"]
     assert "projectid: proj-forced-fanout" in seen["text"]
     assert adapter._session_modes["sess-forced-fanout"] == "pcb"
@@ -1863,25 +2236,72 @@ async def test_forced_reroute_tag_loads_only_reroute_skill(monkeypatch, content)
     assert "projectid: proj-forced-reroute" in seen["text"]
 
 
+def test_get_project_data_relative_file_path_is_resolved_and_cached(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOARD_DATA_USE_FILE_PATH", "1")
+    monkeypatch.chdir(tmp_path)
+    adapter = _make_adapter()
+    session_id = "sess-relative-board-path"
+    call_id = "call_relative_board"
+    board_text = '(component "U22"\n  (part "CG400")\n  (propname "DFA_DEV_CLASS" propvalue "BGA")\n)\n'
+    board_file = tmp_path / "board.txt"
+    board_file.write_text(board_text, encoding="utf-8")
+
+    from tools.pcb_tools import WebSocketTransportSingleton
+
+    transport = WebSocketTransportSingleton.get_instance()
+    transport.clear_session(session_id)
+    adapter._pending_tool_names[call_id] = "getProjectData"
+    adapter._pending_tool_sessions[call_id] = session_id
+
+    result = adapter._maybe_read_file_result(call_id, "board.txt")
+
+    assert result == board_text
+    assert transport.get_cached_project_data_path(session_id) == str(board_file.resolve())
+    transport.clear_session(session_id)
+
+
+def test_pcb_extract_bga_uses_cached_project_data_file_path(tmp_path):
+    session_id = "sess-extract-bga-path"
+    board_file = tmp_path / "board.txt"
+    board_file.write_text(
+        '(component "U22"\n'
+        '  (part "CG400")\n'
+        '  (footprint "BGA400")\n'
+        '  (propname "DFA_DEV_CLASS" propvalue "BGA")\n'
+        ')\n',
+        encoding="utf-8",
+    )
+
+    from tools import pcb_chunking_tool
+    from tools.pcb_tools import WebSocketTransportSingleton
+
+    transport = WebSocketTransportSingleton.get_instance()
+    transport.clear_session(session_id)
+    transport.cache_project_data_path(str(board_file), session_id=session_id)
+
+    result = json.loads(
+        pcb_chunking_tool._extract_bga("__CACHED_PROJECT_DATA__", session_id=session_id)
+    )
+
+    assert result["selection"][0]["label"] == "U22"
+    assert result["source"] == "rule_script"
+    transport.clear_session(session_id)
+
+
 @pytest.mark.asyncio
-async def test_pcb_entry_file_path_mode_is_left_to_agent_loop(monkeypatch, tmp_path):
+async def test_pcb_entry_file_path_mode_bootstraps_from_file_path(monkeypatch, tmp_path):
     monkeypatch.setenv("BOARD_DATA_USE_FILE_PATH", "1")
     port = _free_port()
     adapter = _make_adapter(port)
     board_file = tmp_path / "board.txt"
-    board_file.write_text('(pcb_data (component (name "FPGA1") (package "BGA-1156")))', encoding="utf-8")
+    board_file.write_text(
+        '(component "FPGA1"\n'
+        '(part "BGA-1156")\n'
+        '(propname "DFA_DEV_CLASS" propvalue "BGA")\n'
+        ')\n',
+        encoding="utf-8",
+    )
 
-    async def handler(event):
-        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
-        assert "直接开始逃逸布线，不要解释" in event.text
-        return (
-            "已识别到目标 BGA：FPGA1。\n\n"
-            "##PCB_FIELDS##\n"
-            + json.dumps({"selection": [{"label": "FPGA1", "detail": "BGA-1156"}]}, ensure_ascii=False)
-            + "\n##PCB_FIELDS_END##"
-        )
-
-    adapter.set_message_handler(handler)
     await adapter.connect()
     try:
         uri = f"http://127.0.0.1:{port}"
@@ -1894,6 +2314,11 @@ async def test_pcb_entry_file_path_mode_is_left_to_agent_loop(monkeypatch, tmp_p
                         "直接开始逃逸布线，不要解释",
                     )
                 )
+                msg = await _recv_json(ws)
+                assert msg["type"] == "tool-calls"
+                assert msg["body"]["content"]["name"] == "getProjectData"
+                await ws.send_str(_tool_result(msg["body"]["content"]["id"], str(board_file)))
+
                 msg = await _recv_json(ws)
                 assert msg["type"] == "message"
                 assert msg["body"]["selection"] == [{"label": "FPGA1", "detail": "BGA-1156"}]

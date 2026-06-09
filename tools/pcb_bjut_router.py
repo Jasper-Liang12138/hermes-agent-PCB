@@ -85,7 +85,7 @@ def load_router_config() -> tuple[configparser.ConfigParser, Path | None]:
     last = None
     for path in _config_paths():
         if path.is_file():
-            parser.read(path, encoding="utf-8")
+            parser.read(path, encoding="utf-8-sig")
             last = path
             break
     return parser, last.parent.resolve() if last else None
@@ -104,6 +104,13 @@ def _config_path(parser: configparser.ConfigParser, section: str, key: str, base
         if raw:
             return _expand_path(raw, base_dir=base_dir)
     return None
+
+
+def _router_config_value(key: str) -> tuple[str, Path | None]:
+    parser, config_base_dir = load_router_config()
+    if parser.has_section("router") and parser.has_option("router", key):
+        return parser.get("router", key, fallback="").strip(), config_base_dir
+    return "", config_base_dir
 
 
 def _auto_rl_subdir(rl_root: Path, family: str) -> Path | None:
@@ -432,16 +439,313 @@ def _run_router_main(work_dir: Path, router_dir: Path, router_type: str, layout_
     _require_success(_run_process(_router_binary_args(binary, *args), work_dir), main_stem)
 
 
+def _is_rl_router(router_type: str) -> bool:
+    return normalize_router_type(router_type) in {"rl", "rl_135", "rl_arc"}
+
+
+def _rl_script_name(router_type: str) -> str:
+    return "train_dqn_arc.py" if router_execution_family(router_type) == "arc" else "train_dqn_135.py"
+
+
+def _rl_layout_name(router_type: str) -> str:
+    return "1231_4_arc.txt" if router_execution_family(router_type) == "arc" else "402Pin_08BGA_8L_S_01141700.txt"
+
+
+def _rl_python_executable() -> str:
+    configured, config_base_dir = _router_config_value("rl_python")
+    configured = os.getenv("PCB_RL_PYTHON", "").strip() or configured
+    if configured:
+        return str(_expand_path(configured, base_dir=config_base_dir))
+    if config_base_dir:
+        portable = config_base_dir / "python_runtime" / ("python.exe" if sys.platform == "win32" else "bin/python")
+        if portable.is_file():
+            return str(portable)
+    return "python" if getattr(sys, "frozen", False) else sys.executable
+
+
+def _rl_eval_budget(router_type: str) -> int:
+    configured, _config_base_dir = _router_config_value("rl_eval_budget")
+    raw = os.getenv("PCB_RL_EVAL_BUDGET", "").strip() or configured
+    if not raw:
+        raw = "200" if router_execution_family(router_type) == "arc" else "500"
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 200 if router_execution_family(router_type) == "arc" else 500
+
+
+def _prepare_rl_project_inputs(work_dir: Path, router_dir: Path, router_type: str, layout_path: Path) -> None:
+    shutil.copy2(layout_path, router_dir / _rl_layout_name(router_type))
+    shutil.copy2(work_dir / "order_input.txt", router_dir / "order_input.txt")
+    if router_execution_family(router_type) == "arc" and (work_dir / "constrain.txt").is_file():
+        shutil.copy2(work_dir / "constrain.txt", router_dir / "constrain.txt")
+
+
+def _latest_rl_run_dir(output_root: Path) -> Path | None:
+    if not output_root.is_dir():
+        return None
+    candidates = [
+        path for path in output_root.iterdir()
+        if path.is_dir() and (path / "best_layer_order.txt").is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _run_rl_fanout_search(work_dir: Path, router_dir: Path, router_type: str, layout_path: Path) -> Path:
+    rl_dir = (router_dir / "rl").resolve()
+    script = rl_dir / _rl_script_name(router_type)
+    if not script.is_file():
+        raise FileNotFoundError(f"缺少 RL 层分配/逃逸顺序脚本: {script}")
+
+    _prepare_rl_project_inputs(work_dir, router_dir, router_type, layout_path)
+    output_root = work_dir / "rl_search_runs"
+    tag = f"hermes_{normalize_router_type(router_type)}"
+    args = [
+        _rl_python_executable(),
+        str(script.resolve()),
+        "--eval-budget",
+        str(_rl_eval_budget(router_type)),
+        "--device",
+        os.getenv("PCB_RL_DEVICE", "").strip() or _router_config_value("rl_device")[0] or "cpu",
+        "--initial-order",
+        str(work_dir / "order_input.txt"),
+        "--output-root",
+        str(output_root),
+        "--tag",
+        tag,
+    ]
+    timeout_text = os.getenv("PCB_RL_TIMEOUT_SECONDS", "").strip() or _router_config_value("rl_timeout_seconds")[0] or "1800"
+    try:
+        timeout_seconds = max(60, int(timeout_text))
+    except ValueError:
+        timeout_seconds = 1800
+    proc = _run_process(args, rl_dir, timeout=timeout_seconds)
+    _require_success(proc, script.name)
+
+    run_dir = _latest_rl_run_dir(output_root)
+    if run_dir is None:
+        raise RuntimeError(f"RL 脚本未生成 best_layer_order.txt: output_root={output_root}")
+
+    best_order = run_dir / "best_layer_order.txt"
+    shutil.copy2(best_order, work_dir / "order_input.txt")
+    best_dir = run_dir / "best_full"
+    if not best_dir.is_dir():
+        best_dir = run_dir / "best_partial"
+    for name in ("line.out", "ARC_output.txt", "statistical.out", "data.txt", "summary.json", "explanation.md"):
+        source = (run_dir / name) if (run_dir / name).is_file() else (best_dir / name)
+        if source.is_file():
+            shutil.copy2(source, work_dir / name)
+    return best_order
+
+
 def _read_report(work_dir: Path) -> str:
-    report_path = work_dir / "data.txt"
-    if report_path.is_file():
+    for report_name in ("data.txt", "statistical.out", "statistical.txt", "report.txt", "route_report.txt"):
+        report_path = work_dir / report_name
+        if not report_path.is_file() or report_path.stat().st_size <= 0:
+            continue
         for encoding in ("utf-8", "gbk", "gb18030"):
             try:
-                return report_path.read_text(encoding=encoding).strip()
+                text = report_path.read_text(encoding=encoding).strip()
+                if text:
+                    return _compact_statistical_report(text)
             except UnicodeDecodeError:
                 continue
-        return report_path.read_text(encoding="utf-8", errors="replace").strip()
+        text = report_path.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return _compact_statistical_report(text)
     return "布线完成（无详细报告）"
+
+
+def _read_rl_explanation_report(work_dir: Path, router_dir: Path, router_type: str) -> str:
+    normalized = normalize_router_type(router_type)
+    if normalized not in {"rl", "rl_135", "rl_arc"}:
+        return ""
+
+    roots = [work_dir, router_dir / "rl"]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        direct = root / "explanation.md"
+        if direct.is_file() and direct.stat().st_size > 0:
+            candidates.append(direct)
+        search_root = root / "search_runs"
+        if search_root.is_dir():
+            candidates.extend(
+                path for path in search_root.rglob("explanation.md")
+                if path.is_file() and path.stat().st_size > 0
+            )
+
+    if not candidates:
+        return ""
+
+    explanation_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    try:
+        text = _read_text_lossy(explanation_path).strip()
+    except OSError:
+        return ""
+    return text
+
+
+def _fallback_rl_explanation_report(work_dir: Path, router_type: str) -> str:
+    normalized = normalize_router_type(router_type)
+    if normalized not in {"rl", "rl_135", "rl_arc"}:
+        return ""
+
+    order_path = work_dir / "order_input.txt"
+    try:
+        parsed = parse_order_input_file(order_path)
+    except Exception as exc:
+        return (
+            "本次未读取到 RL explanation.md；"
+            f"同时无法解析本次 order_input.txt 生成概要报告：{exc}"
+        )
+
+    order_lines = parsed.get("orderLines") or []
+    layers = []
+    for item in order_lines:
+        layer = str(item.get("layer") or "").strip()
+        if layer and layer not in layers:
+            layers.append(layer)
+    preview_items = []
+    for item in order_lines[:8]:
+        net = str(item.get("net") or "").strip()
+        layer = str(item.get("layer") or "").strip()
+        order = item.get("order")
+        if net and layer:
+            preview_items.append(f"{net}->{layer}#{order}")
+
+    return (
+        "本次未读取到 RL explanation.md，以下为 Agent 基于本次层分配和逃逸顺序文件生成的概要。\n"
+        f"- RL 类型：{normalized}\n"
+        f"- orderLines 数量：{len(order_lines)}\n"
+        f"- 涉及层：{'、'.join(layers) if layers else '未解析到层'}\n"
+        f"- 顺序预览：{'；'.join(preview_items) if preview_items else '无'}"
+    )
+
+
+def _rl_explanation_report(work_dir: Path, router_dir: Path, router_type: str) -> str:
+    report = _read_rl_explanation_report(work_dir, router_dir, router_type)
+    if report:
+        return report
+    return _fallback_rl_explanation_report(work_dir, router_type)
+
+
+def _combine_route_reports(base_report: str, explanation_report: str) -> str:
+    base = str(base_report or "").strip()
+    explanation = _compact_rl_explanation_report(explanation_report)
+    if not explanation:
+        return base
+    section = f"层分配和逃逸顺序生成报告：\n{explanation}"
+    return f"{base}\n\n{section}".strip() if base else section
+
+
+def _compact_rl_explanation_report(text: str) -> str:
+    raw_lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not raw_lines:
+        return ""
+
+    output: list[str] = []
+    table_rows: list[list[str]] = []
+    keep_next_bullet = False
+
+    def flush_table() -> None:
+        nonlocal table_rows
+        if not table_rows:
+            return
+        for cells in table_rows:
+            if len(cells) >= 4:
+                output.append(f"{cells[0]}：{cells[1]} -> {cells[2]}，变化 {cells[3]}")
+        table_rows = []
+
+    for line in raw_lines:
+        if line.startswith("|"):
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not cells or cells[0] in {"指标", "---"} or set(cells[0]) <= {"-", ":"}:
+                continue
+            table_rows.append(cells)
+            continue
+
+        flush_table()
+        if line.startswith("#"):
+            title = line.lstrip("#").strip()
+            if title and title not in {"指标对比", "层和顺序变化", "为什么这个结果更好", "未布通网络"}:
+                output.append(title)
+            continue
+
+        if line.startswith("- "):
+            bullet = line[2:].strip()
+            if (
+                bullet.startswith("层负载")
+                or bullet.startswith("变化规模")
+                or bullet.startswith("代表性变化")
+                or bullet.startswith("最佳候选来源")
+                or bullet.startswith("布通数量")
+                or bullet.startswith("总线长")
+                or bullet.startswith("过孔")
+                or bullet.startswith("最佳方案仍有")
+                or bullet.startswith("相比初始方案")
+            ):
+                output.append(bullet)
+                keep_next_bullet = True
+            elif keep_next_bullet and len(output) < 14:
+                output.append(bullet)
+            continue
+
+        keep_next_bullet = False
+        if line:
+            output.append(line)
+
+    flush_table()
+
+    deduped: list[str] = []
+    for item in output:
+        item = re.sub(r"`([^`]+)`", r"\1", item).strip()
+        if item and item not in deduped:
+            deduped.append(item)
+    return "\n".join(deduped[:16]).strip()
+
+
+def _compact_statistical_report(text: str, *, pin_preview_limit: int = 30) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if "引脚名称:" not in lines:
+        return str(text or "").strip()
+
+    output: list[str] = []
+    current_pin_label = ""
+    pins: list[str] = []
+
+    def flush_pins() -> None:
+        nonlocal pins, current_pin_label
+        if not current_pin_label:
+            pins = []
+            return
+        preview = "、".join(pins[:pin_preview_limit])
+        suffix = f" 等 {len(pins)} 个" if len(pins) > pin_preview_limit else f"（共 {len(pins)} 个）"
+        output.append(f"{current_pin_label}: {preview}{suffix}" if preview else f"{current_pin_label}: 无")
+        pins = []
+        current_pin_label = ""
+
+    for line in lines:
+        if line == "引脚名称:":
+            continue
+        success_match = re.match(r"布线成功的引脚个数[:：]\s*(.+)", line)
+        failure_match = re.match(r"布线失败的引脚个数[:：]\s*(.+)", line)
+        if success_match or failure_match:
+            flush_pins()
+            output.append(line)
+            current_pin_label = "成功引脚" if success_match else "失败引脚"
+            continue
+        if current_pin_label and re.fullmatch(r"[A-Za-z]+\d+(?:[._-]?[A-Za-z0-9]+)?", line):
+            pins.append(line)
+            continue
+        flush_pins()
+        output.append(line)
+
+    flush_pins()
+    return "\n".join(output).strip()
 
 
 def _resolve_import_lines_path(work_dir: Path, router_type: str, constraints: Any | None = None) -> Path:
@@ -532,6 +836,8 @@ def generate_fanout_params(
 
     _run_layer_assign(work_dir, router_dir, normalized, layout_path.name, "component_input.txt")
     _run_escape_order(work_dir, router_dir, layout_path.name)
+    if _is_rl_router(normalized):
+        _run_rl_fanout_search(work_dir, router_dir, normalized, layout_path)
 
     parsed = parse_order_input_file(work_dir / "order_input.txt")
     merged_constraints = dict(constraints or {})
@@ -594,15 +900,15 @@ def run_bjut_route(
     if router_execution_family(router_type) == "arc":
         copy_arc_constrain(work_dir, router_dir)
 
-    _run_layer_assign(work_dir, router_dir, router_type, layout_path.name, "component_input.txt")
-    _run_escape_order(work_dir, router_dir, layout_path.name)
+    write_order_input(work_dir, order_lines, selected_bga, constraints)
     _run_router_main(work_dir, router_dir, router_type, layout_path.name)
 
     routing_result = _resolve_routing_result_path(work_dir, router_type, router_dir, layout_path)
     import_lines = _resolve_import_lines_path(work_dir, router_type, constraints)
     report = _read_report(work_dir)
+    explanation_report = _rl_explanation_report(work_dir, router_dir, router_type)
     return RouterRunOutputs(
         routing_result_path=routing_result,
         import_lines_path=import_lines,
-        report=report or "布线完成（无详细报告）",
+        report=_combine_route_reports(report or "布线完成（无详细报告）", explanation_report),
     )

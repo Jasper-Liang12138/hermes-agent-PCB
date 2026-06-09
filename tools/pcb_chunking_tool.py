@@ -60,7 +60,7 @@ def _load_project_config_ini() -> configparser.ConfigParser | None:
         if not path.exists():
             continue
         try:
-            parser.read(path, encoding="utf-8")
+            parser.read(path, encoding="utf-8-sig")
             return parser
         except Exception as exc:
             logger.warning("Failed reading project config.ini from %s: %s", path, exc)
@@ -401,25 +401,35 @@ def _is_signal_layer(kind: str, name: str) -> bool:
     return any(token in name_norm for token in ("top", "bottom", "sig", "art"))
 
 
-def _extract_bga_components_json_with_script(board_text: str) -> dict[str, Any]:
+def _extract_bga_components_json_from_path(input_path: Path) -> dict[str, Any]:
     from extract_bga_components import BGA_PIN_THRESHOLD, extract_bga_components
+
+    output_path = input_path.with_name(f"{input_path.stem}_bga_components.json")
+    components = extract_bga_components(input_path)
+    result = {
+        "source": str(input_path),
+        "match_rule": (
+            "component has DFA_DEV_CLASS=BGA, and all U components over "
+            f"{BGA_PIN_THRESHOLD} pins are included"
+        ),
+        "count": len(components),
+        "components": components,
+    }
+    try:
+        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return json.loads(output_path.read_text(encoding="utf-8"))
+    except OSError:
+        return result
+
+
+def _extract_bga_components_json_with_script(board_text: str, board_path: Optional[Path] = None) -> dict[str, Any]:
+    if board_path and board_path.is_file():
+        return _extract_bga_components_json_from_path(board_path)
 
     with tempfile.TemporaryDirectory(prefix="pcb_extract_bga_") as tmp_dir:
         input_path = Path(tmp_dir) / "board.txt"
-        output_path = Path(tmp_dir) / "bga_components.json"
         input_path.write_text(board_text or "", encoding="utf-8")
-        components = extract_bga_components(input_path)
-        result = {
-            "source": str(input_path),
-            "match_rule": (
-                "component has DFA_DEV_CLASS=BGA, and all U components over "
-                f"{BGA_PIN_THRESHOLD} pins are included"
-            ),
-            "count": len(components),
-            "components": components,
-        }
-        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return json.loads(output_path.read_text(encoding="utf-8"))
+        return _extract_bga_components_json_from_path(input_path)
 
 
 def _component_detail_from_script(component: dict[str, Any]) -> str:
@@ -458,9 +468,9 @@ def _selection_from_bga_components_json(data: dict[str, Any]) -> list[dict[str, 
     return selection
 
 
-def _extract_rule_bga_selection(board_text: str) -> list[dict[str, str]]:
+def _extract_rule_bga_selection(board_text: str, board_path: Optional[Path] = None) -> list[dict[str, str]]:
     try:
-        data = _extract_bga_components_json_with_script(board_text)
+        data = _extract_bga_components_json_with_script(board_text, board_path=board_path)
     except Exception as exc:
         logger.warning("Script-based BGA extraction failed: %s", exc)
         return []
@@ -981,70 +991,89 @@ _CACHED_PROJECT_DATA_SENTINELS = {
 }
 
 
-def _resolve_board_text(board_text: str, session_id: Optional[str] = None) -> str:
+def _existing_board_path(value: str) -> Optional[Path]:
+    candidate = str(value or "").strip().strip('"')
+    if not candidate:
+        return None
+    try:
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path.resolve()
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_board_source(board_text: str, session_id: Optional[str] = None) -> tuple[str, Optional[Path]]:
     candidate = (board_text or "").strip()
+    direct_path = _existing_board_path(candidate)
+    if direct_path is not None:
+        try:
+            return direct_path.read_text(encoding="utf-8-sig", errors="ignore"), direct_path
+        except OSError:
+            return board_text or "", direct_path
     if candidate and candidate not in _CACHED_PROJECT_DATA_SENTINELS:
-        return board_text
+        return board_text, None
 
     try:
         from tools.pcb_tools import WebSocketTransportSingleton
 
-        cached = WebSocketTransportSingleton.get_instance().get_cached_project_data(
+        transport = WebSocketTransportSingleton.get_instance()
+        cached_path = transport.get_cached_project_data_path(session_id=session_id)
+        board_path = _existing_board_path(cached_path or "")
+        cached = transport.get_cached_project_data(
             session_id=session_id
         )
         if cached:
             logger.info(
-                "pcb_extract_bga loaded board_text from websocket cache: session=%s chars=%d",
+                "pcb_extract_bga loaded cached board source: session=%s chars=%d path=%s",
                 session_id,
                 len(cached),
+                board_path or "",
             )
-            return cached
+            return cached, board_path
+        if board_path is not None:
+            content = board_path.read_text(encoding="utf-8-sig", errors="ignore")
+            logger.info(
+                "pcb_extract_bga loaded board file from websocket cache: session=%s path=%s chars=%d",
+                session_id,
+                board_path,
+                len(content),
+            )
+            return content, board_path
     except Exception as exc:
-        logger.warning("Failed to load cached board_text for pcb_extract_bga: %s", exc)
+        logger.warning("Failed to load cached board source for pcb_extract_bga: %s", exc)
 
-    return board_text or ""
+    return board_text or "", None
+
+
+def _resolve_board_text(board_text: str, session_id: Optional[str] = None) -> str:
+    resolved_text, _ = _resolve_board_source(board_text, session_id=session_id)
+    return resolved_text
 
 
 def _extract_bga(board_text: str, session_id: Optional[str] = None) -> str:
-    board_text = _resolve_board_text(board_text, session_id=session_id)
+    board_text, board_path = _resolve_board_source(board_text, session_id=session_id)
     if not board_text or not board_text.strip():
         return json.dumps({"error": "board_text is empty"}, ensure_ascii=False)
 
     parser_hints: dict[str, Any] = {}
-    rule_selection = _extract_rule_bga_selection(board_text)
+    rule_selection = _extract_rule_bga_selection(board_text, board_path=board_path)
     try:
         parser_hints = _summarize_board_model(board_text)
     except Exception as exc:
         logger.warning("Failed to build parser hints for pcb_extract_bga: %s", exc)
 
-    try:
-        result = _analyze_board_with_model(board_text)
-        result = _normalize_board_analysis(
-            result if isinstance(result, dict) else {},
-            parser_hints=parser_hints,
-            rule_selection=rule_selection,
-            source=str(result.get("source") or "llm_long_context") if isinstance(result, dict) else "llm_long_context",
-            fallback_used=bool(result.get("fallbackUsed")) if isinstance(result, dict) else False,
-            model_meta=result.get("model", {}) if isinstance(result, dict) else None,
-            context_stats=result.get("contextStats") if isinstance(result, dict) else None,
-        )
-        if not result.get("selection") and not result.get("boardSummary"):
-            raise RuntimeError("board analysis returned empty payload")
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as exc:
-        logger.error("pcb_extract_bga long-context analysis failed, fallback to rule path: %s", exc)
-        fallback = _normalize_board_analysis(
-            {},
-            parser_hints=parser_hints,
-            rule_selection=rule_selection,
-            source="rule_fallback",
-            fallback_used=True,
-        )
-        if not fallback["selection"]:
-            fallback["message"] = "未识别到 BGA 封装元件"
-        else:
-            fallback["message"] = f"长上下文分析失败，已回退到规则提取：{exc}"
-        return json.dumps(fallback, ensure_ascii=False)
+    result = _normalize_board_analysis(
+        {},
+        parser_hints=parser_hints,
+        rule_selection=rule_selection,
+        source="rule_script",
+        fallback_used=False,
+    )
+    if not result.get("selection"):
+        result["message"] = "未识别到 BGA 封装元件"
+    return json.dumps(result, ensure_ascii=False)
 
 
 registry.register(
@@ -1053,17 +1082,26 @@ registry.register(
     schema={
         "name": "pcb_extract_bga",
         "description": (
-            "对启云方格式 PCB 版图文本执行长上下文板分析，主链路返回 BGA 候选 selection、"
+            "从 getProjectData 返回的 PCB 版图文件路径中提取 BGA 候选 selection、"
             "层叠/封装/网络摘要 boardSummary，以及 fanoutContext。"
-            "如长上下文分析失败，会自动回退到规则 BGA 提取。"
+            "优先传 filePath/projectData 文件路径；兼容旧的 board_text 文本或 "
+            "__CACHED_PROJECT_DATA__。主链路使用规则脚本提取 BGA。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "filePath": {
+                    "type": "string",
+                    "description": "getProjectData 返回的 PCB 版图 txt 文件路径，支持绝对路径。",
+                },
+                "projectData": {
+                    "type": "string",
+                    "description": "getProjectData 返回的 PCB 版图 txt 文件路径，兼容前端字段名。",
+                },
                 "board_text": {
                     "type": "string",
                     "description": (
-                        "getProjectData 返回的启云方格式 PCB 版图 S 表达式文本。"
+                        "兼容旧链路：getProjectData 返回的 PCB 版图文本或文件路径。"
                         "如果系统提示版图已缓存，可传 __CACHED_PROJECT_DATA__ 或省略该字段。"
                     ),
                 }
@@ -1072,7 +1110,7 @@ registry.register(
         },
     },
     handler=lambda args, **kwargs: _extract_bga(
-        args.get("board_text", ""),
+        args.get("filePath") or args.get("projectData") or args.get("board_text", ""),
         session_id=kwargs.get("session_id"),
     ),
     check_fn=lambda: _AVAILABLE and _config_enabled(),
