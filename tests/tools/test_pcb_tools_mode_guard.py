@@ -109,6 +109,82 @@ def test_reroute_report_preserves_markdown_newlines():
     assert "DRC 分析 ========" not in public_payload["report"]
 
 
+def test_reroute_import_layer_mapping_uses_pcb_builder_layer_names():
+    assert pcb_tools._kicad_layer_to_import_layer("F.Cu") == "Conductor/Top"
+    assert pcb_tools._kicad_layer_to_import_layer("B.Cu") == "Conductor/Bottom"
+    assert pcb_tools._kicad_layer_to_line_out_layer("F.Cu") == "TOP"
+    assert pcb_tools._kicad_layer_to_line_out_layer("B.Cu") == "BOTTOM"
+    assert pcb_tools._kicad_layer_to_line_out_layer("Conductor/Top") == "TOP"
+
+
+def test_reroute_line_out_coord_mapping_uses_pcb_builder_local_mils(monkeypatch):
+    class FakeConvert:
+        OUTLINE_ONLY_ORIGIN_X = 363386.0
+        OUTLINE_ONLY_ORIGIN_Y = 534646.0
+        DBU_MM = 0.000254
+
+    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+
+    assert pcb_tools._kicad_mm_to_line_out_coord_text("106.479086", "x") == "558.23"
+    assert pcb_tools._kicad_mm_to_line_out_coord_text("139.172950", "y") == "132.79"
+    assert pcb_tools._kicad_mm_to_line_out_coord_text("135.628380", "y") == "-6.76"
+
+
+def test_validate_reroute_incremental_import_accepts_line_out_records():
+    text = "TOP!LINE!0!N1!1.00!2.00!3.00!4.00!6.00\n"
+
+    passed, reason, stats = pcb_tools._validate_reroute_incremental_import_text(text)
+
+    assert passed is True
+    assert reason == ""
+    assert stats["lineCount"] == 1
+    assert stats["layers"] == ["TOP"]
+
+
+def test_write_reroute_line_out_clips_single_axis_missing_route(monkeypatch, tmp_path):
+    class FakeConvert:
+        OUTLINE_ONLY_ORIGIN_X = 363386.0
+        OUTLINE_ONLY_ORIGIN_Y = 534646.0
+        DBU_MM = 0.000254
+
+    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+    patch = "\n".join(
+        [
+            "(segment (start 106.480000 139.170000) (end 106.480000 135.630000) (width 0.152400) (layer Top) (net 58))",
+            "(segment (start 106.480000 135.630000) (end 106.480000 132.790000) (width 0.152400) (layer Top) (net 58))",
+        ]
+    )
+    local_context = {
+        "missingRoutes": [
+            {
+                "net_name": "Z7_SPI0_SCK",
+                "start": {"layer": "Top", "x": 106.479086, "y": 139.17295},
+                "end": {"layer": "Top", "x": 106.479086, "y": 135.62838},
+            }
+        ]
+    }
+
+    path, _ = pcb_tools._write_reroute_incremental_import_file(
+        patch_text=patch,
+        board_text="(kicad_pcb (net 58 Z7_SPI0_SCK))",
+        output_dir=str(tmp_path),
+        session_id="clip",
+        local_context=local_context,
+    )
+
+    import_text = Path(path).read_text(encoding="utf-8")
+    assert import_text == "TOP!LINE!0!Z7_SPI0_SCK!558.23!132.67!558.23!-6.70!6.00\n"
+    assert "-118.51" not in import_text
+
+
+def test_validate_reroute_incremental_import_rejects_empty_wires():
+    passed, reason, stats = pcb_tools._validate_reroute_incremental_import_text("(wires\n)\n")
+
+    assert passed is False
+    assert "(wires" in reason
+    assert stats == {}
+
+
 def test_default_reroute_drc_iterations_is_three(monkeypatch):
     monkeypatch.delenv("PCB_REROUTE_MAX_DRC_ITERATIONS", raising=False)
 
@@ -1022,7 +1098,7 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     assert "DRC 分析" in payload["content"]
     assert "DRC 状态: 未执行" in payload["content"]
     assert model_failure in payload["content"]
-    assert "Explain 模型可解释性报告" in payload["content"]
+    assert "本地布线质量分类模型报告" in payload["content"]
     assert "测试可解释性报告：来自本地 explain 分类模型。" in payload["content"]
     assert "布线较好概率: 0.984707" not in payload["content"]
 
@@ -1203,7 +1279,7 @@ def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
     assert model_failure in pending["report"]
     assert "txt 输出: 未生成" in pending["report"]
     assert "importLines: 不允许" in pending["report"]
-    assert "Explain 模型可解释性报告" in pending["report"]
+    assert "本地布线质量分类模型报告" in pending["report"]
     assert "测试可解释性报告：来自本地 explain 分类模型。" in pending["report"]
 
 
@@ -1663,18 +1739,28 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
     monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", _fake_convert)
 
+    class FakeConvert:
+        OUTLINE_ONLY_ORIGIN_X = 0.0
+        OUTLINE_ONLY_ORIGIN_Y = 0.0
+        DBU_MM = 0.000254
+
+    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-drc-pass")
     payload = json.loads(result)
 
     assert payload["rerouteResult"]["drcPassed"] is True
     assert payload["rerouteResult"]["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
     assert payload["routedLayoutTxtFilePath"] == str(tmp_path / "routed.txt")
-    assert payload["importLinesFilePath"].endswith("_reroute_import.txt")
+    assert payload["importLinesFilePath"].endswith("_reroute_line.out")
     assert payload["rerouteResult"]["importLinesFilePath"] == payload["importLinesFilePath"]
     import_path = Path(payload["importLinesFilePath"])
     assert import_path.is_file()
-    assert import_path.read_text(encoding="utf-8").lstrip().startswith("(wires")
-    assert not import_path.read_text(encoding="utf-8").lstrip().startswith("(layout")
+    import_text = import_path.read_text(encoding="utf-8")
+    assert import_text.startswith("TOP!LINE!0!13!39.37!39.37!78.74!78.74!7.87")
+    assert "(wires" not in import_text
+    assert "(layout" not in import_text
+    assert "F.Cu" not in import_text
     assert "routedBoardDataFilePath" not in payload
     assert "originalBoardDataFilePath" not in payload["rerouteResult"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
@@ -1685,7 +1771,7 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     assert "txt 输出: 已生成" in payload["content"]
     assert str(tmp_path / "routed.txt") in payload["content"]
     assert "importLines: 允许" in payload["content"]
-    assert "Explain 模型可解释性报告" in payload["content"]
+    assert "本地布线质量分类模型报告" in payload["content"]
     assert "测试可解释性报告：来自本地 explain 分类模型。" in payload["content"]
     assert payload["rerouteResult"]["drcAgentReport"]["ok"] is True
 
@@ -1955,4 +2041,4 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     assert "txt 输出: 未生成" in payload["content"]
     assert "失败回填txt: 已保存" in payload["content"]
     assert "importLines: 不允许" in payload["content"]
-    assert "Explain 模型可解释性报告" in payload["content"]
+    assert "本地布线质量分类模型报告" in payload["content"]

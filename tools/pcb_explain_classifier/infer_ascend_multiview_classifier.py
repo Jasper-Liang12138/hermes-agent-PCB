@@ -112,39 +112,29 @@ def build_report_text(
     predicted_label: int,
     probability_positive: float,
     image_paths: Sequence[Path],
+    export_dir: Union[str, Path, None] = None,
+    checkpoint_path: Union[str, Path, None] = None,
 ) -> str:
     layer_count = max(0, len(image_paths) - 1) if image_paths else 0
     label_name = "布线较好" if predicted_label == 1 else "布线较差"
     confidence = probability_positive if predicted_label == 1 else 1.0 - probability_positive
     routing_good_probability = probability_positive
-
-    if predicted_label == 1:
-        conclusion = (
-            f"该文件对应的布线结果整体较好，模型预测置信度为 {confidence:.6f}，"
-            f"布线较好概率为 {routing_good_probability:.6f}，说明其与高质量布线结果具有较高一致性。"
-            "结合可解释性分析结果，该板整体走线较顺畅，绕行和方向突变较少，"
-            "弯折过渡相对自然，层间分布与 via 使用较为均衡。"
-            "这些特征表明当前布线方案在规整性、连通性和制造可实现性方面表现较好，"
-            "建议作为高质量候选方案优先保留或进一步应用。"
-        )
-    else:
-        conclusion = (
-            f"该文件对应的布线结果整体较差，模型预测置信度为 {confidence:.6f}，"
-            f"布线较好概率仅为 {routing_good_probability:.6f}，说明其与高质量布线结果差异明显。"
-            "结合可解释性分析结果，该板可能存在布线长度偏长、局部绕行较多、走线方向变化较频繁、"
-            "路径弯折或弧度不够平滑、层间分布不均衡以及 via 使用不够合理等问题。"
-            "这些特征表明当前布线方案在连通性、规整性和制造可实现性方面存在一定风险，"
-            "建议作为低质量候选方案进行人工复核或后续优化处理。"
-        )
+    export_text = str(export_dir or "").strip()
+    checkpoint_text = str(checkpoint_path or "").strip()
 
     return (
-        f"可解释性分析报告\n"
-        f"================\n\n"
-        f"层数: {layer_count}\n\n"
+        f"本地布线质量分类报告\n"
+        f"====================\n\n"
+        f"模型权重: {checkpoint_text or '未记录'}\n"
         f"预测结果: {label_name}\n"
         f"布线较好概率: {routing_good_probability:.6f}\n"
-        f"当前预测置信度: {confidence:.6f}\n\n"
-        f"{conclusion}\n"
+        f"当前预测置信度: {confidence:.6f}\n"
+        f"层数: {layer_count}\n"
+        f"视图数: {len(image_paths)}\n"
+        f"导出目录: {export_text or '未记录'}\n\n"
+        "说明: 当前本地模型只输出布线质量分类概率，尚未提供逐线段、逐网络或逐层的特征归因。"
+        "因此本报告不再生成固定的走线顺畅度、绕行、via 均衡等细节判断；"
+        "如果不同输入得到相同概率，只代表当前分类模型未给出更细粒度差异解释。"
     )
 
 
@@ -200,6 +190,8 @@ def infer_file(
         predicted_label=predicted_label,
         probability_positive=probability_positive,
         image_paths=image_paths,
+        export_dir=board_out,
+        checkpoint_path=checkpoint_path,
     )
 
     board_out.mkdir(parents=True, exist_ok=True)
@@ -214,6 +206,7 @@ def infer_file(
         "probability_positive": probability_positive,
         "view_count": len(image_paths),
         "layer_count": max(0, len(image_paths) - 1),
+        "checkpoint_path": str(checkpoint_path),
         "export_dir": str(board_out),
         "report_path": str(report_path),
         "prediction_json": str(prediction_json_path),
