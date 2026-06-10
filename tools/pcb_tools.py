@@ -36,6 +36,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 from tools import pcb_model_runtime
+from tools.pcb_drc_agent_report import generate_drc_agent_report
 from tools.pcb_explain_report import generate_explain_report
 from tools.registry import registry
 
@@ -1799,16 +1800,24 @@ def _convert_internal_kicad_to_public_txt(
     kicad_path: str,
     output_dir: str,
     session_id: str,
+    output_subdir: str = "txt",
 ) -> tuple[str, list[str]]:
     if not kicad_path:
         return "", []
     path = Path(kicad_path)
     if path.suffix.lower() == ".txt":
+        if output_subdir != "txt" and path.is_file():
+            txt_dir = Path(output_dir) / output_subdir
+            txt_dir.mkdir(parents=True, exist_ok=True)
+            output_path = txt_dir / path.name
+            if path.resolve() != output_path.resolve():
+                shutil.copyfile(path, output_path)
+            return str(output_path), [f"copied_output_txt_to_{output_subdir}:{output_path}"]
         return str(path), []
     if path.suffix.lower() != ".kicad_pcb" or not path.is_file():
         return "", []
 
-    txt_dir = Path(output_dir) / "txt"
+    txt_dir = Path(output_dir) / (output_subdir or "txt")
     txt_dir.mkdir(parents=True, exist_ok=True)
     convert_mod = _load_convert_module()
     result = convert_mod.convert_one("kicad_to_txt", path, txt_dir, None)
@@ -1975,6 +1984,55 @@ def _compact_public_drc_result(value: Any) -> Any:
     return result
 
 
+def _compact_public_drc_agent_report(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _strip_internal_reroute_paths(value)
+    result: Dict[str, Any] = {
+        "ok": bool(value.get("ok")),
+    }
+    if value.get("jsonPath") or value.get("json_path"):
+        result["jsonPath"] = str(value.get("jsonPath") or value.get("json_path"))
+    if value.get("returncode") is not None:
+        result["returncode"] = value.get("returncode")
+    if value.get("error"):
+        result["error"] = _compact_public_text(value.get("error"), 900)
+
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return result
+
+    compact_payload: Dict[str, Any] = {}
+    for key in ("schema_version", "language"):
+        if key in payload:
+            compact_payload[key] = _strip_internal_reroute_paths(payload.get(key))
+    if payload.get("message_zh"):
+        compact_payload["message_zh"] = _compact_public_text(
+            payload.get("message_zh"),
+            5000,
+            preserve_newlines=True,
+        )
+    for key in ("result", "board_info", "routing_metrics", "precheck"):
+        if isinstance(payload.get(key), dict):
+            compact_payload[key] = _strip_internal_reroute_paths(payload.get(key))
+    issues = payload.get("issues")
+    if isinstance(issues, list):
+        compact_payload["issueCount"] = len(issues)
+        compact_payload["issuesPreview"] = [
+            {
+                "rule": item.get("rule"),
+                "rule_name_zh": item.get("rule_name_zh"),
+                "severity": item.get("severity"),
+                "severity_zh": item.get("severity_zh"),
+                "location_zh": _compact_public_text(item.get("location_zh"), 260),
+                "suggestion_zh": _compact_public_text(item.get("suggestion_zh"), 260),
+            }
+            for item in issues[:5]
+            if isinstance(item, dict)
+        ]
+    result["payload"] = compact_payload
+    return result
+
+
 def _compact_public_attempt(attempt: Any) -> Any:
     if not isinstance(attempt, dict):
         return _strip_internal_reroute_paths(attempt)
@@ -2015,6 +2073,8 @@ def _compact_public_reroute_result(value: Any) -> Any:
     if not isinstance(value, dict):
         return _strip_internal_reroute_paths(value)
     result = dict(_strip_internal_reroute_paths(value))
+    if isinstance(result.get("drcAgentReport"), dict):
+        result["drcAgentReport"] = _compact_public_drc_agent_report(result["drcAgentReport"])
     attempts = result.get("drcAttempts")
     if isinstance(attempts, list):
         result["drcAttempts"] = [_compact_public_attempt(item) for item in attempts[-3:]]
@@ -2039,9 +2099,9 @@ def _compact_public_reroute_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "explanation" in result:
         result["explanation"] = _compact_public_text(result.get("explanation"), 1800)
     if "content" in result:
-        result["content"] = _compact_public_text(result.get("content"), 5000, preserve_newlines=True)
+        result["content"] = _compact_public_text(result.get("content"), 12000, preserve_newlines=True)
     if "report" in result:
-        result["report"] = _compact_public_text(result.get("report"), 5000, preserve_newlines=True)
+        result["report"] = _compact_public_text(result.get("report"), 12000, preserve_newlines=True)
     return result
 
 
@@ -2154,6 +2214,139 @@ def _latest_reroute_drc_result(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _latest_reroute_filled_board_path(payload: Dict[str, Any]) -> str:
+    reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    attempts = reroute_result.get("drcAttempts") if isinstance(reroute_result, dict) else None
+    if isinstance(attempts, list):
+        for attempt in reversed(attempts):
+            if not isinstance(attempt, dict):
+                continue
+            path = str(attempt.get("filledBoardDataFilePath") or "").strip()
+            if path:
+                return path
+    return ""
+
+
+def _drc_agent_message_zh(payload: Dict[str, Any]) -> str:
+    reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    report = reroute_result.get("drcAgentReport") if isinstance(reroute_result, dict) else None
+    report = report if isinstance(report, dict) else {}
+    report_payload = report.get("payload")
+    if isinstance(report_payload, dict):
+        message = str(report_payload.get("message_zh") or "").strip()
+        if message:
+            return _compact_public_text(message, 5000, preserve_newlines=True)
+    return ""
+
+
+def _drc_agent_failure_summary(payload: Dict[str, Any]) -> str:
+    reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    report = reroute_result.get("drcAgentReport") if isinstance(reroute_result, dict) else None
+    if not isinstance(report, dict) or report.get("ok"):
+        return ""
+    error = str(report.get("error") or "").strip()
+    if error:
+        return _compact_public_text(error, 700)
+    report_payload = report.get("payload")
+    if isinstance(report_payload, dict):
+        nested_error = report_payload.get("error")
+        if isinstance(nested_error, dict):
+            text = str(nested_error.get("message") or nested_error.get("type") or "").strip()
+            if text:
+                return _compact_public_text(text, 700)
+    return "增强 DRC 报告生成失败，已保留基础 DRC 摘要。"
+
+
+def _append_drc_agent_report(
+    payload: Dict[str, Any],
+    *,
+    board_path: str,
+    output_dir: str,
+    session_id: str,
+    target_bga: str = "",
+) -> Dict[str, Any]:
+    result = dict(payload)
+    if not str(board_path or "").strip():
+        report = {
+            "ok": False,
+            "error": "缺少可用于增强 DRC 报告的模型回填版图文件。",
+            "jsonPath": "",
+        }
+    else:
+        try:
+            report = generate_drc_agent_report(
+                board_file_path=board_path,
+                output_dir=output_dir,
+                session_id=session_id,
+                target_bga=target_bga,
+            )
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "error": f"增强 DRC 中文报告生成异常：{type(exc).__name__}: {exc}",
+                "jsonPath": "",
+            }
+        if not isinstance(report, dict):
+            report = {
+                "ok": False,
+                "error": f"增强 DRC 中文报告返回了非字典结果：{type(report).__name__}",
+                "jsonPath": "",
+            }
+        elif "json_path" in report and "jsonPath" not in report:
+            report = {**report, "jsonPath": report.get("json_path")}
+
+    reroute_result = dict(result.get("rerouteResult") or {})
+    reroute_result["drcAgentReport"] = report
+    result["rerouteResult"] = reroute_result
+
+    check_report = dict(result.get("checkReport") or {})
+    checks = list(check_report.get("checks") or [])
+    detail = (
+        f"增强 DRC 中文报告已生成：{report.get('jsonPath') or report.get('json_path')}"
+        if isinstance(report, dict) and report.get("ok")
+        else f"增强 DRC 中文报告生成失败：{_compact_public_text((report or {}).get('error'), 700)}"
+    )
+    checks.append(
+        {
+            "name": "drc_agent_report",
+            "passed": bool(report.get("ok")),
+            "detail": detail,
+            "blocking": False,
+        }
+    )
+    check_report["checks"] = checks
+    check_report["passed"] = bool(check_report.get("passed", True))
+    result["checkReport"] = check_report
+    return result
+
+
+def _reroute_target_bga_for_drc_agent(*values: Any) -> str:
+    payload_keys = (
+        "targetBga",
+        "targetBGA",
+        "selectedBGA",
+        "selectedBga",
+        "component",
+        "componentRefdes",
+        "refdes",
+    )
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in payload_keys:
+            refdes = _clean_component_refdes(value.get(key))
+            if refdes:
+                return refdes
+        for route in _frontend_missing_routes_from_context(value):
+            for endpoint_key in ("start", "end"):
+                endpoint = route.get(endpoint_key) if isinstance(route, dict) else None
+                if isinstance(endpoint, dict):
+                    refdes = _clean_component_refdes(endpoint.get("component"))
+                    if refdes:
+                        return refdes
+    return ""
+
+
 def _drc_failure_markdown_summary(payload: Dict[str, Any]) -> str:
     drc_result = _latest_reroute_drc_result(payload)
     details = drc_result.get("details") if isinstance(drc_result, dict) else {}
@@ -2185,16 +2378,21 @@ def _drc_failure_markdown_summary(payload: Dict[str, Any]) -> str:
     return _compact_public_text(failure_reason, 1200) or "DRC 校验未通过，但未返回更具体的失败原因。"
 
 
-def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) -> str:
+def _compose_drc_analysis_report(
+    payload: Dict[str, Any],
+    public_txt_path: str,
+    import_lines_path: str = "",
+) -> str:
     drc_passed = _reroute_drc_passed_from_payload(payload)
     failure_reason = str(_strip_internal_reroute_paths(_latest_reroute_failure_reason(payload))).strip()
+    reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    reroute_result = reroute_result if isinstance(reroute_result, dict) else {}
     txt_generated = bool(public_txt_path)
-    import_allowed = drc_passed is True and txt_generated
+    import_allowed = drc_passed is True and txt_generated and bool(import_lines_path)
 
     if drc_passed is True:
         status = "通过"
         conclusion_label = "成功结论"
-        reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
         local_policy = reroute_result.get("localReroutePolicy") if isinstance(reroute_result, dict) else {}
         if isinstance(local_policy, dict) and local_policy.get("mode") == "selected_net_local":
             inherited = local_policy.get("inheritedIssueCount", 0)
@@ -2220,6 +2418,8 @@ def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) 
     else:
         txt_status = "未生成，DRC 未通过或未执行。"
 
+    failed_txt_path = str(reroute_result.get("drcFailedLayoutTxtFilePath") or "").strip()
+    failed_txt_status = f"已保存：{failed_txt_path}" if failed_txt_path else "未保存。"
     import_status = "允许，满足 DRC 通过且 txt 已生成。" if import_allowed else "不允许，必须 DRC 通过且生成 txt 后才允许 importLines。"
     lines = [
         "DRC 分析",
@@ -2227,9 +2427,21 @@ def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) 
         "",
         f"DRC 状态: {status}",
         f"{conclusion_label}: {conclusion}",
-        f"txt 输出: {txt_status}",
-        f"importLines: {import_status}",
     ]
+    drc_agent_message = _drc_agent_message_zh(payload)
+    if drc_agent_message:
+        lines.extend(["", drc_agent_message])
+    else:
+        drc_agent_failure = _drc_agent_failure_summary(payload)
+        if drc_agent_failure:
+            lines.extend(["", f"DRC规则检查结果：{drc_agent_failure}"])
+    lines.extend(
+        [
+            f"txt 输出: {txt_status}",
+            f"失败回填txt: {failed_txt_status}",
+            f"importLines: {import_status}",
+        ]
+    )
     return "\n".join(lines).strip()
 
 
@@ -2237,9 +2449,10 @@ def _compose_reroute_report_content(
     *,
     payload: Dict[str, Any],
     public_txt_path: str,
+    import_lines_path: str = "",
     explain_report: str,
 ) -> str:
-    drc_report = _compose_drc_analysis_report(payload, public_txt_path)
+    drc_report = _compose_drc_analysis_report(payload, public_txt_path, import_lines_path)
     explain_text = str(_strip_internal_reroute_paths(explain_report or "")).strip()
     if not explain_text:
         explain_text = "Explain 模型未返回可用报告。"
@@ -2691,6 +2904,7 @@ def _append_explainability_report(
     *,
     internal_board_path: str,
     public_txt_path: str,
+    import_lines_path: str = "",
 ) -> Dict[str, Any]:
     result = dict(payload)
     explain_report = ""
@@ -2707,6 +2921,7 @@ def _append_explainability_report(
     result["content"] = _compose_reroute_report_content(
         payload=result,
         public_txt_path=public_txt_path,
+        import_lines_path=import_lines_path,
         explain_report=str(explain_report or ""),
     )
     return result
@@ -4308,15 +4523,29 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         )
     public_txt_path = ""
     import_lines_path = ""
+    failed_txt_path = ""
     routed_internal_path = ""
-    try:
-        routed_internal_path = str(payload.get("routedBoardDataFilePath") or "")
-        if not routed_internal_path and isinstance(payload.get("rerouteResult"), dict):
-            routed_internal_path = str(payload["rerouteResult"].get("routedBoardDataFilePath") or "")
-        drc_passed = False
-        if isinstance(payload.get("rerouteResult"), dict) and "drcPassed" in payload["rerouteResult"]:
-            drc_passed = payload["rerouteResult"].get("drcPassed") is True
-        if drc_passed:
+    latest_filled_board_path = ""
+    drc_passed: bool | None = None
+    routed_internal_path = str(payload.get("routedBoardDataFilePath") or "")
+    if not routed_internal_path and isinstance(payload.get("rerouteResult"), dict):
+        routed_internal_path = str(payload["rerouteResult"].get("routedBoardDataFilePath") or "")
+    if isinstance(payload.get("rerouteResult"), dict) and "drcPassed" in payload["rerouteResult"]:
+        drc_passed = payload["rerouteResult"].get("drcPassed") is True
+    latest_filled_board_path = _latest_reroute_filled_board_path(payload)
+
+    drc_agent_board_path = routed_internal_path if drc_passed is True else latest_filled_board_path
+    if drc_passed is not None:
+        payload = _append_drc_agent_report(
+            payload,
+            board_path=drc_agent_board_path,
+            output_dir=output_dir,
+            session_id=session_id or "session",
+            target_bga=_reroute_target_bga_for_drc_agent(user_data_obj, cached, local_context),
+        )
+
+    if drc_passed is True:
+        try:
             public_txt_path, notes = _convert_internal_kicad_to_public_txt(
                 kicad_path=routed_internal_path,
                 output_dir=output_dir,
@@ -4337,19 +4566,52 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
                     passed=False,
                     detail="DRC 已通过，但未生成轻量增量导入文件，因此不会调用 importLines。",
                 )
-    except Exception as exc:
-        logger.warning("Failed converting reroute result to public txt: %s", exc)
-        payload = _append_reroute_check(
-            payload,
-            name="txt_output_conversion",
-            passed=False,
-            detail=f"输出 txt 转换失败：{exc}",
-        )
-    explain_board_path = routed_internal_path or str(original_board_path or dropped_board_path or "")
+        except Exception as exc:
+            logger.warning("Failed converting reroute result to public txt: %s", exc)
+            payload = _append_reroute_check(
+                payload,
+                name="txt_output_conversion",
+                passed=False,
+                detail=f"输出 txt 转换失败：{exc}",
+            )
+    elif drc_passed is False and latest_filled_board_path:
+        try:
+            failed_txt_path, notes = _convert_internal_kicad_to_public_txt(
+                kicad_path=latest_filled_board_path,
+                output_dir=output_dir,
+                session_id=session_id or "session",
+                output_subdir="failed_txt",
+            )
+            conversion_notes.extend(notes)
+            if failed_txt_path:
+                reroute_result = dict(payload.get("rerouteResult") or {})
+                reroute_result["drcFailedLayoutTxtFilePath"] = failed_txt_path
+                payload["rerouteResult"] = reroute_result
+            else:
+                payload = _append_reroute_check(
+                    payload,
+                    name="failed_txt_output_conversion",
+                    passed=False,
+                    detail="DRC 未通过，且最后一次模型回填结果未能转换成 failed_txt 输出。",
+                )
+        except Exception as exc:
+            logger.warning("Failed converting failed reroute result to txt: %s", exc)
+            payload = _append_reroute_check(
+                payload,
+                name="failed_txt_output_conversion",
+                passed=False,
+                detail=f"DRC 未通过，失败回填 txt 转换失败：{exc}",
+            )
+    explain_board_path = (
+        routed_internal_path
+        if drc_passed is True
+        else latest_filled_board_path or routed_internal_path or str(original_board_path or dropped_board_path or "")
+    )
     payload = _append_explainability_report(
         payload,
         internal_board_path=explain_board_path,
-        public_txt_path=import_lines_path,
+        public_txt_path=public_txt_path,
+        import_lines_path=import_lines_path,
     )
     public_payload = _public_reroute_payload(payload, public_txt_path, import_lines_path)
     pending_fields = _pending_reroute_fields_for_frontend(public_payload, public_txt_path, import_lines_path)

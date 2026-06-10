@@ -36,6 +36,12 @@ def _assert_route_summary(result: str, report: str, routing_path: Path, session_
     assert pcb_tools._transport.pop_pending_pcb_fields(session_id) == pending
 
 
+def _router_call_executable_name(call: list[str]) -> str:
+    if call and Path(call[0]).name.startswith("python") and len(call) > 1:
+        return Path(call[1]).name
+    return Path(call[0]).name
+
+
 def test_read_router_report_uses_statistical_output_when_data_txt_missing(tmp_path):
     (tmp_path / "statistical.out").write_text(
         "布线失败的引脚个数:2个\n"
@@ -172,6 +178,21 @@ def _restore_transport_state(monkeypatch):
         pcb_tools,
         "generate_explain_report",
         lambda **kwargs: "测试可解释性报告：来自本地 explain 分类模型。",
+    )
+    monkeypatch.setattr(
+        pcb_tools,
+        "generate_drc_agent_report",
+        lambda **kwargs: {
+            "ok": True,
+            "json_path": str(Path(kwargs["output_dir"]) / "drc_agent_report" / "mock_drc_agent.json"),
+            "payload": {
+                "schema_version": "drc_agent_v2",
+                "language": "zh-CN",
+                "message_zh": "DRC规则检查结果：mock hard 规则报告。",
+                "result": {"hard_issue_count": 0},
+                "issues": [],
+            },
+        },
     )
     yield
     transport.current_session_id = prev_session
@@ -621,7 +642,7 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
         "U27\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
     )
     assert (work_dir / "constrain.txt").read_text(encoding="utf-8") == "PROFILE_CONSTRAINT\n"
-    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == ["c.out"]
+    assert [_router_call_executable_name(call) for call in calls] == ["c.out"]
 
 
 def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
@@ -683,7 +704,7 @@ def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
     assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-135-route"]
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U22\n"
     assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "U22\n1\n1\nVCC SIG04 2"
-    assert [Path(call[0]).name if not call[0].endswith("python.exe") else Path(call[1]).name for call in calls] == [
+    assert [_router_call_executable_name(call) for call in calls] == [
         "d.out",
         "e.out",
         "f.out",
@@ -1660,10 +1681,13 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     assert payload["checkReport"]["passed"] is True
     assert "DRC 分析" in payload["content"]
     assert "DRC 状态: 通过" in payload["content"]
+    assert "DRC规则检查结果：mock hard 规则报告。" in payload["content"]
     assert "txt 输出: 已生成" in payload["content"]
+    assert str(tmp_path / "routed.txt") in payload["content"]
     assert "importLines: 允许" in payload["content"]
     assert "Explain 模型可解释性报告" in payload["content"]
     assert "测试可解释性报告：来自本地 explain 分类模型。" in payload["content"]
+    assert payload["rerouteResult"]["drcAgentReport"]["ok"] is True
 
 
 def test_reroute_drc_pass_without_txt_marks_failure(monkeypatch, tmp_path):
@@ -1892,14 +1916,22 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
         return payload
 
     def _fake_validate(**kwargs):
+        filled_path = tmp_path / f"filled_iter{kwargs['iteration']}.kicad_pcb"
+        filled_path.write_text("(kicad_pcb\n)\n", encoding="utf-8")
         return pcb_reroute_drc.RerouteDrcAttempt(
             iteration=kwargs["iteration"],
             passed=False,
+            filled_board_data_file_path=str(filled_path),
             failure_summary=f"iteration {kwargs['iteration']} failed",
         )
 
     def _fake_convert(**kwargs):
-        raise AssertionError("DRC failure must not export txt for importLines")
+        assert kwargs.get("output_subdir") == "failed_txt"
+        txt_dir = tmp_path / "failed_txt"
+        txt_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = txt_dir / "filled_iter2.txt"
+        txt_path.write_text("(layout failed)", encoding="utf-8")
+        return str(txt_path), []
 
     monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
@@ -1911,6 +1943,8 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     assert payload["rerouteResult"]["drcPassed"] is False
     assert "routedLayoutTxtFilePath" not in payload["rerouteResult"]
     assert "routedLayoutTxtFilePath" not in payload
+    assert "importLinesFilePath" not in payload
+    assert Path(payload["rerouteResult"]["drcFailedLayoutTxtFilePath"]).parent.name == "failed_txt"
     assert "routedBoardDataFilePath" not in payload["rerouteResult"]
     assert payload["rerouteResult"]["drcFailureReasons"] == ["iteration 1 failed", "iteration 2 failed"]
     assert ".kicad_pcb" not in json.dumps(payload, ensure_ascii=False)
@@ -1919,5 +1953,6 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     assert "DRC 状态: 未通过" in payload["content"]
     assert "iteration 2 failed" in payload["content"]
     assert "txt 输出: 未生成" in payload["content"]
+    assert "失败回填txt: 已保存" in payload["content"]
     assert "importLines: 不允许" in payload["content"]
     assert "Explain 模型可解释性报告" in payload["content"]

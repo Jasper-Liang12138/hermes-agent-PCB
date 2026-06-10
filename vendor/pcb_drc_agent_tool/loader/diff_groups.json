@@ -1,0 +1,12 @@
+{
+  "diff_groups": [
+    {
+      "name": "CLK_GROUP",
+      "pairs": ["CLK"],
+      "same_layer_escape": {
+        "enabled": true,
+        "scope": "first_escape"
+      }
+    }
+  ]
+}

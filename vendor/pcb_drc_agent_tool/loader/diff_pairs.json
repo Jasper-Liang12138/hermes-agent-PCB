@@ -1,0 +1,14 @@
+{
+  "diff_pairs": [
+    {
+      "name": "CLK",
+      "p_net": "CLK+",
+      "n_net": "CLK-"
+    },
+    {
+      "name": "CLK2",
+      "p_net": "CLK2+",
+      "n_net": "CLK2-"
+    }
+  ]
+}
