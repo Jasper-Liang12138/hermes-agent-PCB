@@ -283,7 +283,8 @@ sequenceDiagram
 6. 写入本次版图输入和 `order_input.txt`。
 7. 优先调用 `tools.pcb_bjut_router.run_bjut_route`。
 8. 若 BJUT 不可用且 routerType 是 `arc`/`135`，回退到旧 `_run_arc_router` / `_run_135_router`。
-9. 将 `routingResult`、`importLinesFilePath`、`report` 写入 pending PCB fields，返回短报告。
+9. 若主布线器失败且当前平台可执行 `pcbrouter`，调用 `tools.pcb_local_router.run_pcbrouter_local_route` 做局部布线兜底。
+10. 将 `routingResult`、可选 `importLinesFilePath`、`report` 写入 pending PCB fields，返回短报告。
 
 `run_bjut_route` 内部会再次运行完整三段 router pipeline：
 
@@ -326,6 +327,7 @@ sequenceDiagram
 
 - 优先用 `importLinesFilePath`。
 - 如果只有 `routingResult` 且文件名是 `routing_input.txt`，会跳过 `importLines`，因为它不是前端导入记录格式。
+- 如果只有 `routingResult` 且文件后缀是 `.kicad_pcb`，表示局部 pcbrouter 已经输出完整 KiCad PCB 文件，也会跳过 `importLines`。
 - 调用前端工具 `importLines(filePath, successPins, failedPins)`，并把导入成功/失败状态追加到最终回复。
 
 最终消息会把字段放进 `##PCB_FIELDS##`，WebSocket adapter 再通过 `_extract_pcb_fields` / `_collect_pcb_fields` 提取到消息 body，使前端可以直接读取 `selection`、`fanoutParams`、`routingResult`、`report` 等字段。
@@ -383,7 +385,7 @@ sequenceDiagram
 
 - `routingResult` 指向布线结果大文件，常见为 `router_work/routing_input.txt`。
 - `importLinesFilePath` 指向前端可导入的原始布线记录，例如 `ARC_output.txt`。
-- adapter 会优先用 `importLinesFilePath` 调用前端 `importLines`。
+- adapter 会优先用 `importLinesFilePath` 调用前端 `importLines`；若 pcbrouter 兜底只返回完整 `.kicad_pcb`，adapter 会保留 `routingResult` 并跳过 `importLines`。
 
 ## 现有测试锚点
 
@@ -409,4 +411,3 @@ sequenceDiagram
 5. 修改 `routerType` 枚举时，需要同时更新 `websocket.py`、`pcb_bjut_router.py`、`pcb_tools.py`、skill 文档和测试。
 6. `generate_fanout_params` 和 `run_bjut_route` 都会运行 layer/order 工具；如果以后要复用中间文件，需要额外设计缓存一致性和清理策略。
 7. 当前工作目录、router 目录和相对路径解析都依赖 `config.ini` 与环境变量；跨机器部署时优先检查 `[router]` 配置。
-

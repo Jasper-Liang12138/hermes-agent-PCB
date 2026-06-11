@@ -1593,6 +1593,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             return ""
         if Path(import_file).name.lower() in {"routing_input.txt", "routinginput.txt"}:
             return f"已生成布线结果，但导入文件不是布线器导入记录格式，已跳过 importLines：{import_file}"
+        if not fields.get("importLinesFilePath") and Path(import_file).suffix.lower() == ".kicad_pcb":
+            return f"已生成完整 KiCad PCB 结果，已跳过 importLines：{import_file}"
 
         import_key = self._import_lines_key(session_id, import_file)
         cached = self._import_lines_results.get(import_key)

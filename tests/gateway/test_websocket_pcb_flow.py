@@ -1830,6 +1830,26 @@ async def test_import_fanout_result_calls_import_lines():
 
 
 @pytest.mark.asyncio
+async def test_import_fanout_result_skips_complete_kicad_pcb(tmp_path):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-complete-kicad-pcb"
+    adapter._connections[session_id] = (ws, "proj-complete-kicad-pcb")
+    routed_board = tmp_path / "output.fake.kicad_pcb"
+    routed_board.write_text("(kicad_pcb)\n", encoding="utf-8")
+
+    status = await adapter._import_fanout_result(
+        session_id,
+        {"successPins": ["U27.B13"], "failedPins": []},
+        {"routingResult": str(routed_board)},
+    )
+
+    assert "已生成完整 KiCad PCB 结果" in status
+    assert "已跳过 importLines" in status
+    assert not [item for item in ws.sent if item.get("type") == "tool-calls"]
+
+
+@pytest.mark.asyncio
 async def test_import_fanout_result_dedupes_same_file(tmp_path):
     adapter = _make_adapter()
     ws = _FakeWS()

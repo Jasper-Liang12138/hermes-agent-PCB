@@ -1331,6 +1331,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
                 "report": "缺少 routerType，请选择布线器：arc、135、rl、rl_arc、rl_135",
             }, ensure_ascii=False)
         from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_route
+        from tools import pcb_local_router
 
         if router_type not in SUPPORTED_ROUTER_TYPES:
             return json.dumps({
@@ -1364,30 +1365,67 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         fanout_params.setdefault("orderLines", order_lines)
         fanout_params.setdefault("constraints", constraints or {})
 
-        if bjut_router_available(router_type, work_dir=work_dir):
-            bjut_outputs = run_bjut_route(
+        routing_result_path: Path
+        import_lines_path: Path | None = None
+        report = ""
+
+        def _run_pcbrouter_fallback(primary_error: Exception | None = None):
+            if not pcb_local_router.pcbrouter_available():
+                if primary_error is not None:
+                    raise primary_error
+                raise RuntimeError("pcbrouter 局部布线兜底不可用")
+            fallback_outputs = pcb_local_router.run_pcbrouter_local_route(
                 project_data=project_data,
                 fanout_params=fanout_params,
                 work_dir=work_dir,
+                source_board_path=_transport.get_cached_project_data_path(session_id=session_id) or "",
             )
-            routing_result_path = bjut_outputs.routing_result_path
-            import_lines_path = bjut_outputs.import_lines_path
-            report = bjut_outputs.report
-        elif router_type in {"arc", "135"}:
-            if router_type == "arc":
-                _run_arc_router(
-                    work_dir,
-                    _router_profile_dir("arc", work_dir),
-                    component_refdes,
-                    constraints,
-                    order_lines,
-                    project_data,
+            fallback_report = fallback_outputs.report
+            if primary_error is not None:
+                primary_report = _router_error_report(primary_error, router_type or "未知", component_refdes or "未知器件")
+                fallback_report = (
+                    f"{primary_report}\n"
+                    f"已切换到 pcbrouter 局部布线兜底。\n"
+                    f"{fallback_report}"
                 )
-            else:
-                _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
-            routing_result_path = _router_result_path(work_dir)
-            import_lines_path = _router_import_lines_path(work_dir, router_type, constraints)
-            report = _read_router_report(work_dir)
+            return fallback_outputs.routing_result_path, fallback_outputs.import_lines_path, fallback_report
+
+        if bjut_router_available(router_type, work_dir=work_dir):
+            try:
+                bjut_outputs = run_bjut_route(
+                    project_data=project_data,
+                    fanout_params=fanout_params,
+                    work_dir=work_dir,
+                )
+                routing_result_path = bjut_outputs.routing_result_path
+                import_lines_path = bjut_outputs.import_lines_path
+                report = bjut_outputs.report
+            except Exception as exc:
+                routing_result_path, import_lines_path, report = _run_pcbrouter_fallback(exc)
+        elif router_type in {"arc", "135"}:
+            try:
+                if router_type == "arc":
+                    _run_arc_router(
+                        work_dir,
+                        _router_profile_dir("arc", work_dir),
+                        component_refdes,
+                        constraints,
+                        order_lines,
+                        project_data,
+                    )
+                else:
+                    _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
+                routing_result_path = _router_result_path(work_dir)
+                import_lines_path = _router_import_lines_path(work_dir, router_type, constraints)
+                report = _read_router_report(work_dir)
+            except Exception as exc:
+                routing_result_path, import_lines_path, report = _run_pcbrouter_fallback(exc)
+        elif pcb_local_router.pcbrouter_available():
+            primary_error = RuntimeError(
+                f"{router_type} 布线器目录未配置或缺少 BJUT 可执行文件；"
+                "请检查 config.ini 的 rl_*_dir 配置。"
+            )
+            routing_result_path, import_lines_path, report = _run_pcbrouter_fallback(primary_error)
         else:
             return json.dumps({
                 "routingResult": "",
@@ -1400,20 +1438,25 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         # Step 6: 传递输出文件路径，避免通过 WebSocket 发送大块版图文本
         routing_result_size = routing_result_path.stat().st_size
         report_text = str(report or "").strip().rstrip("。")
-        _transport.set_pending_pcb_fields(
-            {
-                "routingResult": str(routing_result_path),
-                "importLinesFilePath": str(import_lines_path),
-                "report": report_text or "布线完成（无详细报告）",
-            },
-            session_id=session_id,
-        )
+        pending_fields = {
+            "routingResult": str(routing_result_path),
+            "report": report_text or "布线完成（无详细报告）",
+        }
+        if import_lines_path:
+            pending_fields["importLinesFilePath"] = str(import_lines_path)
+        _transport.set_pending_pcb_fields(pending_fields, session_id=session_id)
         summary = report_text if report_text.startswith("布线完成") else f"布线完成。{report_text}"
+        if import_lines_path:
+            import_detail = f"EDA 导入使用布线器原始记录文件 {import_lines_path}。"
+        elif routing_result_path.suffix.lower() == ".kicad_pcb":
+            import_detail = "未生成单独 EDA 导入记录，已返回完整 KiCad PCB 文件，前端将跳过 importLines 导入。"
+        else:
+            import_detail = "未生成单独 EDA 导入记录，前端将使用 routingResult 尝试导入。"
         return (
             f"{summary}。"
             f"完整布线数据已由系统通过 WebSocket 结构化字段发送给前端，"
             f"数据文件 {routing_result_path}，大小 {routing_result_size} 字节；"
-            f"EDA 导入使用布线器原始记录文件 {import_lines_path}。"
+            f"{import_detail}"
         )
 
     except subprocess.TimeoutExpired:
