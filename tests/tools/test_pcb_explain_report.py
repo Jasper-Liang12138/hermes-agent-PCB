@@ -44,6 +44,30 @@ def test_generate_explain_report_runs_local_classifier(monkeypatch, tmp_path):
     assert captured["output_root"] == output_root
 
 
+def test_classifier_report_uses_real_fields_without_fixed_quality_claims(tmp_path):
+    classifier = pytest.importorskip("tools.pcb_explain_classifier.infer_ascend_multiview_classifier")
+    image_paths = [tmp_path / "overview.png", tmp_path / "Top.png", tmp_path / "Bottom.png"]
+
+    report = classifier.build_report_text(
+        predicted_label=1,
+        probability_positive=0.875,
+        image_paths=image_paths,
+        export_dir=tmp_path / "exported_board",
+    )
+
+    assert "本地布线质量分类报告" in report
+    assert "预测结果: 布线较好" in report
+    assert "布线较好概率: 0.875000" in report
+    assert "当前预测置信度: 0.875000" in report
+    assert "层数: 2" in report
+    assert "视图数: 3" in report
+    assert str(tmp_path / "exported_board") in report
+    assert "未给出更细粒度差异解释" in report
+    assert "走线较顺畅" not in report
+    assert "via 使用较为均衡" not in report
+    assert "绕行少" not in report
+
+
 def test_resolve_checkpoint_from_config(monkeypatch, tmp_path):
     monkeypatch.delenv("PCB_EXPLAIN_CHECKPOINT", raising=False)
     parser = configparser.ConfigParser()

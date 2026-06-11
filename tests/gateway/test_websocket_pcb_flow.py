@@ -65,6 +65,10 @@ def _tool_result(call_id: str, result) -> str:
     )
 
 
+def _valid_reroute_import_text() -> str:
+    return "TOP!LINE!0!net13!10.00!10.00!20.00!20.00!6.00\n"
+
+
 def _user_message_camel_project(session_id: str, project_id: str, content: str) -> dict[str, Any]:
     return {
         "sessionId": session_id,
@@ -113,7 +117,7 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
 async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     """Covers Agent-loop selection -> fanoutParams -> routingResult over real WebSocket I/O."""
     port = _free_port()
-    adapter = _make_adapter(port)
+    adapter = _make_adapter(port, bootstrap_get_project=False)
 
     session_id = "sess-pcb-1"
     project_id = "proj-autotest-001"
@@ -171,6 +175,14 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
         raise AssertionError(f"Unexpected Agent-loop event text: {text}")
 
     adapter.set_message_handler(handler)
+    async def fake_direct_fanout_step(session_id: str, user_text: str) -> bool:
+        return False
+
+    async def fake_cached_fanout_route(session_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_run_direct_fanout_param_step", fake_direct_fanout_step)
+    monkeypatch.setattr(adapter, "_run_cached_fanout_route", fake_cached_fanout_route)
     await adapter.connect()
 
     try:
@@ -343,6 +355,28 @@ def test_websocket_escape_routing_phrase_without_hash_forces_global_fanout():
     assert decision.bootstrap_get_project is True
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "对U5逃逸布线",
+        "对 U5 逃逸布线",
+        "帮我对U5做BGA逃逸布线",
+        "给 U5 做 fanout",
+        "U5 扇出",
+    ],
+)
+def test_targeted_bga_natural_language_forces_global_fanout(text):
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-targeted-fanout", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_entry"
+    assert decision.reason == "forced_global_fanout"
+    assert decision.bootstrap_get_project is True
+    assert adapter._session_requested_bga_targets["sess-targeted-fanout"] == "U5"
+
+
 @pytest.mark.parametrize("text", ["什么是逃逸布线", "不要布线，只解释一下逃逸布线原理"])
 def test_escape_routing_concept_or_noop_does_not_force_global_fanout(text):
     adapter = _make_adapter()
@@ -351,6 +385,16 @@ def test_escape_routing_concept_or_noop_does_not_force_global_fanout(text):
 
     assert decision.mode == "chat"
     assert decision.reason != "forced_global_fanout"
+
+
+def test_targeted_bga_concept_question_stays_chat():
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-targeted-chat", "什么是 U5 逃逸布线")
+
+    assert decision.mode == "chat"
+    assert decision.reason != "forced_global_fanout"
+    assert "sess-targeted-chat" not in adapter._session_requested_bga_targets
 
 
 def test_websocket_reroute_interrupts_pending_fanout_confirmation():
@@ -571,7 +615,7 @@ async def _run_websocket_reroute_fields_round_trip() -> None:
     project_id = "proj-reroute-001"
     observed_auto_skill: list[str | None] = []
     import_file = Path(tempfile.gettempdir()) / "hermes_test_reroute_import_fields.txt"
-    import_file.write_text("(wires\n)\n", encoding="utf-8")
+    import_file.write_text(_valid_reroute_import_text(), encoding="utf-8")
 
     reroute_fields = {
         "rerouteResult": {
@@ -943,7 +987,7 @@ def test_websocket_turn_options_passthrough():
 async def _run_websocket_selection_stage_fail_closed() -> None:
     """选择阶段收到“确认”应经 agent loop 返回纠偏提示。"""
     port = _free_port()
-    adapter = _make_adapter(port)
+    adapter = _make_adapter(port, bootstrap_get_project=False)
 
     session_id = "sess-fsm-1"
     project_id = "proj-fsm-001"
@@ -976,7 +1020,7 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 second = await _recv_json(ws)
                 assert second["type"] == "message"
-                assert "执行布线前必须先选择走线算法和层分配/逃逸顺序生成模块" in second["body"]["content"]
+                assert "当前还在选择阶段，请先回复器件" in second["body"]["content"]
     finally:
         await adapter.disconnect()
 
@@ -988,7 +1032,7 @@ def test_websocket_selection_stage_fail_closed():
 async def _run_websocket_selection_accepts_non_u_refdes() -> None:
     """Agent-loop 选择阶段应接受 selection 列表里的任意合法位号，而不只 U+数字。"""
     port = _free_port()
-    adapter = _make_adapter(port)
+    adapter = _make_adapter(port, bootstrap_get_project=False)
 
     session_id = "sess-fsm-fpga"
     project_id = "proj-fsm-fpga"
@@ -1892,7 +1936,7 @@ async def test_import_reroute_prefers_incremental_import_file(tmp_path):
     layout_file = tmp_path / "routed_layout.txt"
     layout_file.write_text("(layout routed)\n", encoding="utf-8")
     import_file = tmp_path / "reroute_import.txt"
-    import_file.write_text("(wires\n)\n", encoding="utf-8")
+    import_file.write_text(_valid_reroute_import_text(), encoding="utf-8")
 
     fields = {
         "rerouteResult": {
@@ -2020,7 +2064,8 @@ def test_rule_validation_rejects_llm_chat_for_strong_pcb_request():
     )
 
     assert decision.mode == "pcb"
-    assert decision.reason == "pcb_entry"
+    assert decision.reason == "forced_global_fanout"
+    assert adapter._session_requested_bga_targets["sess-llm-guard-1"] == "U27"
     assert decision.bootstrap_get_project is True
 
 
@@ -2148,13 +2193,14 @@ async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(mon
         "proj-llm-1",
     )
 
-    assert seen["auto_skill"] == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+    assert seen["auto_skill"] == ["hardware/pcb-intelligence"]
     assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
+    assert "forced_skill: global_fanout" in seen["text"]
     assert "projectid: proj-llm-1" in seen["text"]
     assert "帮我对U27做BGA逃逸布线" in seen["text"]
 
 
-@pytest.mark.parametrize("content", ["#逃逸布线", "#全局fanout", "逃逸布线"])
+@pytest.mark.parametrize("content", ["#逃逸布线", "#全局fanout", "逃逸布线", "对U5逃逸布线"])
 @pytest.mark.asyncio
 async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monkeypatch, content):
     adapter = _make_adapter(route_intent_llm_enabled=True)
@@ -2191,6 +2237,80 @@ async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monk
     assert "projectid: proj-forced-fanout" in seen["text"]
     assert adapter._session_modes["sess-forced-fanout"] == "pcb"
     assert sent == [("sess-forced-fanout", "已进入全局 BGA fanout/逃逸布线流程，正在获取版图信息。")]
+
+
+@pytest.mark.asyncio
+async def test_direct_bga_analysis_uses_requested_target(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-requested-bga"
+    sent = []
+
+    async def fake_send(*, chat_id, content, **kwargs):
+        sent.append((chat_id, content))
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    from tools import pcb_chunking_tool
+
+    monkeypatch.setattr(
+        pcb_chunking_tool,
+        "_extract_bga",
+        lambda *args, **kwargs: json.dumps(
+            {
+                "selection": [
+                    {"label": "U5", "detail": "BGA candidate"},
+                    {"label": "U7", "detail": "BGA candidate"},
+                ],
+                "boardSummary": {"components": [{"refdes": "U5"}, {"refdes": "U7"}]},
+                "fanoutContext": {},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    adapter._session_requested_bga_targets[session_id] = "U5"
+
+    handled = await adapter._run_direct_bga_analysis(session_id, {"projectData": "cached"})
+
+    assert handled is True
+    assert adapter._session_selected_targets[session_id] == "U5"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert sent
+    assert "已选择目标 BGA：U5" in sent[-1][1]
+    assert "请选择走线算法类型" in sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_direct_bga_analysis_reports_missing_requested_target(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-missing-requested-bga"
+    sent = []
+
+    async def fake_send(*, chat_id, content, **kwargs):
+        sent.append((chat_id, content))
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    from tools import pcb_chunking_tool
+
+    monkeypatch.setattr(
+        pcb_chunking_tool,
+        "_extract_bga",
+        lambda *args, **kwargs: json.dumps(
+            {
+                "selection": [{"label": "U7", "detail": "BGA candidate"}],
+                "boardSummary": {},
+                "fanoutContext": {},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    adapter._session_requested_bga_targets[session_id] = "U5"
+
+    handled = await adapter._run_direct_bga_analysis(session_id, {"projectData": "cached"})
+
+    assert handled is True
+    assert session_id not in adapter._session_selected_targets
+    assert adapter._session_flow_states[session_id] == "wait_selection"
+    assert "未在 BGA 候选中找到 U5" in sent[-1][1]
+    assert "候选 BGA：U7" in sent[-1][1]
 
 
 @pytest.mark.asyncio

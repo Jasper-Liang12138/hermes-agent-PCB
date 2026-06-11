@@ -163,6 +163,15 @@ _FORCE_REROUTE_TAG_RE = re.compile(
     r"(?:#|＃)\s*(?:reroute|拆线\s*重布)(?=$|[\s,，。；;:：])",
     re.IGNORECASE,
 )
+_TARGETED_GLOBAL_FANOUT_RE = re.compile(
+    r"(?:对|给|帮我对|请对|目标\s*BGA\s*(?:是|为|:|：)?\s*)\s*([A-Za-z][A-Za-z0-9_-]*\d+)\s*"
+    r".{0,20}(?:BGA\s*)?(?:逃逸\s*布线|逃逸|扇出|fanout|route|布线)",
+    re.IGNORECASE,
+)
+_TARGETED_GLOBAL_FANOUT_PREFIX_RE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_-]*\d+)\s*(?:BGA\s*)?(?:逃逸\s*布线|逃逸|扇出|fanout|route|布线)\s*$",
+    re.IGNORECASE,
+)
 _REROUTE_SHORT_COMMAND_RE = re.compile(
     r"^\s*(?:拆线\s*重布|重布|重新布线|reroute)\s*$",
     re.IGNORECASE,
@@ -335,6 +344,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_flow_states: Dict[str, str] = {}
         self._session_selection_labels: Dict[str, Tuple[str, ...]] = {}
         self._session_selected_targets: Dict[str, str] = {}
+        self._session_requested_bga_targets: Dict[str, str] = {}
         self._session_router_types: Dict[str, str] = {}
         self._session_route_algorithms: Dict[str, str] = {}
         self._session_fanout_modules: Dict[str, str] = {}
@@ -1038,6 +1048,40 @@ class WebSocketAdapter(BasePlatformAdapter):
             self._session_selection_labels[session_id] = tuple(labels)
 
         self._session_selected_targets.pop(session_id, None)
+        requested_target = self._session_requested_bga_targets.get(session_id, "")
+        if requested_target:
+            matched_label = self._match_requested_bga_label(requested_target, labels)
+            if matched_label:
+                self._session_selected_targets[session_id] = matched_label
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+                await self.send(
+                    chat_id=session_id,
+                    content=(
+                        f"{self._router_type_prompt(session_id)}\n\n"
+                        "##PCB_FIELDS##\n"
+                        f"{json.dumps(fields, ensure_ascii=False)}\n"
+                        "##PCB_FIELDS_END##"
+                    ),
+                )
+                return True
+
+            visible = f"未在 BGA 候选中找到 {requested_target}，请从候选 BGA 中选择目标器件。"
+            if labels:
+                visible += "\n候选 BGA：" + "、".join(labels)
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
+            await self.send(
+                chat_id=session_id,
+                content=(
+                    f"{visible}\n\n"
+                    "##PCB_FIELDS##\n"
+                    f"{json.dumps(fields, ensure_ascii=False)}\n"
+                    "##PCB_FIELDS_END##"
+                ),
+            )
+            return True
+
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_SELECTION)
         visible = "已识别到 BGA 候选，请选择目标器件。"
@@ -1809,7 +1853,9 @@ class WebSocketAdapter(BasePlatformAdapter):
 
         if prefix.startswith("(layout"):
             return "该文件是完整 PCB layout，不是轻量布线增量文件"
-        if size > 1_000_000 and not prefix.startswith("(wires") and "!" not in prefix:
+        if prefix.startswith("(wires"):
+            return "该文件是 PCB Builder wires 子结构，不是 importLines 可识别的 line.out/ARC_output 原生记录"
+        if size > 1_000_000 and "!" not in prefix:
             return f"文件过大且不像 importLines 增量格式：{size} bytes"
         return ""
 
@@ -2627,6 +2673,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._set_flow_state(session_id, _FLOW_IDLE)
         self._session_selection_labels.pop(session_id, None)
         self._session_selected_targets.pop(session_id, None)
+        self._session_requested_bga_targets.pop(session_id, None)
         self._session_router_types.pop(session_id, None)
         self._session_route_algorithms.pop(session_id, None)
         self._session_fanout_modules.pop(session_id, None)
@@ -2666,10 +2713,36 @@ class WebSocketAdapter(BasePlatformAdapter):
         text = text or ""
         if _FORCE_GLOBAL_FANOUT_TAG_RE.search(text):
             return True
+        if WebSocketAdapter._extract_targeted_global_fanout_refdes(text):
+            return True
         if _PCB_CONCEPT_QUESTION_RE.search(text) or _CHAT_ONLY_RE.search(text):
             return False
         compact = re.sub(r"\s+", "", text.strip().lower())
         return compact in {"逃逸布线", "bga逃逸布线", "pcb逃逸布线"}
+
+    @staticmethod
+    def _extract_targeted_global_fanout_refdes(text: str) -> str:
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        if _PCB_CONCEPT_QUESTION_RE.search(text) or _CHAT_ONLY_RE.search(text):
+            return ""
+        for pattern in (_TARGETED_GLOBAL_FANOUT_RE, _TARGETED_GLOBAL_FANOUT_PREFIX_RE):
+            match = pattern.search(text)
+            if match:
+                return WebSocketAdapter._sanitize_selection_candidate(match.group(1)).upper()
+        return ""
+
+    @staticmethod
+    def _match_requested_bga_label(requested: str, labels: list[str]) -> str:
+        requested_key = WebSocketAdapter._sanitize_selection_candidate(requested).casefold()
+        if not requested_key:
+            return ""
+        for label in labels:
+            clean = WebSocketAdapter._sanitize_selection_candidate(label)
+            if clean.casefold() == requested_key:
+                return label
+        return ""
 
     @staticmethod
     def _is_explicit_cancel_flow(text: str) -> bool:
@@ -3652,8 +3725,19 @@ class WebSocketAdapter(BasePlatformAdapter):
                 bootstrap_get_project=False,
             )
 
-        if validated_intent == _INTENT_PCB_ENTRY and self._is_forced_global_fanout_command(text):
+        requested_fanout_target = self._extract_targeted_global_fanout_refdes(text)
+        compact_forced_fanout = re.sub(r"\s+", "", text.strip().lower())
+        explicit_forced_fanout = bool(_FORCE_GLOBAL_FANOUT_TAG_RE.search(text)) or (
+            not (_PCB_CONCEPT_QUESTION_RE.search(text) or _CHAT_ONLY_RE.search(text))
+            and compact_forced_fanout in {"逃逸布线", "bga逃逸布线", "pcb逃逸布线"}
+        )
+        if (
+            validated_intent == _INTENT_PCB_ENTRY
+            and (explicit_forced_fanout or (flow_state == _FLOW_IDLE and requested_fanout_target))
+        ):
             self._reset_flow(session_id)
+            if requested_fanout_target:
+                self._session_requested_bga_targets[session_id] = requested_fanout_target
             self._set_session_mode(session_id, _ROUTE_MODE_PCB)
             return _RouteDecision(
                 mode=_ROUTE_MODE_PCB,
