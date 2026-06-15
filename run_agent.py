@@ -8142,6 +8142,27 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
+            _swsd_workflow = None
+            try:
+                if self.session_id:
+                    _swsd_db = self._session_db
+                    if _swsd_db is None:
+                        from hermes_state import SessionDB
+                        _swsd_db = SessionDB()
+                    _swsd_workflow = _swsd_db.get_workflow_state(self.session_id)
+                    if _swsd_workflow:
+                        _swsd_db.append_workflow_event(
+                            session_id=self.session_id,
+                            workflow_id=_swsd_workflow.get("workflow_id", ""),
+                            event_type="tool_selected",
+                            from_state=_swsd_workflow.get("current_state", ""),
+                            to_state=_swsd_workflow.get("current_state", ""),
+                            action_type="tool",
+                            payload={"tool": function_name, "args": function_args},
+                        )
+            except Exception as exc:
+                logger.debug("SWSD tool_selected event skipped: %s", exc)
+
             self._current_tool = function_name
             self._touch_activity(f"executing tool: {function_name}")
 
@@ -8372,6 +8393,30 @@ class AIAgent:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+
+            try:
+                if self.session_id and _swsd_workflow:
+                    _swsd_db = self._session_db
+                    if _swsd_db is None:
+                        from hermes_state import SessionDB
+                        _swsd_db = SessionDB()
+                    _result_text = str(function_result or "")
+                    _swsd_db.append_workflow_event(
+                        session_id=self.session_id,
+                        workflow_id=_swsd_workflow.get("workflow_id", ""),
+                        event_type="tool_result",
+                        from_state=_swsd_workflow.get("current_state", ""),
+                        to_state=_swsd_workflow.get("current_state", ""),
+                        action_type="observation",
+                        payload={
+                            "tool": function_name,
+                            "isError": bool(_is_error_result),
+                            "duration": tool_duration,
+                            "resultPreview": _result_text[:1000],
+                        },
+                    )
+            except Exception as exc:
+                logger.debug("SWSD tool_result event skipped: %s", exc)
 
             if self.tool_progress_callback:
                 try:
@@ -8927,6 +8972,33 @@ class AIAgent:
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
+        _swsd_user_context = ""
+        try:
+            if self.session_id:
+                from hermes_state import SessionDB
+                from agent.swsd.context_packager import build_context_package
+
+                _swsd_db = self._session_db or SessionDB()
+                _workflow_state = _swsd_db.get_workflow_state(self.session_id)
+                if _workflow_state:
+                    _workflow_id = _workflow_state.get("workflow_id")
+                    _swsd_user_context = build_context_package(
+                        session_id=self.session_id,
+                        workflow_state=_workflow_state,
+                        checkpoints=_swsd_db.list_workflow_checkpoints(
+                            self.session_id,
+                            workflow_id=_workflow_id,
+                            limit=12,
+                        ),
+                        events=_swsd_db.list_workflow_events(
+                            self.session_id,
+                            workflow_id=_workflow_id,
+                            limit=20,
+                        ),
+                    )
+        except Exception as exc:
+            logger.debug("SWSD context packaging skipped: %s", exc)
+
         # Main conversation loop
         api_call_count = 0
         final_response = None
@@ -9030,6 +9102,7 @@ class AIAgent:
 
                 # Inject ephemeral context into the current turn's user message.
                 # Sources: memory manager prefetch + plugin pre_llm_call hooks
+                # + SWSD workflow context.
                 # with target="user_message" (the default).  Both are
                 # API-call-time only — the original message in `messages` is
                 # never mutated, so nothing leaks into session persistence.
@@ -9041,6 +9114,8 @@ class AIAgent:
                             _injections.append(_fenced)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
+                    if _swsd_user_context:
+                        _injections.append(_swsd_user_context)
                     if _injections:
                         _base = api_msg.get("content", "")
                         if isinstance(_base, str):

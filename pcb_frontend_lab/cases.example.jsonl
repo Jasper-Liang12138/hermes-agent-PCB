@@ -1,0 +1,4 @@
+{"id":"chat_concept_no_tools","projectid":"proj-lab-demo","turns":["BGA 和 QFP 有什么区别？"],"expect":{"no_tool_calls":true,"no_error":true}}
+{"id":"fanout_basic_protocol","projectid":"proj-lab-demo","turns":["帮我对 U27 做 BGA 逃逸布线","arc + 北科大","确认"],"tool_results":{"getProjectData":"F:\\\\PCB_QYF\\\\fixtures\\\\board_u27.sexpr","importLines":{"success":true,"message":"import finished"}},"expect":{"body_fields":["fanoutParams"],"no_error":true}}
+{"id":"reroute_no_import_on_frontend_error","projectid":"proj-lab-demo","turns":["把我框选的线删除后重新布线"],"tool_results":{"deleteTracesForRerouting":"{\"error\":\"未检测到框选走线\",\"frontendError\":{\"message\":\"未检测到框选走线\"}}"},"expect":{"tool_calls":["deleteTracesForRerouting"],"no_importLines":true}}
+

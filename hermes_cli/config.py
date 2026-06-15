@@ -445,6 +445,13 @@ DEFAULT_CONFIG = {
     # Empty model = use provider's default auxiliary model.
     # All tasks fall back to openrouter:google/gemini-3-flash-preview if
     # the configured provider is unavailable.
+    "swsd": {
+        "enabled": True,
+        "persist_checkpoints": True,
+        "history_compression_enabled": True,
+        "intent_llm_enabled": True,
+    },
+
     "auxiliary": {
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
@@ -716,7 +723,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 16,
+    "_config_version": 17,
 }
 
 # =============================================================================

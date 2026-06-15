@@ -39,9 +39,14 @@ from aiohttp import web
 import aiohttp
 
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from agent.swsd.intent_field import estimate_intent_field
+from agent.swsd.intent_policy import apply_swsd2_policy, apply_swsd3_policy, apply_swsd4_policy
+from agent.swsd.skill_grounding import retrieve_skill_memory
 from gateway.config import PlatformConfig, Platform
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
+from agent.swsd.graph import WorkflowEvent
+from agent.swsd.state_manager import WorkflowStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +155,8 @@ _FLOW_WAIT_ROUTER_TYPE = "wait_router_type"
 _FLOW_WAIT_CONFIRM = "wait_confirm"
 _FLOW_ROUTING = "routing"
 _FLOW_REROUTE = "reroute"
+_SWSD_ESCAPE_FLOW = "pcb_escape_flow"
+_SWSD_REROUTE_FLOW = "pcb_reroute_flow"
 _REROUTE_RE = re.compile(
     r"(拆线|删除.*(?:net|走线|线|trace|traces|框选|选中)|删.*(?:net|走线|线|trace|traces|框选|选中)|"
     r"重布|重新布|重走|重新走线|\breroute\b|\bripup\b|\brip-up\b)",
@@ -352,6 +359,21 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_bga_selection: Dict[str, Tuple[Dict[str, Any], ...]] = {}
         self._session_board_summaries: Dict[str, Dict[str, Any]] = {}
         self._session_fanout_contexts: Dict[str, Dict[str, Any]] = {}
+        self._swsd_enabled = self._as_bool(extra.get("swsd_enabled", True))
+        self._swsd_persist_checkpoints = self._as_bool(extra.get("swsd_persist_checkpoints", True))
+        self._swsd_intent_policy_version = str(
+            extra.get("swsd_intent_policy_version", extra.get("intent_policy_version", "swsd3"))
+        ).strip().lower()
+        self._swsd_db = None
+        self._swsd_state = WorkflowStateManager(persist=False)
+        if self._swsd_enabled and self._swsd_persist_checkpoints:
+            try:
+                from hermes_state import SessionDB
+
+                self._swsd_db = SessionDB()
+                self._swsd_state = WorkflowStateManager(self._swsd_db, persist=True)
+            except Exception:
+                logger.exception("Failed to initialize SWSD SessionDB persistence; using memory state")
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
@@ -1203,6 +1225,21 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_fanout_params[session_id] = dict(fanout_params)
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
+        self._swsd_update(
+            session_id,
+            _SWSD_ESCAPE_FLOW,
+            "escape_order",
+            self._swsd_escape_payload(
+                session_id,
+                {
+                    "fanoutParamsSource": "bjut" if bjut_fanout else ("llm" if candidate else "deterministic"),
+                    "modelStage": "tool_planning_chat" if candidate and not bjut_fanout else "",
+                },
+            ),
+            event_type="checkpoint",
+            intent="fanout_params_generated",
+            checkpoint_label="fanoutParams generated",
+        )
 
         source_hint = f"（{module} 层分配/逃逸顺序生成模块）" if module and bjut_fanout else ""
         await self.send(
@@ -1226,7 +1263,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         fanout_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         try:
-            from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+            from tools import pcb_model_runtime
 
             prompt = (
                 "请根据 PCB 版图摘要生成候选 fanoutParams。只输出 JSON 对象，不要 Markdown，不要解释。\n"
@@ -1238,17 +1275,19 @@ class WebSocketAdapter(BasePlatformAdapter):
                 f"boardSummary={json.dumps(board_summary, ensure_ascii=False)}\n"
                 f"fanoutContext={json.dumps(fanout_context, ensure_ascii=False)}"
             )
-            response = await async_call_llm(
-                provider="auto",
-                messages=[
-                    {"role": "system", "content": "你只生成 PCB fanoutParams 候选 JSON。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0,
-                max_tokens=768,
-                timeout=self._fanout_param_llm_timeout,
+            raw = await asyncio.to_thread(
+                lambda: pcb_model_runtime.chat_completion_text(
+                    stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+                    messages=[
+                        {"role": "system", "content": "你只生成 PCB fanoutParams 候选 JSON。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0,
+                    top_p=1,
+                    max_tokens=768,
+                    timeout_s=self._fanout_param_llm_timeout,
+                )[0]
             )
-            raw = extract_content_or_reasoning(response)
             data = self._parse_jsonish_object(raw)
             fields = self._collect_pcb_fields(data) if isinstance(data, dict) else {}
             fanout_params = fields.get("fanoutParams")
@@ -1478,6 +1517,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         if selected:
             self._session_selected_targets[session_id] = selected
         router_type = self._extract_router_type(str(params.get("routerType") or ""))
+        module = ""
         if router_type:
             self._session_router_types[session_id] = router_type
             algorithm = self._router_algorithm_from_type(router_type)
@@ -1488,6 +1528,15 @@ class WebSocketAdapter(BasePlatformAdapter):
                 self._session_fanout_modules[session_id] = module
         self._set_session_mode(session_id, _ROUTE_MODE_PCB)
         self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
+        self._swsd_update(
+            session_id,
+            _SWSD_ESCAPE_FLOW,
+            "escape_order",
+            self._swsd_escape_payload(session_id, {"source": "frontend_fanout_params"}),
+            event_type="checkpoint",
+            intent="fanout_params_confirmed",
+            checkpoint_label="fanoutParams from frontend",
+        )
 
     @staticmethod
     def _is_frontend_fanout_config_confirmed(content: str) -> bool:
@@ -1512,6 +1561,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         fanout_context = fields.get("fanoutContext")
         if isinstance(fanout_context, dict):
             self._session_fanout_contexts[session_id] = dict(fanout_context)
+        self._swsd_update(
+            session_id,
+            _SWSD_ESCAPE_FLOW,
+            "select_bga",
+            self._swsd_escape_payload(session_id, {"analysisFields": fields}),
+            event_type="checkpoint",
+            intent="board_analysis",
+            checkpoint_label="BGA analysis",
+        )
 
     def _known_bga_labels(self, session_id: str) -> list[str]:
         labels = list(self._session_selection_labels.get(session_id) or ())
@@ -1612,6 +1670,15 @@ class WebSocketAdapter(BasePlatformAdapter):
         if import_status:
             visible = f"{visible.rstrip()}\n{import_status}".strip()
         if fields:
+            self._swsd_update(
+                session_id,
+                _SWSD_ESCAPE_FLOW,
+                "review",
+                self._swsd_escape_payload(session_id, {"routeParams": route_params, "routeFields": fields, "importStatus": import_status}),
+                event_type="checkpoint",
+                intent="route_complete",
+                checkpoint_label="routing result",
+            )
             visible = (
                 f"{visible}\n\n"
                 "##PCB_FIELDS##\n"
@@ -2666,6 +2733,7 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     def _set_flow_state(self, session_id: str, flow_state: str) -> None:
         self._session_flow_states[session_id] = flow_state
+        self._sync_swsd_flow_state(session_id, flow_state)
 
     def _reset_flow(self, session_id: str) -> None:
         self._set_flow_state(session_id, _FLOW_IDLE)
@@ -2680,6 +2748,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._session_board_summaries.pop(session_id, None)
         self._session_fanout_contexts.pop(session_id, None)
         self._clear_import_lines_state(session_id)
+        self._swsd_update(session_id, _SWSD_ESCAPE_FLOW, "idle", {"reset": True}, event_type="reset")
+        self._swsd_update(session_id, _SWSD_REROUTE_FLOW, "idle", {"reset": True}, event_type="reset")
 
     def _clear_import_lines_state(self, session_id: str) -> None:
         for key in [key for key in self._import_lines_results if key[0] == session_id]:
@@ -2688,6 +2758,95 @@ class WebSocketAdapter(BasePlatformAdapter):
             task = self._import_lines_inflight.pop(key, None)
             if task and not task.done():
                 task.cancel()
+
+    def _swsd_escape_payload(self, session_id: str, extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "selection": list(self._session_bga_selection.get(session_id) or ()),
+            "selectedBGA": self._session_selected_targets.get(session_id, ""),
+            "requestedBGA": self._session_requested_bga_targets.get(session_id, ""),
+            "routerType": self._session_router_types.get(session_id, ""),
+            "routeAlgorithm": self._session_route_algorithms.get(session_id, ""),
+            "fanoutModule": self._session_fanout_modules.get(session_id, ""),
+            "fanoutParams": self._session_fanout_params.get(session_id, {}),
+            "boardSummary": self._session_board_summaries.get(session_id, {}),
+            "fanoutContext": self._session_fanout_contexts.get(session_id, {}),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _swsd_state_from_legacy_flow(flow_state: str) -> tuple[str, str]:
+        if flow_state == _FLOW_REROUTE:
+            return _SWSD_REROUTE_FLOW, "rip_up"
+        if flow_state == _FLOW_WAIT_SELECTION:
+            return _SWSD_ESCAPE_FLOW, "select_bga"
+        if flow_state == _FLOW_WAIT_ROUTER_TYPE:
+            return _SWSD_ESCAPE_FLOW, "layer_assign"
+        if flow_state == _FLOW_WAIT_CONFIRM:
+            return _SWSD_ESCAPE_FLOW, "escape_order"
+        if flow_state == _FLOW_ROUTING:
+            return _SWSD_ESCAPE_FLOW, "routing"
+        return _SWSD_ESCAPE_FLOW, "idle"
+
+    def _sync_swsd_flow_state(self, session_id: str, flow_state: str) -> None:
+        if not self._swsd_enabled or not session_id:
+            return
+        workflow_id, state = self._swsd_state_from_legacy_flow(flow_state)
+        self._swsd_update(
+            session_id,
+            workflow_id,
+            state,
+            self._swsd_escape_payload(session_id) if workflow_id == _SWSD_ESCAPE_FLOW else {"legacyFlowState": flow_state},
+            event_type="state_sync",
+        )
+
+    def _swsd_update(
+        self,
+        session_id: str,
+        workflow_id: str,
+        state: str,
+        payload: Dict[str, Any] | None = None,
+        *,
+        event_type: str = "state_update",
+        intent: str = "",
+        action_type: str = "normal",
+        checkpoint_label: str = "",
+    ) -> None:
+        if not self._swsd_enabled or not session_id:
+            return
+        try:
+            previous = self._swsd_state.load(session_id, workflow_id) or {}
+            from_state = str(previous.get("current_state") or "")
+            record = self._swsd_state.update(
+                session_id,
+                workflow_id,
+                current_state=state,
+                payload=payload or {},
+            )
+            event_id = self._swsd_state.append_event(
+                session_id,
+                workflow_id,
+                WorkflowEvent(
+                    event_type=event_type,
+                    from_state=from_state,
+                    to_state=state,
+                    intent=intent,
+                    action_type=action_type,
+                    payload=payload or {},
+                ),
+            )
+            if checkpoint_label:
+                self._swsd_state.checkpoint(
+                    session_id,
+                    workflow_id,
+                    state=state,
+                    label=checkpoint_label,
+                    payload=record.get("state_payload") or payload or {},
+                    event_id=event_id,
+                )
+        except Exception:
+            logger.debug("SWSD update failed: session=%s workflow=%s state=%s", session_id, workflow_id, state, exc_info=True)
 
     @staticmethod
     def _as_bool(value: Any) -> bool:
@@ -3343,10 +3502,11 @@ class WebSocketAdapter(BasePlatformAdapter):
         fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE)
         candidates.extend(item.strip() for item in fenced if item.strip())
 
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start >= 0 and end > start:
-            candidates.append(raw[start:end + 1])
+        brace_starts = [match.start() for match in re.finditer(r"\{", raw)]
+        for start in reversed(brace_starts):
+            end = raw.rfind("}")
+            if end > start:
+                candidates.append(raw[start:end + 1].strip())
 
         for candidate in candidates:
             try:
@@ -3382,7 +3542,31 @@ class WebSocketAdapter(BasePlatformAdapter):
             value = match.group(2).strip().strip("'\"")
             if key:
                 data[key] = value
-        return data if data else None
+        if data:
+            return data
+
+        # Recover a final KV block from verbose reasoning output.
+        kv_lines: list[str] = []
+        for line in reversed(raw.splitlines()):
+            text = line.strip()
+            if not text:
+                if kv_lines:
+                    break
+                continue
+            if re.match(r"^[A-Za-z_][\w]*\s*(?:=|:|：)\s*", text):
+                kv_lines.append(text)
+                continue
+            if kv_lines:
+                break
+        if not kv_lines:
+            return None
+        recovered: Dict[str, Any] = {}
+        for line in reversed(kv_lines):
+            match = re.match(r"^\s*([A-Za-z_][\w]*)\s*(?:=|:|：)\s*(.*?)\s*$", line)
+            if not match:
+                continue
+            recovered[match.group(1)] = match.group(2).strip().strip("'\"")
+        return recovered if recovered else None
 
     def _parse_route_intent_output(self, raw_text: str) -> Optional[_RouteIntent]:
         raw = (raw_text or "").strip()
@@ -3481,16 +3665,22 @@ class WebSocketAdapter(BasePlatformAdapter):
             "intent=...; route_mode=...; confidence=...; reason_code=...\n"
             "intent 可选：chat, pcb_entry, pcb_select_target, pcb_confirm_route, "
             "pcb_modify_params, pcb_reroute_selected, cancel, unclear。\n"
+            "同时尽量输出层级字段：task_intent, control_intent, meta_intent, invalid_intent。"
+            "task_intent 表示用户想完成的工程任务；control_intent 表示推迟/取消/回退等流程控制；"
+            "meta_intent 表示仅说明、不要调用工具等交互约束；invalid_intent 表示流程内无效输入。\n"
             "判断原则：\n"
             "- 概念咨询、原理解释、区别比较且没有执行要求，判 chat。\n"
             "- 明确要求开始 PCB/BGA/逃逸/扇出/布线/获取版图/识别 BGA，判 pcb_entry。\n"
             "- 明确要求对文本中指定 net 做拆线重布、删除后重走、reroute，判 pcb_reroute_selected。\n"
             "- 明确要求对当前框选、选中走线、选中 traces 做删除、拆线、重走、重布，判 pcb_reroute_selected。\n"
             "- “不要解释，直接开始 BGA 逃逸布线”判 pcb_entry；“不要布线，只解释”判 chat。\n"
+            "- “不要调用工具/先别执行/仅说明”是 meta/control 约束，不一定覆盖 task_intent；"
+            "例如“帮我 BGA 逃逸（不要调用工具）”的 task_intent 仍是 pcb_entry。\n"
             "- “我想做/准备做...”只是背景，后面问什么是/原理/介绍时判 chat；明确要求现在/直接/开始/执行时才以执行为主。\n"
             "- flow_state=wait_selection 时，选择器件判 pcb_select_target。\n"
             "- flow_state=wait_router_type 时，用户回复 arc/135/RL/北科大 或组合如 135 + RL，判 pcb_followup。\n"
             "- flow_state=wait_confirm 时，确认/开始/执行/继续判 pcb_confirm_route。\n"
+            "- flow_state=wait_confirm 时，嗯/好的/随便/再想想等无效输入判 unclear，但 route_mode 保持 pcb。\n"
             "- 取消、退出、中止当前流程判 cancel。\n"
             "输出字段：intent, route_mode, confidence, target_refdes, operation, "
             "should_call_get_project_data, needs_clarification, clarification_question, reason_code, brief_reason。"
@@ -3534,20 +3724,22 @@ class WebSocketAdapter(BasePlatformAdapter):
             return None
 
         try:
-            from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+            from tools import pcb_model_runtime
 
-            response = await async_call_llm(
-                provider="auto",
-                messages=self._build_route_intent_prompt(
-                    session_id=session_id,
-                    user_text=text,
-                    project_id=project_id,
-                ),
-                temperature=0,
-                max_tokens=256,
-                timeout=self._route_intent_llm_timeout,
+            raw_output = await asyncio.to_thread(
+                lambda: pcb_model_runtime.chat_completion_text(
+                    stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+                    messages=self._build_route_intent_prompt(
+                        session_id=session_id,
+                        user_text=text,
+                        project_id=project_id,
+                    ),
+                    temperature=0,
+                    top_p=1,
+                    max_tokens=256,
+                    timeout_s=self._route_intent_llm_timeout,
+                )[0]
             )
-            raw_output = extract_content_or_reasoning(response)
             parsed = self._parse_route_intent_output(raw_output)
             if parsed:
                 logger.info(
@@ -3576,6 +3768,56 @@ class WebSocketAdapter(BasePlatformAdapter):
         flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
         mode = self._session_mode(session_id)
         route_intent = self._coerce_route_intent(llm_intent)
+        if route_intent is not None:
+            candidate = {
+                "intent": route_intent.intent,
+                "route_mode": route_intent.route_mode,
+                "confidence": route_intent.confidence,
+                "should_call_get_project_data": route_intent.should_call_get_project_data,
+                "reason_code": route_intent.reason_code,
+                "raw": route_intent.raw or {},
+            }
+            if self._swsd_intent_policy_version == "swsd2":
+                policy = apply_swsd2_policy(
+                    text=text,
+                    flow_state=flow_state,
+                    session_mode=mode,
+                    candidate=candidate,
+                )
+            elif self._swsd_intent_policy_version == "swsd3":
+                policy = apply_swsd3_policy(
+                    text=text,
+                    flow_state=flow_state,
+                    session_mode=mode,
+                    candidate=candidate,
+                )
+            else:
+                try:
+                    intent_field = estimate_intent_field(
+                        user_text=text,
+                        flow_state=flow_state,
+                        session_mode=mode,
+                        candidate=candidate,
+                        timeout_s=self._route_intent_llm_timeout,
+                    )
+                except Exception:
+                    logger.info("SWSD4 intent field failed; falling back to SWSD3", exc_info=True)
+                    policy = apply_swsd3_policy(
+                        text=text,
+                        flow_state=flow_state,
+                        session_mode=mode,
+                        candidate=candidate,
+                    )
+                    return policy.intent
+                policy = apply_swsd4_policy(
+                    text=text,
+                    flow_state=flow_state,
+                    session_mode=mode,
+                    candidate=candidate,
+                    intent_field=intent_field,
+                    skill_grounding=retrieve_skill_memory(text, flow_state),
+                )
+            return policy.intent
         in_pcb_context = flow_state != _FLOW_IDLE or mode == _ROUTE_MODE_PCB or self._is_mode_locked(session_id)
         forced_global_fanout = self._is_forced_global_fanout_command(text)
         forced_reroute = bool(_FORCE_REROUTE_TAG_RE.search(text))
@@ -4096,6 +4338,37 @@ class WebSocketAdapter(BasePlatformAdapter):
             return
         self._remember_board_analysis(session_id, pcb_fields)
 
+        if "routingResult" in pcb_fields:
+            self._swsd_update(
+                session_id,
+                _SWSD_ESCAPE_FLOW,
+                "review",
+                self._swsd_escape_payload(session_id, {"finalFields": pcb_fields}),
+                event_type="checkpoint",
+                intent="route_complete",
+                checkpoint_label="final routing fields",
+            )
+            self._swsd_update(
+                session_id,
+                _SWSD_ESCAPE_FLOW,
+                "import" if pcb_fields.get("importLinesFilePath") else "review",
+                self._swsd_escape_payload(session_id, {"finalFields": pcb_fields}),
+                event_type="observation",
+                intent="final_response",
+            )
+        if "rerouteResult" in pcb_fields:
+            reroute_state = "report"
+            if pcb_fields.get("importLinesFilePath") or pcb_fields.get("routedLayoutTxtFilePath"):
+                reroute_state = "import"
+            self._swsd_update(
+                session_id,
+                _SWSD_REROUTE_FLOW,
+                reroute_state,
+                {"finalFields": pcb_fields},
+                event_type="checkpoint",
+                intent="reroute_result",
+                checkpoint_label="reroute result",
+            )
         if "routingResult" in pcb_fields or "rerouteResult" in pcb_fields:
             self._reset_flow(session_id)
             self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)

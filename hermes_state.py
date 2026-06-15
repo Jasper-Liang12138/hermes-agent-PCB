@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +88,47 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS workflow_sessions (
+    session_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    current_state TEXT NOT NULL,
+    state_payload TEXT,
+    history_summary TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, workflow_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT,
+    intent TEXT,
+    action_type TEXT,
+    payload TEXT,
+    model_stage TEXT,
+    timestamp REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    label TEXT,
+    payload TEXT,
+    event_id INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_sessions_session ON workflow_sessions(session_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_session ON workflow_events(session_id, workflow_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_session ON workflow_checkpoints(session_id, workflow_id, created_at);
 """
 
 FTS_SQL = """
@@ -329,6 +370,50 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: SWSD workflow state/checkpoint/event persistence.
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS workflow_sessions (
+                        session_id TEXT NOT NULL,
+                        workflow_id TEXT NOT NULL,
+                        current_state TEXT NOT NULL,
+                        state_payload TEXT,
+                        history_summary TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (session_id, workflow_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS workflow_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        workflow_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        from_state TEXT,
+                        to_state TEXT,
+                        intent TEXT,
+                        action_type TEXT,
+                        payload TEXT,
+                        model_stage TEXT,
+                        timestamp REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        workflow_id TEXT NOT NULL,
+                        checkpoint_id TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL,
+                        label TEXT,
+                        payload TEXT,
+                        event_id INTEGER,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_workflow_sessions_session ON workflow_sessions(session_id);
+                    CREATE INDEX IF NOT EXISTS idx_workflow_events_session ON workflow_events(session_id, workflow_id, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_workflow_checkpoints_session ON workflow_checkpoints(session_id, workflow_id, created_at);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -929,6 +1014,227 @@ class SessionDB:
                         msg["codex_reasoning_items"] = None
             messages.append(msg)
         return messages
+
+    # =========================================================================
+    # SWSD workflow state / checkpoint persistence
+    # =========================================================================
+
+    @staticmethod
+    def _json_dumps_safe(value: Any) -> str:
+        return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+    @staticmethod
+    def _json_loads_safe(value: Any, default: Any = None) -> Any:
+        if value in (None, ""):
+            return {} if default is None else default
+        try:
+            return json.loads(value)
+        except Exception:
+            return {} if default is None else default
+
+    def upsert_workflow_state(
+        self,
+        session_id: str,
+        workflow_id: str,
+        current_state: str,
+        state_payload: Dict[str, Any] = None,
+        history_summary: str = "",
+    ) -> None:
+        now = time.time()
+        payload_json = self._json_dumps_safe(state_payload or {})
+
+        def _write(conn):
+            conn.execute(
+                """INSERT INTO workflow_sessions
+                   (session_id, workflow_id, current_state, state_payload, history_summary, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, workflow_id) DO UPDATE SET
+                       current_state = excluded.current_state,
+                       state_payload = excluded.state_payload,
+                       history_summary = COALESCE(NULLIF(excluded.history_summary, ''), workflow_sessions.history_summary),
+                       updated_at = excluded.updated_at
+                """,
+                (session_id, workflow_id, current_state, payload_json, history_summary or "", now, now),
+            )
+
+        self._execute_write(_write)
+
+    def get_workflow_state(self, session_id: str, workflow_id: str = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if workflow_id:
+                cursor = self._conn.execute(
+                    "SELECT * FROM workflow_sessions WHERE session_id = ? AND workflow_id = ?",
+                    (session_id, workflow_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT * FROM workflow_sessions WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1",
+                    (session_id,),
+                )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["state_payload"] = self._json_loads_safe(result.get("state_payload"))
+        return result
+
+    def append_workflow_event(
+        self,
+        *,
+        session_id: str,
+        workflow_id: str,
+        event_type: str,
+        from_state: str = "",
+        to_state: str = "",
+        intent: str = "",
+        action_type: str = "",
+        payload: Dict[str, Any] = None,
+        model_stage: str = "",
+    ) -> int:
+        now = time.time()
+        payload_json = self._json_dumps_safe(payload or {})
+
+        def _write(conn):
+            cursor = conn.execute(
+                """INSERT INTO workflow_events
+                   (session_id, workflow_id, event_type, from_state, to_state, intent,
+                    action_type, payload, model_stage, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    workflow_id,
+                    event_type,
+                    from_state,
+                    to_state,
+                    intent,
+                    action_type,
+                    payload_json,
+                    model_stage,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_write)
+
+    def list_workflow_events(
+        self,
+        session_id: str,
+        workflow_id: str = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit or 50), 500))
+        with self._lock:
+            if workflow_id:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_events
+                       WHERE session_id = ? AND workflow_id = ?
+                       ORDER BY timestamp DESC, id DESC LIMIT ?""",
+                    (session_id, workflow_id, limit),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_events
+                       WHERE session_id = ?
+                       ORDER BY timestamp DESC, id DESC LIMIT ?""",
+                    (session_id, limit),
+                )
+            rows = [dict(row) for row in cursor.fetchall()]
+        rows.reverse()
+        for row in rows:
+            row["payload"] = self._json_loads_safe(row.get("payload"))
+        return rows
+
+    def write_workflow_checkpoint(
+        self,
+        *,
+        session_id: str,
+        workflow_id: str,
+        checkpoint_id: str,
+        state: str,
+        label: str,
+        payload: Dict[str, Any] = None,
+        event_id: int = None,
+    ) -> None:
+        now = time.time()
+        payload_json = self._json_dumps_safe(payload or {})
+
+        def _write(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO workflow_checkpoints
+                   (session_id, workflow_id, checkpoint_id, state, label, payload, event_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, workflow_id, checkpoint_id, state, label, payload_json, event_id, now),
+            )
+
+        self._execute_write(_write)
+
+    def list_workflow_checkpoints(
+        self,
+        session_id: str,
+        workflow_id: str = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit or 20), 200))
+        with self._lock:
+            if workflow_id:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_checkpoints
+                       WHERE session_id = ? AND workflow_id = ?
+                       ORDER BY created_at ASC, id ASC LIMIT ?""",
+                    (session_id, workflow_id, limit),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_checkpoints
+                       WHERE session_id = ?
+                       ORDER BY created_at ASC, id ASC LIMIT ?""",
+                    (session_id, limit),
+                )
+            rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["payload"] = self._json_loads_safe(row.get("payload"))
+        return rows
+
+    def rollback_workflow_checkpoint(
+        self,
+        session_id: str,
+        workflow_id: str,
+        checkpoint_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if checkpoint_id:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_checkpoints
+                       WHERE session_id = ? AND workflow_id = ? AND checkpoint_id = ?""",
+                    (session_id, workflow_id, checkpoint_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """SELECT * FROM workflow_checkpoints
+                       WHERE session_id = ? AND workflow_id = ?
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (session_id, workflow_id),
+                )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        checkpoint = dict(row)
+        previous = self.get_workflow_state(session_id, workflow_id) or {}
+        payload = self._json_loads_safe(checkpoint.get("payload"))
+        self.upsert_workflow_state(session_id, workflow_id, checkpoint["state"], payload)
+        self.append_workflow_event(
+            session_id=session_id,
+            workflow_id=workflow_id,
+            event_type="rollback",
+            from_state=previous.get("current_state", ""),
+            to_state=checkpoint["state"],
+            intent="rollback",
+            action_type="rollback",
+            payload={"checkpointId": checkpoint.get("checkpoint_id"), "label": checkpoint.get("label")},
+        )
+        return self.get_workflow_state(session_id, workflow_id)
 
     # =========================================================================
     # Search

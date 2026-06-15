@@ -36,6 +36,10 @@ DEFAULT_PROXY_BYPASS_HOSTS = ("wishub-x5.ctyun.cn",)
 
 _OPENAI_CHAT_COMPLETIONS_SUFFIX_RE = re.compile(r"/chat/completions/?$", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"(?is)<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>")
+_STREAM_FINAL_PREFIX_RE = re.compile(r"(?is)(?:^|\n)\s*(?:final|answer|json|最终答案|答案)\s*[:：]\s*")
+_STREAM_THINKING_RE = re.compile(
+    r"(?is)(thinking process|analy[sz]e the request|思考过程|推理过程|^\s*\d+\.\s+\*\*)"
+)
 _LOCAL_ENV_LOADED = False
 
 
@@ -527,7 +531,12 @@ def resolve_model_runtime(
 
 
 def runtime_disables_thinking(stage: str, base_url: str) -> bool:
-    stage_env = "PCB_EXPLAIN_DISABLE_THINKING" if stage == STAGE_EXPLAIN else "PCB_REROUTE_DISABLE_THINKING"
+    if stage == STAGE_EXPLAIN:
+        stage_env = "PCB_EXPLAIN_DISABLE_THINKING"
+    elif stage == STAGE_TOOL_PLANNING_CHAT:
+        stage_env = "PCB_TOOL_PLANNING_CHAT_DISABLE_THINKING"
+    else:
+        stage_env = "PCB_REROUTE_DISABLE_THINKING"
     override = _env_first(stage_env, "PCB_MODEL_DISABLE_THINKING").lower()
     if override:
         return override not in ("0", "false", "no", "off")
@@ -536,21 +545,51 @@ def runtime_disables_thinking(stage: str, base_url: str) -> bool:
 
 
 def runtime_sends_disable_thinking_kwargs(stage: str) -> bool:
-    stage_env = (
-        "PCB_EXPLAIN_DISABLE_THINKING_KWARGS"
-        if stage == STAGE_EXPLAIN
-        else "PCB_REROUTE_DISABLE_THINKING_KWARGS"
-    )
+    if stage == STAGE_EXPLAIN:
+        stage_env = "PCB_EXPLAIN_DISABLE_THINKING_KWARGS"
+    elif stage == STAGE_TOOL_PLANNING_CHAT:
+        stage_env = "PCB_TOOL_PLANNING_CHAT_DISABLE_THINKING_KWARGS"
+    else:
+        stage_env = "PCB_REROUTE_DISABLE_THINKING_KWARGS"
     override = _env_first(stage_env, "PCB_MODEL_DISABLE_THINKING_KWARGS").lower()
-    return override in ("1", "true", "yes", "on")
+    if override:
+        return override in ("1", "true", "yes", "on")
+    return stage == STAGE_TOOL_PLANNING_CHAT
+
+
+def runtime_sends_top_level_disable_thinking(stage: str) -> bool:
+    if stage == STAGE_EXPLAIN:
+        stage_env = "PCB_EXPLAIN_DISABLE_THINKING_TOP_LEVEL"
+    elif stage == STAGE_TOOL_PLANNING_CHAT:
+        stage_env = "PCB_TOOL_PLANNING_CHAT_DISABLE_THINKING_TOP_LEVEL"
+    else:
+        stage_env = "PCB_REROUTE_DISABLE_THINKING_TOP_LEVEL"
+    override = _env_first(stage_env, "PCB_MODEL_DISABLE_THINKING_TOP_LEVEL").lower()
+    if override:
+        return override in ("1", "true", "yes", "on")
+    return stage == STAGE_TOOL_PLANNING_CHAT
+
+
+def runtime_uses_json_response_format(stage: str) -> bool:
+    if stage == STAGE_EXPLAIN:
+        stage_env = "PCB_EXPLAIN_JSON_RESPONSE_FORMAT"
+    elif stage == STAGE_TOOL_PLANNING_CHAT:
+        stage_env = "PCB_TOOL_PLANNING_CHAT_JSON_RESPONSE_FORMAT"
+    else:
+        stage_env = "PCB_REROUTE_JSON_RESPONSE_FORMAT"
+    override = _env_first(stage_env, "PCB_MODEL_JSON_RESPONSE_FORMAT").lower()
+    if override:
+        return override in ("1", "true", "yes", "on")
+    return stage == STAGE_TOOL_PLANNING_CHAT
 
 
 def runtime_uses_no_think_prefix(stage: str, base_url: str) -> bool:
-    stage_env = (
-        "PCB_EXPLAIN_USE_NO_THINK_PREFIX"
-        if stage == STAGE_EXPLAIN
-        else "PCB_REROUTE_USE_NO_THINK_PREFIX"
-    )
+    if stage == STAGE_EXPLAIN:
+        stage_env = "PCB_EXPLAIN_USE_NO_THINK_PREFIX"
+    elif stage == STAGE_TOOL_PLANNING_CHAT:
+        stage_env = "PCB_TOOL_PLANNING_CHAT_USE_NO_THINK_PREFIX"
+    else:
+        stage_env = "PCB_REROUTE_USE_NO_THINK_PREFIX"
     override = _env_first(stage_env, "PCB_MODEL_USE_NO_THINK_PREFIX").lower()
     if override:
         return override in ("1", "true", "yes", "on")
@@ -588,6 +627,175 @@ def strip_think_blocks(text: str) -> str:
     return cleaned.strip()
 
 
+def _approx_token_count(text: str) -> int:
+    raw = str(text or "")
+    if not raw:
+        return 0
+    word_count = len(re.findall(r"\S+", raw))
+    char_count = len(raw)
+    return max(word_count, char_count // 4)
+
+
+def _tail_after_final_prefix(text: str) -> str:
+    raw = str(text or "")
+    matches = list(_STREAM_FINAL_PREFIX_RE.finditer(raw))
+    if not matches:
+        return raw
+    return raw[matches[-1].end() :]
+
+
+def _complete_json_candidate(text: str) -> str | None:
+    raw = _tail_after_final_prefix(str(text or "")).strip()
+    fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE)
+    for candidate in reversed([item.strip() for item in fenced if item.strip()]):
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+
+    starts = [match.start() for match in re.finditer(r"\{", raw)]
+    for start in reversed(starts):
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(raw)):
+            ch = raw[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start : index + 1].strip()
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except Exception:
+                        break
+    return None
+
+
+def _complete_kv_candidate(text: str) -> str | None:
+    raw = _tail_after_final_prefix(str(text or "")).strip()
+    for line in reversed(raw.splitlines()):
+        candidate = line.strip().strip("`")
+        if not candidate:
+            continue
+        if (
+            re.search(r"\bintent\s*(?:=|:|：)\s*[^;\n]+", candidate)
+            and re.search(r"\broute_mode\s*(?:=|:|：)\s*[^;\n]+", candidate)
+        ):
+            return candidate
+    return None
+
+
+def _stream_structured_candidate(text: str) -> str | None:
+    return _complete_json_candidate(text) or _complete_kv_candidate(text)
+
+
+def _delta_text_from_stream_chunk(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") if isinstance(chunk, dict) else None
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta") or choices[0].get("message") or {}
+    if not isinstance(delta, dict):
+        return ""
+    content = delta.get("content")
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    if content is None:
+        content = delta.get("reasoning_content") or delta.get("reasoning")
+    return str(content or "")
+
+
+def _read_stream_until_structured(resp, *, prune_token_budget: int) -> tuple[str, dict[str, Any]]:
+    buffer = ""
+    thinking_buffer = ""
+    non_sse_lines: list[str] = []
+    first_response_id = None
+    chunks = 0
+    pruned = False
+    finish_reason = ""
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            non_sse_lines.append(line)
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            finish_reason = finish_reason or "done"
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        first_response_id = first_response_id or chunk.get("id")
+        delta = _delta_text_from_stream_chunk(chunk)
+        if not delta:
+            continue
+        chunks += 1
+        buffer += delta
+        if _STREAM_THINKING_RE.search(buffer):
+            thinking_buffer += delta
+        candidate = _stream_structured_candidate(buffer)
+        if candidate:
+            finish_reason = "structured"
+            return candidate, {
+                "stream_chunks": chunks,
+                "stream_pruned": False,
+                "stream_finish_reason": finish_reason,
+                "stream_thinking_tokens": _approx_token_count(thinking_buffer),
+                "response_id": first_response_id,
+            }
+        if (
+            prune_token_budget > 0
+            and _STREAM_THINKING_RE.search(buffer)
+            and not re.search(r"\{|\bintent\s*(?:=|:|：)", _tail_after_final_prefix(buffer))
+            and _approx_token_count(thinking_buffer or buffer) >= prune_token_budget
+        ):
+            pruned = True
+            finish_reason = "thinking_pruned"
+            break
+
+    if not buffer and non_sse_lines:
+        raw = "\n".join(non_sse_lines)
+        try:
+            data = json.loads(raw)
+            first_response_id = first_response_id or data.get("id")
+            choices = data.get("choices") if isinstance(data, dict) else None
+            message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+            content = message.get("content") if isinstance(message, dict) else ""
+            if isinstance(content, list):
+                buffer = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+            else:
+                buffer = str(content or "")
+        except Exception:
+            buffer = raw
+
+    candidate = _stream_structured_candidate(buffer)
+    text = candidate or strip_think_blocks(buffer) or buffer.strip()
+    return text, {
+        "stream_chunks": chunks,
+        "stream_pruned": pruned,
+        "stream_finish_reason": finish_reason or "eof",
+        "stream_thinking_tokens": _approx_token_count(thinking_buffer),
+        "response_id": first_response_id,
+    }
+
+
 def _normalize_message_content_for_no_think(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     normalized = [dict(message) for message in messages]
     for index in range(len(normalized) - 1, -1, -1):
@@ -608,6 +816,10 @@ def chat_completion_text(
     top_p: float | None = None,
     timeout_s: float = 180,
     stream: bool = False,
+    stop: list[str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+    stream_until_json: bool = False,
+    stream_prune_token_budget: int = 160,
     require_api_key: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     resolved = runtime or resolve_model_runtime(stage, require_api_key=require_api_key)
@@ -622,18 +834,27 @@ def chat_completion_text(
         else messages
     )
 
+    effective_stream = bool(stream or stream_until_json)
     payload: dict[str, Any] = {
         "model": resolved["model"],
         "messages": outgoing_messages,
-        "stream": stream,
+        "stream": effective_stream,
     }
     payload[runtime_token_parameter(stage, base_url)] = max_tokens
     if temperature is not None:
         payload["temperature"] = temperature
     if top_p is not None:
         payload["top_p"] = top_p
+    if stop:
+        payload["stop"] = stop
     if disable_thinking and runtime_sends_disable_thinking_kwargs(stage):
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if disable_thinking and runtime_sends_top_level_disable_thinking(stage):
+        payload["enable_thinking"] = False
+    if runtime_uses_json_response_format(stage):
+        payload.setdefault("response_format", {"type": "json_object"})
+    if extra_payload:
+        payload.update(extra_payload)
 
     headers = {"Content-Type": "application/json"}
     if resolved.get("api_key"):
@@ -646,6 +867,20 @@ def chat_completion_text(
     )
     try:
         with _open_chat_request(req, timeout_s=timeout_s, base_url=base_url) as resp:
+            if stream_until_json:
+                text, stream_meta = _read_stream_until_structured(
+                    resp,
+                    prune_token_budget=stream_prune_token_budget,
+                )
+                meta = {
+                    "stage": stage,
+                    "base_url": base_url,
+                    "model": resolved["model"],
+                    "usage": {},
+                    "response_id": stream_meta.get("response_id"),
+                    **stream_meta,
+                }
+                return text, meta
             raw = resp.read().decode("utf-8", errors="replace")
     except urlerror.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace").strip()

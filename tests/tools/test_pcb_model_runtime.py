@@ -396,6 +396,205 @@ def test_chat_completion_text_can_opt_into_disable_thinking_kwargs(monkeypatch):
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_tool_planning_chat_sends_disable_thinking_kwargs_by_default(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"id": "resp-tool-1", "choices": [{"message": {"content": '{"intent":"chat"}'}}]}).encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        runtime={
+            "model": "tool-stage-model",
+            "base_url": "https://wishub-x5.ctyun.cn/v1",
+            "api_key": "secret",
+        },
+        messages=[{"role": "user", "content": "分类"}],
+        max_tokens=256,
+    )
+
+    assert text == '{"intent":"chat"}'
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["payload"]["enable_thinking"] is False
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_reroute_does_not_use_tool_planning_json_response_defaults(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "patch"}}]}).encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+
+    text, _meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_REROUTE,
+        runtime={
+            "model": "reroute-stage-model",
+            "base_url": "https://wishub-x5.ctyun.cn/v1",
+            "api_key": "secret",
+        },
+        messages=[{"role": "user", "content": "生成 patch"}],
+    )
+
+    assert text == "patch"
+    assert "response_format" not in captured["payload"]
+    assert "enable_thinking" not in captured["payload"]
+
+
+def test_chat_completion_text_stream_until_json_stops_on_structured_output(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
+
+    class _FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            chunks = [
+                {"id": "stream-1", "choices": [{"delta": {"content": "Thinking Process:\n1. analyze\n"}}]},
+                {"id": "stream-1", "choices": [{"delta": {"content": 'JSON: {"intent":"chat",'}}]},
+                {"id": "stream-1", "choices": [{"delta": {"content": '"route_mode":"chat","should_call_get_project_data":false}'}}]},
+                {"id": "stream-1", "choices": [{"delta": {"content": "\nextra explanation should not be read"}}]},
+            ]
+            for chunk in chunks:
+                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+
+    def _fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeStreamResponse()
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", _fake_urlopen)
+
+    text, meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        runtime={"model": "tool-stage-model", "base_url": "https://model.example/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "分类"}],
+        max_tokens=256,
+        stream_until_json=True,
+        stop=["```"],
+    )
+
+    assert json.loads(text)["intent"] == "chat"
+    assert captured["payload"]["stream"] is True
+    assert captured["payload"]["stop"] == ["```"]
+    assert meta["stream_finish_reason"] == "structured"
+    assert meta["stream_chunks"] == 3
+
+
+def test_chat_completion_text_stream_prunes_long_thinking(monkeypatch):
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
+
+    class _FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            for index in range(10):
+                chunk = {
+                    "id": "stream-prune",
+                    "choices": [{"delta": {"content": f"Thinking Process:\n{index}. analyze details without json. "}}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", lambda req, timeout: _FakeStreamResponse())
+
+    text, meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        runtime={"model": "tool-stage-model", "base_url": "https://model.example/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "分类"}],
+        max_tokens=256,
+        stream_until_json=True,
+        stream_prune_token_budget=8,
+    )
+
+    assert "Thinking Process" in text
+    assert meta["stream_pruned"] is True
+    assert meta["stream_finish_reason"] == "thinking_pruned"
+
+
+def test_chat_completion_text_stream_until_json_accepts_non_sse_json(monkeypatch):
+    monkeypatch.setattr(
+        pcb_model_runtime,
+        "_load_project_config_ini",
+        lambda project_config_paths=None: _config_with_network(proxy_mode="proxy"),
+    )
+
+    class _FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            payload = {
+                "id": "plain-json-while-streaming",
+                "choices": [{"message": {"content": '{"intent":"chat","route_mode":"chat"}'}}],
+            }
+            yield json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(pcb_model_runtime.urlrequest, "urlopen", lambda req, timeout: _FakeStreamResponse())
+
+    text, meta = pcb_model_runtime.chat_completion_text(
+        stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+        runtime={"model": "tool-stage-model", "base_url": "https://model.example/v1", "api_key": "secret"},
+        messages=[{"role": "user", "content": "分类"}],
+        stream_until_json=True,
+    )
+
+    assert json.loads(text)["intent"] == "chat"
+    assert meta["response_id"] == "plain-json-while-streaming"
+
+
 def test_chat_completion_text_bypasses_wishub_proxy_by_default(monkeypatch):
     captured = {}
 

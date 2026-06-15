@@ -114,6 +114,73 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
     return WebSocketAdapter(PlatformConfig(enabled=True, extra=merged_extra))
 
 
+async def _run_route_intent_llm_uses_tool_planning_chat_stage(monkeypatch):
+    from tools import pcb_model_runtime
+
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    captured: dict[str, Any] = {}
+
+    def fake_chat_completion_text(**kwargs):
+        captured.update(kwargs)
+        return (
+            '{"intent":"pcb_entry","route_mode":"pcb","confidence":0.92,'
+            '"should_call_get_project_data":true}',
+            {"stage": kwargs["stage"]},
+        )
+
+    monkeypatch.setattr(pcb_model_runtime, "chat_completion_text", fake_chat_completion_text)
+
+    intent = await adapter._classify_route_intent_with_llm(
+        session_id="sess-stage-route-intent",
+        user_text="帮我做 BGA 逃逸布线",
+        project_id="proj",
+    )
+
+    assert intent.intent == "pcb_entry"
+    assert captured["stage"] == pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT
+
+
+def test_route_intent_llm_uses_tool_planning_chat_stage(monkeypatch):
+    asyncio.get_event_loop().run_until_complete(
+        _run_route_intent_llm_uses_tool_planning_chat_stage(monkeypatch)
+    )
+
+
+async def _run_fanout_param_llm_uses_tool_planning_chat_stage(monkeypatch):
+    from tools import pcb_model_runtime
+
+    adapter = _make_adapter(fanout_param_llm_enabled=True)
+    captured: dict[str, Any] = {}
+
+    def fake_chat_completion_text(**kwargs):
+        captured.update(kwargs)
+        return (
+            '{"fanoutParams":{"selectedBGA":"U22","routerType":"135",'
+            '"orderLines":[{"net":"GND","layer":"Top","order":1}],'
+            '"constraints":{"LineWidth":4,"LineSpacing":3}}}',
+            {"stage": kwargs["stage"]},
+        )
+
+    monkeypatch.setattr(pcb_model_runtime, "chat_completion_text", fake_chat_completion_text)
+
+    params = await adapter._generate_fanout_params_candidate(
+        session_id="sess-stage-fanout",
+        selected_bga="U22",
+        router_type="135",
+        board_summary={"netSummary": {"groundNets": ["GND"]}},
+        fanout_context={"recommendedEscapeLayers": ["Top"]},
+    )
+
+    assert params["selectedBGA"] == "U22"
+    assert captured["stage"] == pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT
+
+
+def test_fanout_param_llm_uses_tool_planning_chat_stage(monkeypatch):
+    asyncio.get_event_loop().run_until_complete(
+        _run_fanout_param_llm_uses_tool_planning_chat_stage(monkeypatch)
+    )
+
+
 async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     """Covers Agent-loop selection -> fanoutParams -> routingResult over real WebSocket I/O."""
     port = _free_port()
@@ -1993,8 +2060,8 @@ async def test_cached_fanout_route_suppresses_report_when_import_is_rejected(mon
     )
 
     task = asyncio.create_task(adapter._run_cached_fanout_route(session_id))
-    for _ in range(10):
-        await asyncio.sleep(0)
+    for _ in range(100):
+        await asyncio.sleep(0.01)
         if any(item.get("type") == "tool-calls" for item in ws.sent):
             break
 
@@ -2112,6 +2179,41 @@ def test_parse_route_intent_output_tolerates_non_json(raw, expected_intent, expe
     assert intent is not None
     assert intent.intent == expected_intent
     assert intent.route_mode == expected_route
+
+
+def test_parse_route_intent_output_recovers_final_json_after_reasoning():
+    adapter = _make_adapter()
+    raw = (
+        "Thinking Process:\n"
+        "1. analyze the request\n"
+        "2. compare candidate intents\n\n"
+        '{"intent":"pcb_entry","route_mode":"pcb","confidence":0.93,'
+        '"should_call_get_project_data":true}'
+    )
+
+    intent = adapter._parse_route_intent_output(raw)
+
+    assert intent is not None
+    assert intent.intent == "pcb_entry"
+    assert intent.route_mode == "pcb"
+
+
+def test_parse_route_intent_output_recovers_final_kv_after_reasoning():
+    adapter = _make_adapter()
+    raw = (
+        "Thinking Process:\n"
+        "1. analyze the request\n"
+        "2. compare candidate intents\n\n"
+        "intent=cancel\n"
+        "route_mode=chat\n"
+        "confidence=0.99\n"
+    )
+
+    intent = adapter._parse_route_intent_output(raw)
+
+    assert intent is not None
+    assert intent.intent == "cancel"
+    assert intent.route_mode == "chat"
 
 
 def test_route_intent_prompt_includes_intention_memory(tmp_path, monkeypatch):

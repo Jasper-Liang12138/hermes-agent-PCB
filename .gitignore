@@ -103,3 +103,11 @@ models/**/*.kicad_pcb
 models/**/__pycache__/
 models/**/*.pyc
 models/**/.DS_Store
+
+# Local SWSD/intent experiment artifacts. Keep curated Markdown summaries addable.
+/reports/**/*.json
+/reports/**/*.jsonl
+/reports/**/*.db
+/pcb_frontend_lab/reports/**/*.json
+/pcb_frontend_lab/reports/**/*.jsonl
+/pcb_frontend_lab/reports/**/*.db

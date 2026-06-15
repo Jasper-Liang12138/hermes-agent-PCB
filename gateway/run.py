@@ -150,15 +150,26 @@ if _config_ini_cfg.has_section("model"):
         })
         _ws_host = _config_ini_cfg.get("server", "host", fallback="0.0.0.0")
         _ws_port = int(_config_ini_cfg.get("server", "port", fallback="8765"))
+        _swsd_extra = {}
+        if _config_ini_cfg.has_section("swsd"):
+            _s = _config_ini_cfg["swsd"]
+            for _cfg_key, _extra_key in {
+                "enabled": "swsd_enabled",
+                "persist_checkpoints": "swsd_persist_checkpoints",
+                "intent_policy_version": "swsd_intent_policy_version",
+            }.items():
+                if _s.get(_cfg_key, "").strip():
+                    _swsd_extra[_extra_key] = _s[_cfg_key].strip()
         _hermes_cfg.setdefault("gateway", {}).setdefault("websocket", {}).update({
             "enabled": True,
             "host": _ws_host,
             "port": _ws_port,
+            **_swsd_extra,
         })
         # 注册 websocket 到 platforms，使 get_connected_platforms() 能遍历到它
         _hermes_cfg.setdefault("platforms", {}).setdefault("websocket", {}).update({
             "enabled": True,
-            "extra": {"host": _ws_host, "port": _ws_port},
+            "extra": {"host": _ws_host, "port": _ws_port, **_swsd_extra},
         })
         # 注册项目 skills 目录为外部 skills dir
         # 默认启用流式输出
