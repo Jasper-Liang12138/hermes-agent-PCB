@@ -32,6 +32,13 @@ from rules.rule_helpers.p7_geometry import (
     _bbox_overlap,
     _grid_cells_for_bbox,
 )
+from rules.rule_helpers.pad_segment_geometry import (
+    bboxes_overlap,
+    pad_bbox,
+    pad_copper_layers,
+    segment_bbox,
+    segment_intersects_pad,
+)
 
 from rules.rule_helpers.connectivity import (
     _estimate_bga_pitch,
@@ -40,6 +47,55 @@ from rules.rule_helpers.connectivity import (
     _endpoint_is_connected,
     _collect_escape_endpoints_for_pad,
 )
+
+
+def _target_bga_bbox(board):
+    component = getattr(board, "target_bga", "") or ""
+    if not component:
+        return None
+    pitch = _estimate_bga_pitch(board, component)
+    margin = pitch * 0.5 if pitch else 0.0
+    return _build_bga_bbox(board, component, margin=margin)
+
+
+def _point_inside_bga_bbox(point, bbox, tolerance=1e-9):
+    if point is None or bbox is None:
+        return False
+    min_x, max_x, min_y, max_y = bbox
+    return (
+        min_x - tolerance <= point[0] <= max_x + tolerance
+        and min_y - tolerance <= point[1] <= max_y + tolerance
+    )
+
+
+def _segment_bbox_overlaps_bga(seg_bbox, bga_bbox, tolerance=1e-9):
+    min_x, min_y, max_x, max_y = seg_bbox
+    bga_min_x, bga_max_x, bga_min_y, bga_max_y = bga_bbox
+    return not (
+        max_x < bga_min_x - tolerance
+        or bga_max_x < min_x - tolerance
+        or max_y < bga_min_y - tolerance
+        or bga_max_y < min_y - tolerance
+    )
+
+
+def _segment_conflict_inside_bga(s1, s2, intersection, bga_bbox):
+    if intersection is not None:
+        return _point_inside_bga_bbox(intersection, bga_bbox)
+
+    # Collinear overlap has no single intersection point. Its common bbox must
+    # overlap the target BGA region.
+    b1 = _seg_bbox(s1)
+    b2 = _seg_bbox(s2)
+    overlap = (
+        max(b1[0], b2[0]),
+        max(b1[1], b2[1]),
+        min(b1[2], b2[2]),
+        min(b1[3], b2[3]),
+    )
+    if overlap[0] > overlap[2] or overlap[1] > overlap[3]:
+        return False
+    return _segment_bbox_overlaps_bga(overlap, bga_bbox)
 
 
 """
@@ -143,12 +199,12 @@ def check_p2_single_escape_per_bga_pad(board, log_fn=None) -> List[Issue]:
         if log_fn:
             seg_ids = [getattr(seg, "id", None) for seg in touching_segments]
             log_fn(
-                "debug", 
+                "debug",
                 f"[P2] pad={pad.id} comp={pad.component} net={pad.net} "
                 f"layer={pad.layer} choice_count={choice_count} "
                 f"touching_segments={seg_ids}"
             )
-        
+
         if choice_count > 1:
             issues.append(
                 Issue(
@@ -186,6 +242,9 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
     4) 候选对再做精确几何判断
     """
     issues = []
+    bga_bbox = _target_bga_bbox(board)
+    if bga_bbox is None:
+        return issues
 
     t0_total = time.perf_counter()
     by_layer = _build_segments_by_layer(board)
@@ -210,6 +269,12 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
 
         # 1) bbox cache
         bbox_map = {seg.id: _seg_bbox(seg) for seg in layer_segments}
+        layer_segments = [
+            seg for seg in layer_segments
+            if _segment_bbox_overlaps_bga(bbox_map[seg.id], bga_bbox)
+        ]
+        if len(layer_segments) < 2:
+            continue
 
         # 2) grid index
         cell_size = _choose_grid_cell_size(layer_segments)
@@ -264,6 +329,8 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
                         continue
 
                     ip = line_intersection_point(s1.start, s1.end, s2.start, s2.end)
+                    if not _segment_conflict_inside_bga(s1, s2, ip, bga_bbox):
+                        continue
 
                     x = None
                     y = None
@@ -292,6 +359,8 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
                             category="drc",
                             suggestion="Reroute one of the segments so different nets do not cross on the same copper layer.",
                             extra={
+                                "target_bga": getattr(board, "target_bga", ""),
+                                "bga_bbox": bga_bbox,
                                 "seg1_net": s1.net,
                                 "seg2_net": s2.net,
                                 "seg1_start": s1.start,
@@ -315,7 +384,7 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
 
         if log_fn:
             log_fn(
-                "debug", 
+                "debug",
                 f"[P7] layer={layer}: "
                 f"segments={len(layer_segments)} "
                 f"cell_size={cell_size:.3f} "
@@ -333,7 +402,7 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
 
     if log_fn:
         log_fn(
-            "debug", 
+            "debug",
             f"[P7] done: "
             f"layers={total_layers} "
             f"segments={total_segments} "
@@ -347,7 +416,7 @@ def check_p7_segment_crossing(board, log_fn=None) -> List[Issue]:
     return issues
 """
 def check_h2_dangling_segment(board) -> List[Issue]:
-    
+
 
     for pad in _get_valid_bga_pads(board):
         #bbox = _build_bga_bbox(board, pad.component)
@@ -589,5 +658,93 @@ def check_h5_escape_path_no_fork(board) -> List[Issue]:
                 )
             )
 
+
+    return issues
+
+
+def check_h6_pad_segment_crossing(board, log_fn=None) -> List[Issue]:
+    """Check physical overlap between pads and segments on different nets."""
+    issues = []
+    target_bga = getattr(board, "target_bga", "") or ""
+    bga_bbox = _target_bga_bbox(board)
+    if not target_bga or bga_bbox is None:
+        return issues
+
+    segments_by_layer = defaultdict(list)
+    for segment in board.segments:
+        current_segment_bbox = segment_bbox(segment)
+        if (
+            _is_named_net(segment.net)
+            and _segment_bbox_overlaps_bga(current_segment_bbox, bga_bbox)
+        ):
+            segments_by_layer[segment.layer].append(
+                (segment, current_segment_bbox)
+            )
+
+    candidate_count = 0
+    for pad in board.pads:
+        if (
+            not getattr(pad, "is_bga", False)
+            or pad.component != target_bga
+            or not _is_named_net(pad.net)
+        ):
+            continue
+
+        current_pad_bbox = pad_bbox(pad)
+        for layer in pad_copper_layers(board, pad):
+            for segment, current_segment_bbox in segments_by_layer.get(layer, []):
+                if segment.net == pad.net:
+                    continue
+                if not bboxes_overlap(current_pad_bbox, current_segment_bbox):
+                    continue
+
+                candidate_count += 1
+                if not segment_intersects_pad(segment, pad):
+                    continue
+
+                issues.append(
+                    Issue(
+                        rule="HR_DRC_PAD_SEGMENT_CROSSING",
+                        severity="ERROR",
+                        issue_id=(
+                            f"HR_DRC_PAD_SEGMENT_CROSSING_"
+                            f"{pad.id}_{segment.id}_{layer}"
+                        ),
+                        message=(
+                            f"Pad {pad.id} ({pad.net}) overlaps segment "
+                            f"{segment.id} ({segment.net}) on layer {layer}."
+                        ),
+                        obj1=pad.id,
+                        obj2=segment.id,
+                        net=f"{pad.net}|{segment.net}",
+                        layer=layer,
+                        x=pad.x,
+                        y=pad.y,
+                        category="drc",
+                        suggestion=(
+                            "Reroute the segment so it does not overlap a pad on another net."
+                        ),
+                        component=pad.component or "",
+                        pad_id=pad.id or "",
+                        extra={
+                            "target_bga": target_bga,
+                            "bga_bbox": bga_bbox,
+                            "pad_net": pad.net,
+                            "pad_shape": pad.shape,
+                            "pad_size": [pad.size_x, pad.size_y],
+                            "pad_rotation": pad.rotation,
+                            "segment_net": segment.net,
+                            "segment_start": segment.start,
+                            "segment_end": segment.end,
+                            "segment_width": segment.width,
+                        },
+                    )
+                )
+
+    if log_fn:
+        log_fn(
+            "debug",
+            f"[H6] pad-segment candidates={candidate_count} issues={len(issues)}",
+        )
 
     return issues

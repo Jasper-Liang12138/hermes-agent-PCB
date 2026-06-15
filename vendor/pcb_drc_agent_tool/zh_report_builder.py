@@ -1,6 +1,8 @@
 from collections import Counter
 from typing import Any, Dict, List
 
+from rules.rule_helpers.connectivity import _build_bga_bbox, _estimate_bga_pitch
+
 
 RULE_ZH = {
     "HR_CONNECT_PAD_NOT_ESCAPED": {
@@ -20,6 +22,12 @@ RULE_ZH = {
         "explanation": "不同网络的铜线段在同一层发生交叉或重叠。",
         "impact": "这是直接的电气/几何硬性违规，通常会导致布线不可用。",
         "suggestion": "调整其中一条线段的路径、层或过孔位置，消除同层异网冲突。",
+    },
+    "HR_DRC_PAD_SEGMENT_CROSSING": {
+        "name": "BGA区域内异网焊盘与线段冲突",
+        "explanation": "目标BGA区域内，不同网络的焊盘与铜线段发生实体重叠。",
+        "impact": "该冲突可能造成不同网络短路，属于Hard错误。",
+        "suggestion": "调整线段路径、层或焊盘附近的扇出方式，消除异网重叠。",
     },
     "HR_CONNECT_BRANCH_INCOMPLETE": {
         "name": "逃逸分支未完成",
@@ -97,6 +105,16 @@ def _copper_layer_names(board) -> List[str]:
 
     layers_table = getattr(board, "layers_table", {}) or {}
     id_to_name = layers_table.get("id_to_name", {}) or {}
+    standard_copper_names = {
+        str(name)
+        for name in id_to_name.values()
+        if name and str(name).lower().endswith(".cu")
+    }
+    if standard_copper_names:
+        return sorted(standard_copper_names)
+
+    # Older/custom boards may use names such as Top/GND02/POWER05/Bottom.
+    # For those files, copper layers normally occupy KiCad IDs 0..31.
     copper_from_table = {
         str(name)
         for layer_id, name in id_to_name.items()
@@ -286,8 +304,17 @@ def build_chinese_payload(result: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_agent_ready_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     zh_payload = build_chinese_payload(result)
+    hard_timings = result.get("hard_rule_timings", []) or []
+    board = result.get("board")
+    target_bga = zh_payload["summary_zh"].get("target_bga", "")
+    pitch = _estimate_bga_pitch(board, target_bga) if board and target_bga else None
+    bga_bbox = (
+        _build_bga_bbox(board, target_bga, margin=pitch * 0.5 if pitch else 0.0)
+        if board and target_bga
+        else None
+    )
     return {
-        "schema_version": "drc_agent_v2",
+        "schema_version": "drc_agent_v3",
         "language": "zh-CN",
         "tool": {
             "name": "pcb_drc_checker",
@@ -297,7 +324,16 @@ def build_agent_ready_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         },
         "input": {
             "check_mode": result.get("check_mode", ""),
+            "target_bga": target_bga,
+            "check_scope": "target_bga_region",
         },
+        "scope": {
+            "type": "target_bga_region",
+            "target_bga": target_bga,
+            "bga_bbox": bga_bbox,
+            "description_zh": "交叉检查仅覆盖目标BGA焊盘包围框向外扩展半个pitch的区域。",
+        },
+        "enabled_rules": [item.get("rule", "") for item in hard_timings],
         "message_zh": zh_payload["message_zh"],
         "result": zh_payload["summary_zh"],
         "board_info": zh_payload["board_info"],

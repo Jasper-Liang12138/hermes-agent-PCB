@@ -1932,7 +1932,7 @@ class AIAgent:
                 "After getProjectData returns board data, if pcb_extract_bga has not run yet, your next output MUST be exactly a pcb_extract_bga tool call with board_text=\"__CACHED_PROJECT_DATA__\".\n"
                 "Raw PCB board data inside <tool_response> is not for you to inspect or summarize; only pcb_extract_bga may extract BGA names, selections, pins, nets, or board summaries.\n"
                 "Do not output ##PCB_FIELDS## from getProjectData results. Output ##PCB_FIELDS## only after a pcb_extract_bga tool response provides selection data.\n"
-                "After a target BGA and routerType are both known, call generateFanoutParams before route. For generateFanoutParams, pass only selectedBGA, routerType, and constraints explicitly stated by the user; do not invent line width, spacing, layer, via, or clearance values.\n"
+                "After a target BGA and routerType are both known, call generateFanoutParams before route. For generateFanoutParams, pass selectedBGA, routerType, userText as the original routing request, and constraints explicitly stated by the user; do not invent line width, spacing, layer, via, or clearance values.\n"
                 "If a prior generateFanoutParams <tool_response> contains fanoutParams and the current user asks to confirm/execute/start routing, your next output MUST be exactly a route tool call.\n"
                 "For route, set userData to the JSON string of the confirmed fanoutParams. Do not re-run getProjectData, pcb_extract_bga, or generateFanoutParams after fanoutParams are present unless the user asks to regenerate/change parameters.\n"
                 "Only call route after fanoutParams are present and the user confirms execution.\n"
@@ -2098,6 +2098,17 @@ class AIAgent:
             if {"orderLines", "selectedBGA", "routerType"} & set(parsed):
                 return parsed
         return None
+
+    @staticmethod
+    def _shim_explicit_route_execution_request(text: str) -> bool:
+        source = str(text or "")
+        if re.search(r"不要|别|先别|不用|无需|取消|只生成|仅生成|只给|仅给|修改|调整|change|edit", source):
+            return False
+        return bool(re.search(r"开始|执行|直接|进行|马上|现在|确认|可以|布线|route\b|routing\b|start\b|run\b|go\b", source, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _shim_fanout_has_natural_language_order_lines(fanout: Any) -> bool:
+        return isinstance(fanout, dict) and bool(fanout.get("naturalLanguageOrderLines"))
 
     @staticmethod
     def _shim_router_type_from_text(text: str) -> str:
@@ -2328,8 +2339,8 @@ class AIAgent:
             if last_extract_content:
                 return self._shim_wait_for_fanout_choice_content(last_extract_content)
             return "已进入全局 BGA fanout/逃逸布线流程，请先获取版图并识别 BGA。"
-        if forced_reroute and (proposed_names & {"getProjectData", "pcb_extract_bga", "generateFanoutParams", "route"}):
-            return "已进入拆线重布流程，请先框选需要拆线的走线，或说明要拆哪根线。"
+        if forced_reroute and (proposed_names & {"pcb_extract_bga", "generateFanoutParams", "route"}):
+            return "已进入拆线重布流程，请说明要重布的网络（例如 net13），或在前端框选需要拆线的走线。"
         if "route" in proposed_names and not last_fanout:
             return self._shim_wait_for_fanout_choice_content(last_extract_content)
         if last_extract_content and not last_fanout and (proposed_names & {"getProjectData", "pcb_extract_bga"}):
@@ -2446,6 +2457,12 @@ class AIAgent:
                 if name in {"deleteTracesForRerouting", "drop_net"}:
                     last_drop_net_index = msg_index
             if latest_plain_user_index > last_drop_net_index or not ({"deleteTracesForRerouting", "drop_net"} & response_names):
+                if (
+                    "getProjectData" in valid_names
+                    and "getProjectData" not in response_names
+                    and self._shim_has_explicit_reroute_net(latest_user)
+                ):
+                    return [self._make_shim_tool_call("getProjectData", {})]
                 return [self._make_shim_tool_call(reroute_delete_tool, {
                     "userText": latest_user,
                     "projectID": self._shim_project_id_from_text(latest_user_envelope),
@@ -2483,7 +2500,11 @@ class AIAgent:
                 last_extract_content = content
 
         is_confirm = bool(re.search(r"确认|执行|开始|继续|可以|ok\b|yes\b|go\b", latest_user or "", flags=re.IGNORECASE))
-        if last_fanout and is_confirm and not re.search(r"不|不要|取消|先别|修改|调整|change|edit", latest_user or "", flags=re.IGNORECASE):
+        if (
+            last_fanout
+            and (is_confirm or self._shim_fanout_has_natural_language_order_lines(last_fanout))
+            and self._shim_explicit_route_execution_request(latest_user)
+        ):
             return [self._make_shim_tool_call("route", {"userData": json.dumps(last_fanout, ensure_ascii=False)})]
 
         if "getProjectData" not in response_names:
@@ -2500,6 +2521,7 @@ class AIAgent:
                 return [self._make_shim_tool_call("generateFanoutParams", {
                     "selectedBGA": selected_bga,
                     "routerType": router_type,
+                    "userText": latest_user,
                 })]
 
         return None
@@ -2723,12 +2745,17 @@ class AIAgent:
         return bool(
             re.search(
                 r"(?:#|＃)\s*reroute\b|拆线\s*重布|局部\s*重布|重新布线|重布|重新布|重走|重新走线|"
-                r"\breroute\b|\bripup\b|\brip-up\b|删除.*(?:走线|线|trace|traces|框选|选中)|"
-                r"删.*(?:走线|线|trace|traces|框选|选中)",
+                r"\breroute\b|\bripup\b|\brip-up\b|删除.*(?:net|走线|线|trace|traces|框选|选中)|"
+                r"删.*(?:net|走线|线|trace|traces|框选|选中)|"
+                r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]+.*(?:布线|走线|布一下|走一下|层|layer|route|reroute|SIG\s*\d+|ART\s*\d+)",
                 text,
                 flags=re.IGNORECASE,
             )
         )
+
+    @staticmethod
+    def _shim_has_explicit_reroute_net(text: str) -> bool:
+        return bool(re.search(r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]+", text or "", flags=re.IGNORECASE))
 
     @staticmethod
     def _shim_parse_reroute_delete_payload(content: Any) -> dict:
@@ -2844,7 +2871,7 @@ class AIAgent:
                     error = error_value.strip()
         if not error:
             error = "未检测到可用于拆线重布的框选走线。"
-        return f"拆线重布未能继续：{error}\n请先在前端框选需要重布的走线后再试。"
+        return f"拆线重布未能继续：{error}\n请明确说明要重布的网络（例如 net13），或在前端框选需要重布的走线后再试。"
 
     @staticmethod
     def _shim_reroute_final_content(content: Any) -> str:

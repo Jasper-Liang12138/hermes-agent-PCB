@@ -3,7 +3,7 @@ from typing import Dict, List, Tuple
 import math
 import re
 
-from model.board import Board, Net, Pad, Via, Segment
+from model.board import Arc, Board, Net, Pad, Via, Segment
 
 
 # =========================================================
@@ -438,11 +438,11 @@ def parse_modules_from_text(text: str, layer_table: Dict[str, Dict]):#解析器�
 # =========================================================
 
 def parse_segments_from_text(
-        text: str, 
+        text: str,
         net_map: Dict[int, str],
         layer_table: Dict[str, Dict],
 ) -> List[Segment]: #解析线段信息，返回一个列表，每个元素是一个 Segment 对象，包含线段的起点、终点、宽度、所在层和所属网络等信息
-    
+
     segments = []
     blocks = extract_blocks_multi(text, ["segment"])
     seg_blocks = blocks["segment"]
@@ -478,6 +478,48 @@ def parse_segments_from_text(
         )
 
     return segments
+
+
+# =========================================================
+# routed arcs
+# =========================================================
+
+def parse_arcs_from_text(
+        text: str,
+        net_map: Dict[int, str],
+        layer_table: Dict[str, Dict],
+) -> List[Arc]:
+    arcs = []
+    arc_blocks = extract_blocks_multi(text, ["arc"])["arc"]
+
+    for i, block in enumerate(arc_blocks):
+        start_m = re.search(r'\(\s*start\s+([-\d\.]+)\s+([-\d\.]+)', block)
+        mid_m = re.search(r'\(\s*mid\s+([-\d\.]+)\s+([-\d\.]+)', block)
+        end_m = re.search(r'\(\s*end\s+([-\d\.]+)\s+([-\d\.]+)', block)
+        width_m = re.search(r'\(\s*width\s+([-\d\.]+)', block)
+        layer_m = re.search(r'\(\s*layer\s+([^\s\)"]+|"[^"]+")', block)
+        net_m = re.search(r'\(\s*net\s+(\d+)', block)
+
+        # Graphics arcs have no net and must not enter routing connectivity.
+        if not (start_m and mid_m and end_m and net_m):
+            continue
+
+        layer_name = layer_m.group(1).strip('"') if layer_m else "UNKNOWN"
+        net_id = int(net_m.group(1))
+        arcs.append(
+            Arc(
+                id=f"ARC_{i}",
+                net=net_map.get(net_id, ""),
+                layer=layer_name,
+                layer_id=resolve_layer_id(layer_name, layer_table),
+                width=float(width_m.group(1)) if width_m else 0.0,
+                start=(float(start_m.group(1)), float(start_m.group(2))),
+                mid=(float(mid_m.group(1)), float(mid_m.group(2))),
+                end=(float(end_m.group(1)), float(end_m.group(2))),
+            )
+        )
+
+    return arcs
 
 
 # =========================================================
@@ -560,7 +602,6 @@ def parse_pads_from_text(text: str, net_map: Dict[int, str], layer_table: Dict[s
         package_name = _extract_package_name_from_block(block)
         is_bga = _is_bga_package(package_name) or _infer_bga_from_pad_names_block(block)
         fp_x, fp_y, fp_angle = _extract_fp_at_from_block(block)
-
         pad_blocks = extract_blocks_multi(block, ["pad"])["pad"]
 
         for pb in pad_blocks:
@@ -574,11 +615,15 @@ def parse_pads_from_text(text: str, net_map: Dict[int, str], layer_table: Dict[s
                 continue
 
             pad_name = head.group(1).strip('"')
+            pad_type = head.group(2).strip('"')
             pad_shape = head.group(3).strip('"')
 
-            at_m = re.search(r'\(\s*at\s+([-\d\.]+)\s+([-\d\.]+)', pb)
+            at_m = re.search(
+                r'\(\s*at\s+([-\d\.]+)\s+([-\d\.]+)(?:\s+([-\d\.]+))?',
+                pb,
+            )
             size_m = re.search(r'\(\s*size\s+([-\d\.]+)\s+([-\d\.]+)', pb)
-            layers_m = re.search(r'\(\s*layers\s+([^\s\)"]+|"[^"]+")', pb)
+            layers_m = re.search(r'\(\s*layers\s+([^\)]*)\)', pb)
             net_m = re.search(r'\(\s*net\s+(\d+)', pb)
 
             if not at_m:
@@ -592,8 +637,19 @@ def parse_pads_from_text(text: str, net_map: Dict[int, str], layer_table: Dict[s
 
             size_x = float(size_m.group(1)) if size_m else 0.0
             size_y = float(size_m.group(2)) if size_m else 0.0
-            layer_name = layers_m.group(1).strip('"') if layers_m else "UNKNOWN"
+            layer_names = (
+                re.findall(r'"([^"]+)"|([^\s"]+)', layers_m.group(1))
+                if layers_m
+                else []
+            )
+            layer_names = [quoted or bare for quoted, bare in layer_names]
+            copper_layers = [
+                name for name in layer_names
+                if name.endswith(".Cu") or name in ("*.Cu", "F&B.Cu")
+            ]
+            layer_name = copper_layers[0] if copper_layers else "UNKNOWN"
             layer_id = resolve_layer_id(layer_name, layer_table)
+            pad_angle = float(at_m.group(3)) if at_m.group(3) else 0.0
 
             net_name = ""
             if net_m:
@@ -622,6 +678,9 @@ def parse_pads_from_text(text: str, net_map: Dict[int, str], layer_table: Dict[s
                     size_x=size_x,
                     size_y=size_y,
                     shape=pad_shape,
+                    pad_type=pad_type,
+                    layers=copper_layers,
+                    rotation=pad_angle - fp_angle,
                 )
             )
 
@@ -646,5 +705,6 @@ def parse_kicad(path: str) -> Board:
     board.pads = parse_pads_from_text(text, net_map, board.layers_table)
     board.vias = parse_vias_from_text(text, net_map, board.layers_table)
     board.segments = parse_segments_from_text(text, net_map, board.layers_table)
+    board.arcs = parse_arcs_from_text(text, net_map, board.layers_table)
 
     return board

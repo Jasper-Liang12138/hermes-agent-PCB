@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import configparser
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,11 +13,84 @@ import pytest
 from model_tools import handle_function_call
 from tools import pcb_model_runtime
 from tools import pcb_tools
+from tools.pcb_fanout_memory import FanoutMemoryStore, parse_fanout_memory_request, resolve_memory_root
 from tools import pcb_reroute_drc
 
 
 def _pin_csv(component: str) -> str:
     return f"PinNumber,Net\n1,{component}.NET1\n"
+
+
+def _outline_only_board_text(*body: str) -> str:
+    outline = [
+        "(gr_line (start 92.300044 135.800084) (end 117.700044 135.800084) (layer Edge.Cuts) (width 0.05))",
+        "(gr_line (start 117.700044 135.800084) (end 117.700044 161.200084) (layer Edge.Cuts) (width 0.05))",
+        "(gr_line (start 117.700044 161.200084) (end 92.300044 161.200084) (layer Edge.Cuts) (width 0.05))",
+        "(gr_line (start 92.300044 161.200084) (end 92.300044 135.800084) (layer Edge.Cuts) (width 0.05))",
+    ]
+    return "\n".join(["(kicad_pcb", *body, *outline, ")"])
+
+
+S0050_SAMPLE_DIR = Path(
+    "/work/mount/dataset/DRC/dataset/eval_data/dataset_400/samples/S0050_B007_R1_seed1002"
+)
+
+
+def _s0050_incomplete_board_text() -> str:
+    if not S0050_SAMPLE_DIR.is_dir():
+        pytest.skip(f"dataset sample not mounted: {S0050_SAMPLE_DIR}")
+    candidates = sorted(S0050_SAMPLE_DIR.glob("*_incomplete.kicad_pcb")) or sorted(S0050_SAMPLE_DIR.glob("*.kicad_pcb"))
+    if not candidates:
+        pytest.skip(f"no board files found in {S0050_SAMPLE_DIR}")
+    return candidates[0].read_text(encoding="utf-8", errors="replace")
+
+
+def _write_mock_fanout_artifacts(root: Path, version: int, params: dict) -> tuple[Path, Path, Path]:
+    artifact_dir = root / f"mock_v{version:03d}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    order_path = artifact_dir / "order_input.txt"
+    routed_path = artifact_dir / "routed_layout.txt"
+    import_path = artifact_dir / "line.out"
+    lines = [params["selectedBGA"], "1", str(len(params["orderLines"]))]
+    lines.extend(
+        f"{item['net']} {item['layer']} {item['order']}"
+        for item in params["orderLines"]
+    )
+    order_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    routed_path.write_text(
+        f"(kicad_pcb\n  (comment \"mock routed fanout v{version}\")\n)\n",
+        encoding="utf-8",
+    )
+    first_net = params["orderLines"][0]["net"]
+    import_path.write_text(f"TOP!LINE!0!{first_net}!1!1!2!2!6\n", encoding="utf-8")
+    return order_path, routed_path, import_path
+
+
+def _mock_fanout_params(version: int) -> dict:
+    variants = {
+        1: [
+            {"net": "NET_A", "layer": "SIG03", "order": 1},
+            {"net": "NET_B", "layer": "SIG04", "order": 2},
+            {"net": "NET_C", "layer": "SIG05", "order": 3},
+        ],
+        2: [
+            {"net": "NET_A", "layer": "SIG04", "order": 1},
+            {"net": "NET_B", "layer": "SIG03", "order": 2},
+            {"net": "NET_C", "layer": "SIG06", "order": 3},
+        ],
+        3: [
+            {"net": "NET_C", "layer": "SIG05", "order": 1},
+            {"net": "NET_A", "layer": "SIG03", "order": 2},
+            {"net": "NET_B", "layer": "SIG04", "order": 3},
+        ],
+    }
+    return {
+        "selectedBGA": "U1",
+        "routerType": "135" if version != 2 else "arc",
+        "constraints": {"LineWidth": 4 + version, "LineSpacing": 3 + version},
+        "orderLines": variants[version],
+        "naturalLanguageOrderLines": variants[version][:1],
+    }
 
 
 def _assert_route_summary(result: str, report: str, routing_path: Path, session_id: str) -> None:
@@ -100,13 +174,16 @@ def test_reroute_report_preserves_markdown_newlines():
         explain_report="可解释性分析报告\n================\n\n预测结果: 布线较差",
     )
     public_payload = pcb_tools._compact_public_reroute_payload({"content": report, "report": report})
+    pending_fields = pcb_tools._pending_reroute_fields_for_frontend(public_payload, "", "")
 
-    assert "DRC 分析\n========" in public_payload["report"]
+    assert public_payload["report"].startswith("## DRC 分析")
+    assert "### 失败原因" in public_payload["report"]
+    assert "## 本地布线质量分类模型报告" in public_payload["report"]
     assert "可解释性分析报告\n================" in public_payload["report"]
     assert "- 硬 DRC 问题数：2" in public_payload["report"]
     assert "`HR_CONNECT_PAD_NOT_ESCAPED`" in public_payload["report"]
     assert "issues=[" not in public_payload["report"]
-    assert "DRC 分析 ========" not in public_payload["report"]
+    assert pending_fields == {"report": public_payload["report"]}
 
 
 def test_reroute_import_layer_mapping_uses_pcb_builder_layer_names():
@@ -117,17 +194,24 @@ def test_reroute_import_layer_mapping_uses_pcb_builder_layer_names():
     assert pcb_tools._kicad_layer_to_line_out_layer("Conductor/Top") == "TOP"
 
 
-def test_reroute_line_out_coord_mapping_uses_pcb_builder_local_mils(monkeypatch):
-    class FakeConvert:
-        OUTLINE_ONLY_ORIGIN_X = 363386.0
-        OUTLINE_ONLY_ORIGIN_Y = 534646.0
-        DBU_MM = 0.000254
+def test_reroute_line_out_coord_mapping_reuses_convert_rules():
+    convert_mod = pcb_tools._load_convert_module()
 
-    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+    outline_point = pcb_tools._kicad_mm_point_to_line_out_coord_text(
+        106.479086,
+        139.172950,
+        convert_mod=convert_mod,
+        outline_only_translation=True,
+    )
+    native_point = pcb_tools._kicad_mm_point_to_line_out_coord_text(
+        1.0,
+        2.0,
+        convert_mod=convert_mod,
+        outline_only_translation=False,
+    )
 
-    assert pcb_tools._kicad_mm_to_line_out_coord_text("106.479086", "x") == "558.23"
-    assert pcb_tools._kicad_mm_to_line_out_coord_text("139.172950", "y") == "132.79"
-    assert pcb_tools._kicad_mm_to_line_out_coord_text("135.628380", "y") == "-6.76"
+    assert outline_point == ("558.23", "132.79")
+    assert native_point == ("39.37", "78.74")
 
 
 def test_validate_reroute_incremental_import_accepts_line_out_records():
@@ -141,13 +225,7 @@ def test_validate_reroute_incremental_import_accepts_line_out_records():
     assert stats["layers"] == ["TOP"]
 
 
-def test_write_reroute_line_out_clips_single_axis_missing_route(monkeypatch, tmp_path):
-    class FakeConvert:
-        OUTLINE_ONLY_ORIGIN_X = 363386.0
-        OUTLINE_ONLY_ORIGIN_Y = 534646.0
-        DBU_MM = 0.000254
-
-    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+def test_write_reroute_line_out_clips_single_axis_missing_route(tmp_path):
     patch = "\n".join(
         [
             "(segment (start 106.480000 139.170000) (end 106.480000 135.630000) (width 0.152400) (layer Top) (net 58))",
@@ -166,7 +244,7 @@ def test_write_reroute_line_out_clips_single_axis_missing_route(monkeypatch, tmp
 
     path, _ = pcb_tools._write_reroute_incremental_import_file(
         patch_text=patch,
-        board_text="(kicad_pcb (net 58 Z7_SPI0_SCK))",
+        board_text=_outline_only_board_text("(net 58 Z7_SPI0_SCK)"),
         output_dir=str(tmp_path),
         session_id="clip",
         local_context=local_context,
@@ -240,6 +318,204 @@ def test_reroute_model_max_tokens_env_overrides_config_and_is_capped(monkeypatch
     assert pcb_tools._get_reroute_model_max_tokens() == 8192
 
 
+def test_fanout_memory_root_env_overrides_config(monkeypatch, tmp_path):
+    configured = tmp_path / "configured"
+    env_root = tmp_path / "env"
+    monkeypatch.setenv("PCB_FANOUT_MEMORY_DIR", str(env_root))
+
+    assert resolve_memory_root(str(configured)) == env_root.resolve()
+
+
+def test_fanout_memory_records_initial_route_and_restore_params(tmp_path):
+    store = FanoutMemoryStore(str(tmp_path))
+    session_id = "sess-memory"
+    store.bind_project(session_id, "proj-memory")
+
+    history = store.record_initial_layout(session_id, project_id="proj-memory", layout_text="(kicad_pcb initial)")
+    assert history["latestVersion"] == 0
+    assert history["currentLayoutVersion"] == 0
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    order_path = artifacts / "order_input.txt"
+    routed_path = artifacts / "routing_input.txt"
+    import_path = artifacts / "line.out"
+    order_path.write_text("U1\n1\n1\nN1 SIG03 1\n", encoding="utf-8")
+    routed_path.write_text("(kicad_pcb routed)", encoding="utf-8")
+    import_path.write_text("TOP!LINE!0!N1!1!1!2!2!6\n", encoding="utf-8")
+
+    params = {
+        "selectedBGA": "U1",
+        "routerType": "135",
+        "orderLines": [{"net": "N1", "layer": "SIG03", "order": 1}],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+    record = store.record_route_version(
+        session_id,
+        fanout_params=params,
+        base_layout_version=0,
+        order_input_path=str(order_path),
+        routed_layout_path=str(routed_path),
+        import_lines_path=str(import_path),
+        report="布线完成",
+    )
+
+    assert record["version"] == 1
+    restored, restored_version = store.fanout_params_for_version(session_id, 1)
+    assert restored_version == 1
+    assert restored["orderLines"] == params["orderLines"]
+
+    layout_text, layout_version, layout_path = store.resolve_layout_text(session_id, 1)
+    assert layout_version == 1
+    assert layout_text == "(kicad_pcb routed)"
+    assert layout_path.endswith("v001/routed_layout.txt")
+
+    updated = store.mark_import_status(session_id, 1, "success", "EDA 导入完成")
+    assert updated["currentLayoutVersion"] == 1
+
+
+def test_parse_fanout_memory_request_distinguishes_params_and_layout():
+    restore = parse_fanout_memory_request("回到第3版参数")
+    assert restore["isMemoryRequest"] is True
+    assert restore["intent"] == "restore_params"
+    assert restore["restoredFromVersion"] == 3
+    assert restore["autoRoute"] is False
+
+    rerun = parse_fanout_memory_request("从初始版图开始，用第1版参数再来一轮，然后布线")
+    assert rerun["isMemoryRequest"] is True
+    assert rerun["intent"] == "rerun_from_params"
+    assert rerun["baseLayoutVersion"] == 0
+    assert rerun["restoredFromVersion"] == 1
+    assert rerun["autoRoute"] is True
+
+
+@pytest.mark.parametrize(
+    "sample_dir",
+    [
+        Path("/work/mount/dataset/DRC/dataset/eval_data/dataset_400/samples/S0001_B001_R1_seed1001"),
+        Path("/work/mount/dataset/DRC/dataset/eval_data/dataset_400/samples/S0050_B007_R1_seed1002"),
+    ],
+)
+def test_fanout_memory_records_dataset_sample_layouts(tmp_path, sample_dir):
+    if not sample_dir.is_dir():
+        pytest.skip(f"dataset sample not mounted: {sample_dir}")
+    candidates = sorted(sample_dir.glob("*_incomplete.kicad_pcb")) or sorted(sample_dir.glob("*.kicad_pcb"))
+    assert candidates, f"no board files found in {sample_dir}"
+
+    board_text = candidates[0].read_text(encoding="utf-8", errors="replace")
+    store = FanoutMemoryStore(str(tmp_path))
+    history = store.record_initial_layout(
+        f"sess-{sample_dir.name}",
+        project_id=sample_dir.name,
+        layout_text=board_text,
+    )
+
+    assert history["latestVersion"] == 0
+    layout_text, version, path = store.resolve_layout_text(f"sess-{sample_dir.name}", 0)
+    assert version == 0
+    assert layout_text.lstrip().startswith("( kicad_pcb") or layout_text.lstrip().startswith("(kicad_pcb")
+    assert path.endswith("v000/layout.txt")
+
+
+def test_fanout_memory_only_pipeline_restores_random_s0050_version(tmp_path):
+    board_text = _s0050_incomplete_board_text()
+    store = FanoutMemoryStore(str(tmp_path / "memory"))
+    session_id = "sess-s0050-memory-pipeline"
+    store.record_initial_layout(session_id, project_id=S0050_SAMPLE_DIR.name, layout_text=board_text)
+
+    original_params: dict[int, dict] = {}
+    for version in (1, 2, 3):
+        params = _mock_fanout_params(version)
+        order_path, routed_path, import_path = _write_mock_fanout_artifacts(tmp_path / "artifacts", version, params)
+        record = store.record_route_version(
+            session_id,
+            fanout_params=params,
+            base_layout_version=0 if version == 1 else version - 1,
+            restored_from_version=None,
+            user_text=f"mock fanout round {version}",
+            order_input_path=str(order_path),
+            routed_layout_path=str(routed_path),
+            import_lines_path=str(import_path),
+            report=f"mock report v{version}",
+        )
+        assert record["version"] == version
+        store.mark_import_status(session_id, version, "success", f"mock import success v{version}")
+        original_params[version] = params
+
+    summary = store.history_summary(session_id)
+    assert summary["latestVersion"] == 3
+    assert summary["currentLayoutVersion"] == 3
+    assert [item["version"] for item in summary["versions"]] == [0, 1, 2, 3]
+
+    rng = random.Random(20260612)
+    restored_version = rng.randint(1, 3)
+    restored_params, resolved = store.fanout_params_for_version(session_id, restored_version)
+    assert resolved == restored_version
+    assert restored_params == original_params[restored_version]
+
+    restored_layout, layout_version, layout_path = store.resolve_layout_text(session_id, restored_version)
+    assert layout_version == restored_version
+    assert f"mock routed fanout v{restored_version}" in restored_layout
+    assert layout_path.endswith(f"v{restored_version:03d}/routed_layout.txt")
+
+    draft = store.write_draft(
+        session_id,
+        fanout_params=restored_params,
+        user_text=f"回到第{restored_version}版参数",
+        base_layout_version="current",
+        restored_from_version=restored_version,
+    )
+    assert draft["restoredFromVersion"] == restored_version
+    assert draft["baseLayoutVersion"] == 3
+    assert draft["fanoutParams"] == original_params[restored_version]
+
+
+def test_real_fanout_pipeline_records_s0050_when_router_available(tmp_path):
+    from tools.pcb_bjut_router import bjut_router_available, generate_fanout_params
+
+    if not bjut_router_available("135", work_dir=tmp_path):
+        pytest.skip("135 router is not available in this environment")
+
+    board_text = _s0050_incomplete_board_text()
+    store = FanoutMemoryStore(str(tmp_path / "memory"))
+    session_id = "sess-s0050-real-fanout-pipeline"
+    store.record_initial_layout(session_id, project_id=S0050_SAMPLE_DIR.name, layout_text=board_text)
+
+    fanout_params = generate_fanout_params(
+        project_data=board_text,
+        selected_bga="U1",
+        router_type="135",
+        work_dir=tmp_path / "router_work",
+        constraints={"LineWidth": 4, "LineSpacing": 3},
+    )
+    assert fanout_params["selectedBGA"] == "U1"
+    assert fanout_params["routerType"] == "135"
+    assert fanout_params["orderLines"]
+
+    routed_path = tmp_path / "router_work" / "routing_input.txt"
+    import_path = tmp_path / "router_work" / "line.out"
+    if not routed_path.is_file():
+        routed_path.write_text(board_text, encoding="utf-8")
+    if not import_path.is_file():
+        first_net = fanout_params["orderLines"][0]["net"]
+        import_path.write_text(f"TOP!LINE!0!{first_net}!1!1!2!2!6\n", encoding="utf-8")
+
+    record = store.record_route_version(
+        session_id,
+        fanout_params=fanout_params,
+        base_layout_version=0,
+        order_input_path=str(tmp_path / "router_work" / "order_input.txt"),
+        routed_layout_path=str(routed_path),
+        import_lines_path=str(import_path),
+        report="real fanout params generated",
+    )
+    assert record["version"] == 1
+
+    restored, restored_version = store.fanout_params_for_version(session_id, 1)
+    assert restored_version == 1
+    assert restored == fanout_params
+
+
 @pytest.fixture(autouse=True)
 def _restore_transport_state(monkeypatch):
     transport = pcb_tools.WebSocketTransportSingleton.get_instance()
@@ -248,6 +524,8 @@ def _restore_transport_state(monkeypatch):
     prev_cache = dict(transport._cached_project_data)
     prev_reroute_cache = dict(transport._cached_reroute_context)
     prev_pending_fields = dict(transport._pending_pcb_fields)
+    prev_project_ids = dict(transport._session_project_ids)
+    prev_fanout_memory = transport._fanout_memory
     prev_adapter = transport._websocket_adapter
     prev_loop = transport._main_loop
     monkeypatch.setattr(
@@ -276,6 +554,8 @@ def _restore_transport_state(monkeypatch):
     transport._cached_project_data = prev_cache
     transport._cached_reroute_context = prev_reroute_cache
     transport._pending_pcb_fields = prev_pending_fields
+    transport._session_project_ids = prev_project_ids
+    transport._fanout_memory = prev_fanout_memory
     transport._websocket_adapter = prev_adapter
     transport._main_loop = prev_loop
 
@@ -447,12 +727,17 @@ def test_generate_fanout_params_uses_cached_project_data(monkeypatch, tmp_path):
     )
     payload = json.loads(result)
 
-    assert payload["fanoutParams"] == {
+    fanout_params = payload["fanoutParams"]
+    assert {
+        key: fanout_params[key]
+        for key in ("selectedBGA", "routerType", "orderLines", "constraints")
+    } == {
         "selectedBGA": "U27",
         "routerType": "rl_135",
         "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
         "constraints": {"LineWidth": 5.0, "LineSpacing": 3},
     }
+    assert "_fanoutMemory" in fanout_params
     assert seen["project_data"] == '(pcb_data (component (name "U27") (package "BGA-256")))'
     assert seen["selected_bga"] == "U27"
     assert seen["router_type"] == "rl_135"
@@ -471,7 +756,7 @@ def test_route_requires_router_type_even_with_active_websocket_adapter(monkeypat
         raise AssertionError("route must not be proxied to frontend")
 
     def _should_not_run(*args, **kwargs):
-        raise AssertionError("route must require explicit routerType before running")
+        raise AssertionError("route must require generated fanoutParams before running auto")
 
     monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _should_not_proxy)
     monkeypatch.setattr(pcb_tools.subprocess, "run", _should_not_run)
@@ -481,7 +766,7 @@ def test_route_requires_router_type_even_with_active_websocket_adapter(monkeypat
     payload = json.loads(result)
 
     assert payload["routingResult"] == ""
-    assert "缺少 routerType" in payload["report"]
+    assert "需要先生成 fanoutParams" in payload["report"]
     assert not (tmp_path / "版图信息.txt").exists()
     assert not (tmp_path / "order_input.txt").exists()
 
@@ -508,7 +793,10 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
+    calls = []
+
     def _fake_run(cmd, cwd, capture_output, text, encoding, errors, timeout):
+        calls.append([str(part) for part in cmd])
         executable = Path(cmd[1]).name if Path(cmd[0]).name.startswith("python") else Path(cmd[0]).name
         if executable == "a.out":
             assert cmd[-2:] == ["layout_input.txt", "component_input.txt"]
@@ -517,7 +805,7 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
         elif executable == "b.out":
             assert cmd[-2:] == ["layer_input.txt", "layout_input.txt"]
         elif executable == "c.out":
-            assert cmd[-4:] == ["order_input.txt", "layout_input.txt", "constrain.txt", "component_input.txt"]
+            assert cmd[-3:] == ["order_input.txt", "layout_input.txt", "constrain.txt"]
             (tmp_path / "U35_pins.csv").write_text(_pin_csv("U35"), encoding="utf-8")
             (tmp_path / "ARC_output.txt").write_text("arc", encoding="utf-8")
             (tmp_path / "net_list.txt").write_text("NET_A_P_SIG03 ; J1.A1 U35.A1 ; 3.00\n", encoding="utf-8")
@@ -545,6 +833,7 @@ def test_route_appends_component_from_session_selection(monkeypatch, tmp_path):
     assert (tmp_path / "order_input.txt").read_text(encoding="utf-8") == (
         "U35\n1\n2\nNET_A_P_SIG03 SIG03 1\nNET_A_N_SIG03 SIG03 2"
     )
+    assert [_router_call_executable_name(call) for call in calls] == ["c.out"]
 
 
 def test_handle_function_call_uses_explicit_session_for_get_project_data(monkeypatch):
@@ -685,7 +974,7 @@ def test_route_arc_profile_uses_readme_flow(monkeypatch, tmp_path):
             assert args == ["layer_input.txt", "layout_input.txt"]
             (work_dir / "order_input.txt").write_text((work_dir / "order_input.txt").read_text(encoding="utf-8"), encoding="utf-8")
         elif executable == "c.out":
-            assert args == ["order_input.txt", "layout_input.txt", "constrain.txt", "component_input.txt"]
+            assert args == ["order_input.txt", "layout_input.txt", "constrain.txt"]
             (work_dir / "U27_pins.csv").write_text(_pin_csv("U27"), encoding="utf-8")
             (work_dir / "ARC_output.txt").write_text("arc-lines", encoding="utf-8")
             (work_dir / "net_list.txt").write_text("NET_A_P_SIG03 ; J1.A1 U27.A1 ; 3.00\n", encoding="utf-8")
@@ -780,11 +1069,7 @@ def test_route_135_profile_uses_readme_flow(monkeypatch, tmp_path):
     assert (work_dir / "layout_input.txt").read_text(encoding="utf-8") == transport._cached_project_data["sess-135-route"]
     assert (work_dir / "component_input.txt").read_text(encoding="utf-8") == "U22\n"
     assert (work_dir / "order_input.txt").read_text(encoding="utf-8") == "U22\n1\n1\nVCC SIG04 2"
-    assert [_router_call_executable_name(call) for call in calls] == [
-        "d.out",
-        "e.out",
-        "f.out",
-    ]
+    assert [_router_call_executable_name(call) for call in calls] == ["f.out"]
 
 
 def test_extract_reroute_nets_from_user_text():
@@ -892,6 +1177,80 @@ def test_delete_traces_for_rerouting_prefers_frontend_routes_over_user_text_nets
     cached = transport.get_cached_reroute_context("sess-pcb-drop-text-nets")
     assert cached["selectedNets"] == ["net13"]
     assert cached["localContext"]["source"] == "deleteTracesForRerouting"
+
+
+def test_delete_traces_for_rerouting_uses_natural_language_net_when_frontend_has_no_selection(monkeypatch, tmp_path):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    session_id = "sess-pcb-nl-reroute"
+    transport.current_session_id = session_id
+    transport.set_session_mode(session_id, "pcb")
+    board_path = tmp_path / "board.kicad_pcb"
+    board_text = """
+(kicad_pcb
+  (net 13 "net13")
+  (net 17 "net17")
+  (module BGA (layer Top)
+    (at 0 0)
+    (fp_text reference U1)
+    (pad A1 smd rect (at 0 0) (size 1 1) (layers Top) (net 13 "net13"))
+    (pad A2 smd rect (at 10 0) (size 1 1) (layers Top) (net 13 "net13"))
+    (pad B1 smd rect (at 0 10) (size 1 1) (layers Top) (net 17 "net17"))
+    (pad B2 smd rect (at 10 10) (size 1 1) (layers Top) (net 17 "net17"))
+  )
+  (segment (start 0 0) (end 5 0) (width 0.1524) (layer Top) (net 13))
+  (via (at 5 0) (size 0.45) (drill 0.2) (layers Top Bottom) (net 13))
+  (segment (start 0 10) (end 10 10) (width 0.1524) (layer Top) (net 17))
+)
+""".strip()
+    board_path.write_text(board_text, encoding="utf-8")
+    transport.cache_project_data_path(str(board_path), session_id=session_id)
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        assert tool_name == "deleteTracesForRerouting"
+        return {"error": "未检测到框选走线", "missingRoutes": []}
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.delete_traces_for_rerouting("请重布 net13，优先走 Top 层", projectID="proj1")
+    payload = json.loads(result)
+
+    assert "error" not in payload
+    assert payload["naturalLanguageReroute"] is True
+    assert payload["selectedNets"] == ["net13"]
+    assert payload["missingRoutes"][0]["net_name"] == "net13"
+    assert payload["localContext"]["source"] == "naturalLanguageReroute"
+    assert payload["localContext"]["routerPriority"] == "model_first_pcbrouter_fallback"
+    assert payload["constraints"]["naturalLanguageOrderLines"] == [
+        {"net": "net13", "layer": "Top", "order": 1}
+    ]
+    dropped_text = Path(payload["droppedBoardDataFilePath"]).read_text(encoding="utf-8")
+    assert "(net 13" in dropped_text
+    assert "(net 17" in dropped_text
+    assert "(net 13)" not in dropped_text
+    assert "(net 17)" in dropped_text
+    cached = transport.get_cached_reroute_context(session_id)
+    assert cached["selectedNets"] == ["net13"]
+    assert cached["missingRoutes"][0]["net_name"] == "net13"
+
+
+def test_delete_traces_for_rerouting_requires_explicit_net_for_natural_language_fallback(monkeypatch):
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    session_id = "sess-pcb-nl-reroute-no-net"
+    transport.current_session_id = session_id
+    transport.set_session_mode(session_id, "pcb")
+
+    def _fake_call_tool_sync(tool_name, arguments, timeout=30.0, session_id=None):
+        assert tool_name == "deleteTracesForRerouting"
+        return {"error": "未检测到框选走线", "missingRoutes": []}
+
+    monkeypatch.setattr(pcb_tools._transport, "call_tool_sync", _fake_call_tool_sync)
+
+    result = pcb_tools.delete_traces_for_rerouting("把那条线拆了重新布", projectID="proj1")
+    payload = json.loads(result)
+
+    assert payload["selectedNets"] == []
+    assert "未检测到框选走线" in payload["error"]
+    assert transport.get_cached_reroute_context(session_id) is None
 
 
 def test_delete_traces_for_rerouting_surfaces_frontend_error(monkeypatch):
@@ -1738,13 +2097,6 @@ def test_reroute_drc_pass_returns_public_txt_path(monkeypatch, tmp_path):
     monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
     monkeypatch.setattr(pcb_reroute_drc, "validate_kicad_patch_with_drc", _fake_validate)
     monkeypatch.setattr(pcb_tools, "_convert_internal_kicad_to_public_txt", _fake_convert)
-
-    class FakeConvert:
-        OUTLINE_ONLY_ORIGIN_X = 0.0
-        OUTLINE_ONLY_ORIGIN_Y = 0.0
-        DBU_MM = 0.000254
-
-    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
 
     result = pcb_tools.reroute(session_id="sess-pcb-reroute-drc-pass")
     payload = json.loads(result)

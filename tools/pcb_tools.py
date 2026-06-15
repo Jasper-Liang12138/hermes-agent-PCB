@@ -38,6 +38,7 @@ from pathlib import Path
 from tools import pcb_model_runtime
 from tools.pcb_drc_agent_report import generate_drc_agent_report
 from tools.pcb_explain_report import generate_explain_report
+from tools.pcb_fanout_memory import FanoutMemoryStore
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,12 @@ def _router_type_from_payload(user_data_obj: Any, route_params: Any) -> str:
             if router_type:
                 return router_type
     return _normalize_router_type(os.getenv("ROUTER_TYPE") or os.getenv("PCB_ROUTER_TYPE"))
+
+
+def _default_router_type_for_fanout_text(text: str = "") -> str:
+    if re.search(r"\b(?:SIG|ART)\s*\d+\b|Top|Bottom|顶层|底层", str(text or ""), re.IGNORECASE):
+        return "auto_arc"
+    return "auto_135"
 
 
 def _router_profile_dir(router_type: str, work_dir: Path) -> Path:
@@ -826,6 +833,50 @@ def _resolve_component_refdes(user_data_obj: Any, route_params: Any, session_id:
     )
 
 
+def _fanout_memory_meta_from_payload(*payloads: Any) -> Dict[str, Any]:
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in ("_fanoutMemory", "fanoutMemory", "memory"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return dict(value)
+    return {}
+
+
+def _fanout_memory_payload_value(*payloads: Any, keys: tuple[str, ...]) -> Any:
+    meta = _fanout_memory_meta_from_payload(*payloads)
+    for key in keys:
+        if key in meta and meta.get(key) not in (None, ""):
+            return meta.get(key)
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        for key in keys:
+            if key in payload and payload.get(key) not in (None, ""):
+                return payload.get(key)
+    return None
+
+
+def _fanout_memory_base_version(*payloads: Any) -> Any:
+    return _fanout_memory_payload_value(
+        *payloads,
+        keys=("baseLayoutVersion", "baseVersion", "sourceVersion", "fanoutBaseVersion"),
+    )
+
+
+def _fanout_memory_restored_version(*payloads: Any) -> Any:
+    return _fanout_memory_payload_value(
+        *payloads,
+        keys=("restoredFromVersion", "paramsVersion", "restoredVersion", "fanoutParamsVersion"),
+    )
+
+
+def _fanout_memory_user_text(*payloads: Any) -> str:
+    value = _fanout_memory_payload_value(*payloads, keys=("userText", "routingIntentText", "requestText"))
+    return str(value or "").strip()
+
+
 # ============================================================================
 # WebSocket Transport Singleton
 # 保存 adapter 引用、主 event loop 引用、当前活跃 session_id
@@ -849,6 +900,8 @@ class WebSocketTransportSingleton:
     _cached_reroute_context: Dict[str, Dict[str, Any]] = {}  # session_id -> drop_net 结果缓存
     _session_modes: Dict[str, str] = {}  # session_id -> chat/pcb
     _pending_pcb_fields: Dict[str, Dict[str, Any]] = {}  # session_id -> fields emitted by tools
+    _session_project_ids: Dict[str, str] = {}  # session_id -> frontend project id
+    _fanout_memory: FanoutMemoryStore = FanoutMemoryStore()
 
     @classmethod
     def get_instance(cls) -> "WebSocketTransportSingleton":
@@ -861,6 +914,20 @@ class WebSocketTransportSingleton:
         self._websocket_adapter = adapter
         self._main_loop = loop
         logger.info("PCB transport: adapter and main loop registered")
+
+    def configure_fanout_memory(self, configured_dir: Optional[str] = None) -> None:
+        """Configure the on-disk fanout memory root for this process."""
+        self._fanout_memory.set_configured_dir(configured_dir)
+
+    def bind_project(self, session_id: Optional[str], project_id: Optional[str]) -> None:
+        """Bind a frontend project id to a WebSocket session for fanout memory paths."""
+        resolved = self.resolve_session_id(session_id)
+        if not resolved:
+            return
+        project = str(project_id or "").strip()
+        if project:
+            self._session_project_ids[resolved] = project
+            self._fanout_memory.bind_project(resolved, project)
 
     def get_adapter(self):
         return self._websocket_adapter
@@ -909,6 +976,7 @@ class WebSocketTransportSingleton:
         self._cached_project_data_paths.pop(session_id, None)
         self._cached_reroute_context.pop(session_id, None)
         self._pending_pcb_fields.pop(session_id, None)
+        self._session_project_ids.pop(session_id, None)
         if self.current_session_id == session_id:
             self.current_session_id = None
 
@@ -918,6 +986,14 @@ class WebSocketTransportSingleton:
         if not session_id:
             return
         self._cached_project_data[session_id] = data
+        try:
+            self._fanout_memory.record_initial_layout(
+                session_id,
+                project_id=self._session_project_ids.get(session_id, ""),
+                layout_text=data,
+            )
+        except Exception:
+            logger.debug("Failed recording initial fanout layout memory", exc_info=True)
 
     def get_cached_project_data(self, session_id: Optional[str] = None) -> Optional[str]:
         session_id = self.resolve_session_id(session_id)
@@ -971,6 +1047,102 @@ class WebSocketTransportSingleton:
         if not session_id:
             return {}
         return self._pending_pcb_fields.pop(session_id, {})
+
+    def fanout_memory_history(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        return self._fanout_memory.load_history(session_id or "") if session_id else {}
+
+    def fanout_memory_summary(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        return self._fanout_memory.history_summary(session_id or "") if session_id else {}
+
+    def fanout_memory_has_history(self, session_id: Optional[str] = None) -> bool:
+        session_id = self.resolve_session_id(session_id)
+        return self._fanout_memory.has_history(session_id or "") if session_id else False
+
+    def fanout_layout_data(self, session_id: Optional[str] = None, version: Any = None) -> tuple[str, Optional[int], str]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return "", None, ""
+        return self._fanout_memory.resolve_layout_text(session_id, version)
+
+    def fanout_params_for_version(self, session_id: Optional[str], version: Any) -> tuple[Dict[str, Any], Optional[int]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}, None
+        params, resolved = self._fanout_memory.fanout_params_for_version(session_id, version)
+        return params if isinstance(params, dict) else {}, resolved
+
+    def latest_fanout_params(self, session_id: Optional[str]) -> tuple[Dict[str, Any], Optional[int]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}, None
+        params, resolved = self._fanout_memory.latest_fanout_params(session_id)
+        return params if isinstance(params, dict) else {}, resolved
+
+    def write_fanout_draft(
+        self,
+        session_id: Optional[str],
+        *,
+        fanout_params: Dict[str, Any],
+        user_text: str = "",
+        base_layout_version: Any = None,
+        restored_from_version: Any = None,
+    ) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        return self._fanout_memory.write_draft(
+            session_id,
+            fanout_params=fanout_params,
+            user_text=user_text,
+            base_layout_version=base_layout_version,
+            restored_from_version=restored_from_version,
+        )
+
+    def fanout_draft(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        return self._fanout_memory.load_draft(session_id or "") if session_id else {}
+
+    def record_fanout_route_version(
+        self,
+        session_id: Optional[str],
+        *,
+        fanout_params: Dict[str, Any],
+        base_layout_version: Any = None,
+        restored_from_version: Any = None,
+        user_text: str = "",
+        order_input_path: str = "",
+        routed_layout_path: str = "",
+        import_lines_path: str = "",
+        report: str = "",
+    ) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        return self._fanout_memory.record_route_version(
+            session_id,
+            fanout_params=fanout_params,
+            base_layout_version=base_layout_version,
+            restored_from_version=restored_from_version,
+            user_text=user_text,
+            order_input_path=order_input_path,
+            routed_layout_path=routed_layout_path,
+            import_lines_path=import_lines_path,
+            report=report,
+        )
+
+    def mark_fanout_import_status(
+        self,
+        session_id: Optional[str],
+        version: Any,
+        status: str,
+        message: str = "",
+    ) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        return self._fanout_memory.mark_import_status(session_id, version, status, message=message)
 
     def call_tool_sync(
         self,
@@ -1309,27 +1481,67 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
     except json.JSONDecodeError:
         return json.dumps({"routingResult": "", "report": f"无效的 userData JSON: {userData[:200]}"})
 
-    # 从 session 缓存取版图数据
-    project_data = _transport.get_cached_project_data(session_id=session_id)
-    if not project_data:
-        return json.dumps({"routingResult": "", "report": "缺少版图数据，请先调用 getProjectData"})
-
     work_dir = Path(os.getenv("ROUTER_WORK_DIR", "."))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     router_type = ""
     component_refdes = ""
+    fanout_base_version = None
+    fanout_restored_version = None
+    fanout_user_text = ""
     try:
         logger.info("route local start: session=%s work_dir=%s", session_id, work_dir)
         route_params = user_data_obj.get("fanoutParams") if isinstance(user_data_obj.get("fanoutParams"), dict) else user_data_obj
         if not isinstance(route_params, dict):
             return json.dumps({"routingResult": "", "report": "userData 必须是 JSON 对象"})
 
+        fanout_base_version = _fanout_memory_base_version(user_data_obj, route_params)
+        fanout_restored_version = _fanout_memory_restored_version(user_data_obj, route_params)
+        fanout_user_text = _fanout_memory_user_text(user_data_obj, route_params)
+
+        project_data = ""
+        resolved_base_version = None
+        if fanout_base_version not in (None, ""):
+            project_data, resolved_base_version, base_path = _transport.fanout_layout_data(
+                session_id=session_id,
+                version=fanout_base_version,
+            )
+            if project_data:
+                fanout_base_version = resolved_base_version
+                logger.info(
+                    "route using fanout memory base layout: session=%s version=%s path=%s",
+                    session_id,
+                    resolved_base_version,
+                    base_path,
+                )
+        if not project_data:
+            draft = _transport.fanout_draft(session_id=session_id)
+            draft_base = draft.get("baseLayoutVersion") if isinstance(draft, dict) else None
+            if draft_base not in (None, ""):
+                project_data, resolved_base_version, base_path = _transport.fanout_layout_data(
+                    session_id=session_id,
+                    version=draft_base,
+                )
+                if project_data:
+                    fanout_base_version = resolved_base_version
+                    logger.info(
+                        "route using fanout draft base layout: session=%s version=%s path=%s",
+                        session_id,
+                        resolved_base_version,
+                        base_path,
+                    )
+        if not project_data:
+            project_data = _transport.get_cached_project_data(session_id=session_id) or ""
+        if not project_data:
+            return json.dumps({"routingResult": "", "report": "缺少版图数据，请先调用 getProjectData"})
+
         router_type = _router_type_from_payload(user_data_obj, route_params)
         if not router_type:
+            router_type = _default_router_type_for_fanout_text(fanout_user_text)
+        if router_type.startswith("auto"):
             return json.dumps({
                 "routingResult": "",
-                "report": "缺少 routerType，请选择布线器：arc、135、rl、rl_arc、rl_135",
+                "report": "routerType=auto 需要先生成 fanoutParams，让系统自动选择实际层分配/逃逸顺序搜索器后再执行布线。",
             }, ensure_ascii=False)
         from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_route
 
@@ -1401,12 +1613,33 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         # Step 6: 传递输出文件路径，避免通过 WebSocket 发送大块版图文本
         routing_result_size = routing_result_path.stat().st_size
         report_text = str(report or "").strip().rstrip("。")
+        memory_record = {}
+        try:
+            memory_record = _transport.record_fanout_route_version(
+                session_id=session_id,
+                fanout_params=fanout_params,
+                base_layout_version=fanout_base_version,
+                restored_from_version=fanout_restored_version,
+                user_text=fanout_user_text,
+                order_input_path=str(work_dir / "order_input.txt"),
+                routed_layout_path=str(routing_result_path),
+                import_lines_path=str(import_lines_path),
+                report=report_text or "布线完成（无详细报告）",
+            )
+        except Exception:
+            logger.warning("Failed recording fanout route memory", exc_info=True)
+            memory_record = {}
+        memory_version = memory_record.get("version") if isinstance(memory_record, dict) else None
+        pending_fields = {
+            "routingResult": str(routing_result_path),
+            "importLinesFilePath": str(import_lines_path),
+            "report": report_text or "布线完成（无详细报告）",
+        }
+        if memory_version is not None:
+            pending_fields["fanoutMemoryVersion"] = memory_version
+            pending_fields["fanoutHistory"] = _transport.fanout_memory_summary(session_id=session_id)
         _transport.set_pending_pcb_fields(
-            {
-                "routingResult": str(routing_result_path),
-                "importLinesFilePath": str(import_lines_path),
-                "report": report_text or "布线完成（无详细报告）",
-            },
+            pending_fields,
             session_id=session_id,
         )
         summary = report_text if report_text.startswith("布线完成") else f"布线完成。{report_text}"
@@ -1476,6 +1709,9 @@ def generate_fanout_params_tool(
     selectedBGA: str = "",
     routerType: str = "",
     constraints: Optional[Dict[str, Any]] = None,
+    userText: str = "",
+    baseVersion: Any = None,
+    restoredFromVersion: Any = None,
     session_id: Optional[str] = None,
 ) -> str:
     """Generate fanoutParams from cached board data via the BJUT layer/order adapter."""
@@ -1485,19 +1721,22 @@ def generate_fanout_params_tool(
         logger.warning(msg)
         return json.dumps({"error": msg}, ensure_ascii=False)
 
-    project_data = _transport.get_cached_project_data(session_id=session_id)
+    project_data = ""
+    resolved_base_version = None
+    if baseVersion not in (None, ""):
+        project_data, resolved_base_version, _base_path = _transport.fanout_layout_data(
+            session_id=session_id,
+            version=baseVersion,
+        )
+    if not project_data:
+        project_data = _transport.get_cached_project_data(session_id=session_id) or ""
     if not project_data:
         return json.dumps({
             "error": "缺少版图数据，请先调用 getProjectData。",
             "fanoutParams": None,
         }, ensure_ascii=False)
 
-    router_type = _normalize_router_type(routerType)
-    if not router_type:
-        return json.dumps({
-            "error": "缺少 routerType，请先让用户选择 arc、135、rl、rl_arc 或 rl_135。",
-            "fanoutParams": None,
-        }, ensure_ascii=False)
+    router_type = _normalize_router_type(routerType) or _default_router_type_for_fanout_text(userText)
 
     selected_bga = str(selectedBGA or "").strip()
     if not selected_bga:
@@ -1513,9 +1752,15 @@ def generate_fanout_params_tool(
         "LineWidth": _fanout_positive_number(normalized_constraints.get("LineWidth"), 4),
         "LineSpacing": _fanout_positive_number(normalized_constraints.get("LineSpacing"), 3),
     }
+    try:
+        from tools.pcb_nl_fanout import parse_fanout_constraints_from_text
+        normalized_constraints.update(parse_fanout_constraints_from_text(userText))
+    except Exception:
+        logger.debug("Natural-language fanout constraints skipped", exc_info=True)
 
     try:
         from tools.pcb_bjut_router import bjut_router_available, generate_fanout_params
+        from tools.pcb_nl_fanout import merge_explicit_order_lines, parse_natural_language_order_lines
 
         work_dir = Path(os.getenv("ROUTER_WORK_DIR", ".")).resolve()
         if not bjut_router_available(router_type, work_dir=work_dir):
@@ -1539,6 +1784,37 @@ def generate_fanout_params_tool(
         fanout_params.setdefault("selectedBGA", selected_bga)
         fanout_params.setdefault("routerType", router_type)
         fanout_params.setdefault("constraints", normalized_constraints)
+        explicit_order_lines = parse_natural_language_order_lines(
+            userText,
+            fanout_params.get("orderLines", []),
+        )
+        if explicit_order_lines:
+            fanout_params["orderLines"] = merge_explicit_order_lines(fanout_params.get("orderLines", []), explicit_order_lines)
+            fanout_params["naturalLanguageOrderLines"] = explicit_order_lines
+        if resolved_base_version is not None or restoredFromVersion not in (None, ""):
+            fanout_params["_fanoutMemory"] = {
+                "baseLayoutVersion": resolved_base_version,
+                "restoredFromVersion": restoredFromVersion,
+                "userText": userText,
+            }
+        draft = _transport.write_fanout_draft(
+            session_id=session_id,
+            fanout_params=fanout_params,
+            user_text=userText,
+            base_layout_version=resolved_base_version,
+            restored_from_version=restoredFromVersion,
+        )
+        if draft:
+            memory_meta = dict(fanout_params.get("_fanoutMemory") or {})
+            memory_meta.update(
+                {
+                    "draftId": draft.get("draftId"),
+                    "baseLayoutVersion": draft.get("baseLayoutVersion"),
+                    "restoredFromVersion": draft.get("restoredFromVersion"),
+                    "userText": userText,
+                }
+            )
+            fanout_params["_fanoutMemory"] = memory_meta
         return json.dumps({"fanoutParams": fanout_params}, ensure_ascii=False)
     except Exception as exc:
         logger.error("generateFanoutParams failed: %s", exc, exc_info=True)
@@ -1570,6 +1846,18 @@ registry.register(
                     "type": "object",
                     "description": "Optional routing constraints, e.g. LineWidth/LineSpacing in mil.",
                 },
+                "userText": {
+                    "type": "string",
+                    "description": "Original natural-language routing request; may include explicit net layer/order assignments.",
+                },
+                "baseVersion": {
+                    "type": ["integer", "string"],
+                    "description": "Optional fanout memory base layout version, e.g. 0, 1, or 'current'.",
+                },
+                "restoredFromVersion": {
+                    "type": ["integer", "string"],
+                    "description": "Optional fanout memory params version this request restores from.",
+                },
             },
             "required": ["selectedBGA", "routerType"],
         },
@@ -1578,6 +1866,9 @@ registry.register(
         selectedBGA=args.get("selectedBGA", ""),
         routerType=args.get("routerType", ""),
         constraints=args.get("constraints") if isinstance(args.get("constraints"), dict) else None,
+        userText=args.get("userText", ""),
+        baseVersion=args.get("baseVersion"),
+        restoredFromVersion=args.get("restoredFromVersion"),
         session_id=kwargs.get("session_id"),
     ),
     check_fn=lambda: True,
@@ -1585,6 +1876,21 @@ registry.register(
 
 
 _NET_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:net|NET)[A-Za-z0-9_.+\-/]*")
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in values or []:
+        text = str(raw or "").strip().strip("，。,.!?！？:：;；、")
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
 
 
 def extract_reroute_nets(user_text: str) -> list[str]:
@@ -1597,15 +1903,337 @@ def extract_reroute_nets(user_text: str) -> list[str]:
         if _NET_TOKEN_RE.fullmatch(candidate):
             found.append(candidate)
 
-    seen: set[str] = set()
-    nets: list[str] = []
-    for raw in found:
-        net = raw.strip().strip("，。,.!?！？:：;；、")
-        key = net.casefold()
-        if net and key != "net" and key not in seen:
-            seen.add(key)
-            nets.append(net)
-    return nets
+    return [net for net in _dedupe_preserve_order(found) if net.casefold() != "net"]
+
+
+def _casefold_lookup(values: list[str]) -> dict[str, str]:
+    return {str(value).casefold(): str(value) for value in values if str(value).strip()}
+
+
+def _resolve_reroute_net_names(board_text: str, requested_nets: list[str]) -> tuple[list[str], list[str]]:
+    """Resolve user-provided net names against the current board, preserving input order."""
+    requested = _dedupe_preserve_order(requested_nets)
+    if not requested:
+        return [], []
+    id_to_name, name_to_id = _parse_reroute_net_declarations(board_text or "")
+    by_name = _casefold_lookup(list(name_to_id.keys()))
+    by_id = {str(net_id): name for net_id, name in id_to_name.items()}
+    resolved: list[str] = []
+    missing: list[str] = []
+    for net in requested:
+        if net.casefold() in by_name:
+            resolved.append(by_name[net.casefold()])
+            continue
+        if net in by_id:
+            resolved.append(by_id[net])
+            continue
+        missing.append(net)
+    return _dedupe_preserve_order(resolved), missing
+
+
+def _extract_kicad_net_id_from_block(block: str) -> str:
+    match = re.search(r"\(\s*net\s+(\d+)\b", block or "", flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_kicad_layer_from_block(block: str) -> str:
+    match = re.search(r"\(\s*layer\s+([^\s\)]+)", block or "", flags=re.IGNORECASE)
+    return _strip_kicad_atom(match.group(1) if match else "")
+
+
+def _extract_segment_endpoints(block: str) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    start = _parse_float_pair(r"\(\s*start\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", block or "")
+    end = _parse_float_pair(r"\(\s*end\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", block or "")
+    return start, end
+
+
+def _extract_via_point(block: str) -> tuple[float, float] | None:
+    return _parse_float_pair(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", block or "")
+
+
+def _endpoint_from_point(
+    point: tuple[float, float],
+    *,
+    layer: str,
+    net_name: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "net_name": net_name,
+        "layer": layer or "Top",
+        "x": float(point[0]),
+        "y": float(point[1]),
+        "source": source,
+    }
+
+
+def _distance_squared(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return (float(a[0]) - float(b[0])) ** 2 + (float(a[1]) - float(b[1])) ** 2
+
+
+def _longest_endpoint_pair(points: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if len(points) < 2:
+        return None
+    best: tuple[dict[str, Any], dict[str, Any]] | None = None
+    best_distance = -1.0
+    for index, first in enumerate(points[:-1]):
+        try:
+            first_point = (float(first.get("x")), float(first.get("y")))
+        except (TypeError, ValueError):
+            continue
+        for second in points[index + 1:]:
+            try:
+                second_point = (float(second.get("x")), float(second.get("y")))
+            except (TypeError, ValueError):
+                continue
+            distance = _distance_squared(first_point, second_point)
+            if distance > best_distance:
+                best_distance = distance
+                best = (first, second)
+    return best
+
+
+def _route_from_endpoint_pair(net_name: str, first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "net_name": net_name,
+        "start": dict(first),
+        "end": dict(second),
+    }
+
+
+def _missing_route_from_deleted_objects(
+    *,
+    net_name: str,
+    deleted_objects: list[dict[str, Any]],
+    board_text: str,
+) -> dict[str, Any] | None:
+    segment_endpoints: list[dict[str, Any]] = []
+    via_points: list[dict[str, Any]] = []
+    for item in deleted_objects:
+        if item.get("net") != net_name:
+            continue
+        layer = str(item.get("layer") or "Top")
+        points = item.get("points")
+        if isinstance(points, list) and len(points) >= 2:
+            for point in points[:2]:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    try:
+                        segment_endpoints.append(
+                            _endpoint_from_point(
+                                (float(point[0]), float(point[1])),
+                                layer=layer,
+                                net_name=net_name,
+                                source="deleted_segment",
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+        elif isinstance(points, list) and len(points) == 1:
+            point = points[0]
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                try:
+                    via_points.append(
+                        _endpoint_from_point(
+                            (float(point[0]), float(point[1])),
+                            layer=layer,
+                            net_name=net_name,
+                            source="deleted_via",
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+    pair = _longest_endpoint_pair(segment_endpoints) or _longest_endpoint_pair(via_points)
+    if pair:
+        return _route_from_endpoint_pair(net_name, pair[0], pair[1])
+
+    pad_endpoints = _module_pad_endpoints_for_nets(board_text, target_net_names=[net_name], target_net_ids=[])
+    pair = _longest_endpoint_pair(pad_endpoints)
+    if pair:
+        return _route_from_endpoint_pair(net_name, pair[0], pair[1])
+    return None
+
+
+def _remove_blocks_from_text(text: str, blocks: list[str]) -> str:
+    result = text
+    for block in sorted(blocks, key=len, reverse=True):
+        result = result.replace(block, "", 1)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result
+
+
+def _build_natural_language_reroute_context(
+    *,
+    user_text: str,
+    session_id: Optional[str],
+    project_id: str,
+) -> Dict[str, Any]:
+    requested_nets = extract_reroute_nets(user_text)
+    if not requested_nets:
+        return {
+            "selectedNets": [],
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "error": "未从自然语言中识别到明确网络名。请说明要重布的 net，例如 `重布 net13`，或在前端框选走线。",
+            "naturalLanguageReroute": True,
+            "needsTargetNet": True,
+        }
+
+    cached_board_data = _transport.get_cached_project_data(session_id=session_id) or ""
+    cached_board_path = _transport.get_cached_project_data_path(session_id=session_id) or ""
+    output_dir = _resolve_reroute_output_dir({}, cached_board_path, session_id or "session")
+    board_text, board_path, notes = _write_internal_board_data(
+        board_data=cached_board_data,
+        board_path=str(cached_board_path or ""),
+        output_dir=output_dir,
+        session_id=session_id or "session",
+        label="nl_original",
+    )
+    if not board_text:
+        return {
+            "selectedNets": [],
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "error": "当前没有可用版图数据，无法按自然语言拆线。请先获取版图或在 PCB 客户端保持项目打开后重试。",
+            "naturalLanguageReroute": True,
+            "needsProjectData": True,
+        }
+    if not _looks_like_kicad_board_data(board_text):
+        return {
+            "selectedNets": [],
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "error": "当前版图数据无法转换成可解析的 KiCad 版图，不能安全执行自然语言拆线。请改用前端框选走线。",
+            "naturalLanguageReroute": True,
+        }
+
+    selected_nets, missing_nets = _resolve_reroute_net_names(board_text, requested_nets)
+    if not selected_nets:
+        return {
+            "selectedNets": [],
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "requestedNets": requested_nets,
+            "missingNets": missing_nets,
+            "error": f"当前板图中找不到这些网络：{', '.join(missing_nets or requested_nets)}。请确认网络名后重试。",
+            "naturalLanguageReroute": True,
+        }
+
+    try:
+        from tools.pcb_nl_fanout import parse_natural_language_order_lines
+
+        natural_language_order_lines = parse_natural_language_order_lines(
+            user_text,
+            [],
+            allowed_nets=set(selected_nets),
+        )
+    except Exception as exc:
+        logger.warning("Failed parsing natural language reroute layer assignments: %s", exc)
+        natural_language_order_lines = []
+
+    name_to_id = _parse_kicad_net_name_to_id(board_text)
+    selected_ids = {name_to_id[net] for net in selected_nets if net in name_to_id}
+    blocks_to_remove: list[str] = []
+    dropped_objects: list[dict[str, Any]] = []
+    for head in ("segment", "via"):
+        for block in _extract_balanced_sexpr_blocks(board_text, head):
+            net_id = _extract_kicad_net_id_from_block(block)
+            if not net_id or net_id not in selected_ids:
+                continue
+            net_name = next((name for name in selected_nets if name_to_id.get(name) == net_id), "")
+            layer = _extract_kicad_layer_from_block(block) or "Top"
+            points: list[tuple[float, float]] = []
+            if head == "segment":
+                start, end = _extract_segment_endpoints(block)
+                if start and end:
+                    points = [start, end]
+            else:
+                point = _extract_via_point(block)
+                if point:
+                    points = [point]
+            blocks_to_remove.append(block)
+            dropped_objects.append(
+                {
+                    "net": net_name,
+                    "netId": net_id,
+                    "type": head,
+                    "layer": layer,
+                    "points": points,
+                    "deleted": True,
+                    "source": "natural_language_backend_ripup",
+                }
+            )
+
+    if not blocks_to_remove:
+        return {
+            "selectedNets": selected_nets,
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "requestedNets": requested_nets,
+            "missingNets": missing_nets,
+            "error": f"已识别网络 {', '.join(selected_nets)}，但当前版图中没有找到可删除的 segment/via。请确认该网络已有走线，或在前端框选需要删除的走线。",
+            "naturalLanguageReroute": True,
+        }
+
+    dropped_board_data = _remove_blocks_from_text(board_text, blocks_to_remove)
+    base_dir = Path(output_dir) / "_internal"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    dropped_board_path = base_dir / f"{_safe_reroute_name(session_id or 'session')}_nl_dropped.kicad_pcb"
+    dropped_board_path.write_text(dropped_board_data, encoding="utf-8")
+
+    missing_routes = []
+    for net in selected_nets:
+        route = _missing_route_from_deleted_objects(net_name=net, deleted_objects=dropped_objects, board_text=board_text)
+        if route:
+            missing_routes.append(route)
+
+    if not missing_routes:
+        return {
+            "selectedNets": selected_nets,
+            "selectedTraceIds": [],
+            "missingRoutes": [],
+            "requestedNets": requested_nets,
+            "missingNets": missing_nets,
+            "droppedObjects": dropped_objects,
+            "error": "已按自然语言删除目标网络走线，但无法构造明确的重布端点；请在前端框选具体线段后重试。",
+            "naturalLanguageReroute": True,
+        }
+
+    return {
+        "selectedNets": selected_nets,
+        "selectedTraceIds": [],
+        "missingRoutes": missing_routes,
+        "requestedNets": requested_nets,
+        "missingNets": missing_nets,
+        "droppedObjects": dropped_objects,
+        "droppedBoardDataFilePath": str(dropped_board_path),
+        "originalBoardDataFilePath": str(board_path or cached_board_path or ""),
+        "droppedBoardDataChars": len(dropped_board_data),
+        "naturalLanguageReroute": True,
+        "conversionNotes": notes,
+        "constraints": {
+            "naturalLanguageOrderLines": natural_language_order_lines,
+            "routingIntentText": user_text,
+            "routerPriority": "model_first_pcbrouter_fallback",
+        },
+        "localContext": {
+            "source": "naturalLanguageReroute",
+            "projectID": project_id,
+            "selectionCount": len(blocks_to_remove),
+            "selectedNetCount": len(selected_nets),
+            "requestedNets": requested_nets,
+            "missingNets": missing_nets,
+            "missingRoutes": missing_routes,
+            "naturalLanguageOrderLines": natural_language_order_lines,
+            "deletedObjectCount": len(dropped_objects),
+            "routerPriority": "model_first_pcbrouter_fallback",
+        },
+        "dropResult": {
+            "source": "naturalLanguageReroute",
+            "deletedObjectCount": len(dropped_objects),
+            "selectedNets": selected_nets,
+            "missingNets": missing_nets,
+        },
+    }
 
 
 def _parse_json_value(value: Any) -> Any:
@@ -1831,17 +2459,20 @@ def _kicad_mm_to_mil_text(value: str) -> str:
     return f"{(float(value) / 0.0254):.2f}"
 
 
-def _kicad_mm_to_line_out_coord_text(value: str, axis: str) -> str:
-    """Convert internal KiCad mm coordinates back to PCB Builder line.out local mils."""
-    try:
-        convert_mod = _load_convert_module()
-        origin = float(getattr(convert_mod, "OUTLINE_ONLY_ORIGIN_X" if axis == "x" else "OUTLINE_ONLY_ORIGIN_Y"))
-        dbu_mm = float(getattr(convert_mod, "DBU_MM"))
-    except Exception:
-        origin = 363386.0 if axis == "x" else 534646.0
-        dbu_mm = 0.000254
-    local_mil = (float(value) / dbu_mm - origin) / 100.0
-    return f"{local_mil:.2f}"
+def _kicad_mm_point_to_line_out_coord_text(
+    x_mm: float,
+    y_mm: float,
+    *,
+    convert_mod: Any,
+    outline_only_translation: bool,
+) -> tuple[str, str]:
+    """Convert a KiCad point with the same DBU and outline rules as convert.py."""
+    x_dbu, y_dbu = convert_mod.kicad_mm_point_to_txt_dbu(
+        x_mm,
+        y_mm,
+        outline_only_translation=outline_only_translation,
+    )
+    return f"{convert_mod.dbu_to_mil(x_dbu):.2f}", f"{convert_mod.dbu_to_mil(y_dbu):.2f}"
 
 
 def _kicad_layer_to_import_layer(layer: str) -> str:
@@ -2031,6 +2662,8 @@ def _write_reroute_incremental_import_file(
     if not patch_text:
         return "", []
 
+    convert_mod = _load_convert_module()
+    outline_only_translation = convert_mod.kicad_board_uses_outline_only_translation(board_text)
     net_id_to_name = _kicad_net_id_to_name(board_text)
     line_records: list[str] = []
     for block in _extract_balanced_sexpr_blocks(patch_text, "segment"):
@@ -2060,10 +2693,18 @@ def _write_reroute_incremental_import_file(
         if clipped is None:
             continue
         x1_raw, y1_raw, x2_raw, y2_raw = clipped
-        x1 = _kicad_mm_to_line_out_coord_text(str(x1_raw), "x")
-        y1 = _kicad_mm_to_line_out_coord_text(str(y1_raw), "y")
-        x2 = _kicad_mm_to_line_out_coord_text(str(x2_raw), "x")
-        y2 = _kicad_mm_to_line_out_coord_text(str(y2_raw), "y")
+        x1, y1 = _kicad_mm_point_to_line_out_coord_text(
+            x1_raw,
+            y1_raw,
+            convert_mod=convert_mod,
+            outline_only_translation=outline_only_translation,
+        )
+        x2, y2 = _kicad_mm_point_to_line_out_coord_text(
+            x2_raw,
+            y2_raw,
+            convert_mod=convert_mod,
+            outline_only_translation=outline_only_translation,
+        )
 
         line_records.append(f"{line_layer}!LINE!0!{net_name}!{x1}!{y1}!{x2}!{y2}!{width_mil}")
 
@@ -2607,26 +3248,24 @@ def _compose_drc_analysis_report(
     failed_txt_status = f"已保存：{failed_txt_path}" if failed_txt_path else "未保存。"
     import_status = "允许，满足 DRC 通过且 txt 已生成。" if import_allowed else "不允许，必须 DRC 通过且生成 txt 后才允许 importLines。"
     lines = [
-        "DRC 分析",
-        "========",
+        "## DRC 分析",
         "",
-        f"DRC 状态: {status}",
-        f"{conclusion_label}: {conclusion}",
+        f"- DRC 状态: {status}",
+        f"- txt 输出: {txt_status}",
+        f"- 失败回填txt: {failed_txt_status}",
+        f"- importLines: {import_status}",
+        "",
+        f"### {conclusion_label}",
+        "",
+        conclusion,
     ]
     drc_agent_message = _drc_agent_message_zh(payload)
     if drc_agent_message:
-        lines.extend(["", drc_agent_message])
+        lines.extend(["", "### DRC 规则检查", "", drc_agent_message])
     else:
         drc_agent_failure = _drc_agent_failure_summary(payload)
         if drc_agent_failure:
-            lines.extend(["", f"DRC规则检查结果：{drc_agent_failure}"])
-    lines.extend(
-        [
-            f"txt 输出: {txt_status}",
-            f"失败回填txt: {failed_txt_status}",
-            f"importLines: {import_status}",
-        ]
-    )
+            lines.extend(["", "### DRC 规则检查", "", f"DRC规则检查结果：{drc_agent_failure}"])
     return "\n".join(lines).strip()
 
 
@@ -2643,9 +3282,8 @@ def _compose_reroute_report_content(
         explain_text = "本地布线质量分类模型未返回可用报告。"
     explain_text = _compact_public_text(explain_text, 3000, preserve_newlines=True)
     explain_section = (
-        "本地布线质量分类模型报告\n"
-        "========================\n\n"
-        "以下内容来自本地分类模型，仅作为布线质量分类参考，不覆盖上面的 DRC 结论。\n\n"
+        "## 本地布线质量分类模型报告\n\n"
+        "> 以下内容来自本地分类模型，仅作为布线质量分类参考，不覆盖上面的 DRC 结论。\n\n"
         f"{explain_text}"
     )
     return f"{drc_report}\n\n{explain_section}".strip()
@@ -2971,13 +3609,45 @@ def delete_traces_for_rerouting(userText: str = "", projectID: str = "", session
         )
         payload = _normalize_delete_for_rerouting_payload(raw_result, user_text=userText, project_id=projectID)
         if payload.get("error"):
+            nl_payload: Dict[str, Any] | None = None
+            if extract_reroute_nets(userText):
+                nl_payload = _build_natural_language_reroute_context(
+                    user_text=userText,
+                    session_id=session_id,
+                    project_id=projectID,
+                )
+            if nl_payload and not nl_payload.get("error"):
+                nl_payload["frontendDeleteFallback"] = {
+                    "attempted": True,
+                    "error": payload.get("error"),
+                }
+                _transport.cache_reroute_context(nl_payload, session_id=session_id)
+                return json.dumps(nl_payload, ensure_ascii=False)
             logger.warning("deleteTracesForRerouting returned unusable reroute context: %s", payload.get("error"))
             _transport.clear_reroute_context(session_id)
+            if nl_payload and nl_payload.get("error"):
+                payload["naturalLanguageFallbackError"] = nl_payload.get("error")
         else:
             _transport.cache_reroute_context(payload, session_id=session_id)
         return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         logger.error("deleteTracesForRerouting failed: %s", e)
+        if extract_reroute_nets(userText):
+            try:
+                payload = _build_natural_language_reroute_context(
+                    user_text=userText,
+                    session_id=session_id,
+                    project_id=projectID,
+                )
+                if not payload.get("error"):
+                    payload["frontendDeleteFallback"] = {
+                        "attempted": True,
+                        "error": str(e),
+                    }
+                    _transport.cache_reroute_context(payload, session_id=session_id)
+                    return json.dumps(payload, ensure_ascii=False)
+            except Exception as fallback_exc:
+                logger.error("natural language reroute fallback failed: %s", fallback_exc)
         return json.dumps({"selectedNets": [], "selectedTraceIds": [], "error": str(e)}, ensure_ascii=False)
 
 
@@ -3753,6 +4423,16 @@ def _build_reroute_generation_prompts(
             "DRC 失败反馈（下一轮必须据此修改走线，不要重复失败 patch）:\n"
             f"{json.dumps(drc_feedback or [], ensure_ascii=False, indent=2)}\n\n"
         )
+    layer_assignment_text = ""
+    if isinstance(constraints, dict):
+        order_lines = constraints.get("naturalLanguageOrderLines")
+        if isinstance(order_lines, list) and order_lines:
+            layer_assignment_text = (
+                "自然语言指定的网络层分配/顺序（优先遵守）:\n"
+                f"{json.dumps(order_lines, ensure_ascii=False, indent=2)}\n"
+                "如果缺失走线描述中的端点层和这里的指定层不同，可使用 via 完成换层，"
+                "但必须保持只重布 selectedNets，不得移动其它网络。\n\n"
+            )
     user_prompt = (
         "/no_think\n"
         "你是一个 PCB 逃逸布线智能体。请根据 PCB 上下文和缺失走线描述，"
@@ -3765,9 +4445,11 @@ def _build_reroute_generation_prompts(
         f"{task_description.strip() or '前端已框选并删除局部走线，请根据上下文补全同网缺失连接。'}\n\n"
         "相关 KiCad 上下文片段：\n"
         f"{context_text}\n\n"
+        f"{layer_assignment_text}"
         f"{feedback_text}"
         "布线约束：\n"
         "- 必须保留 PCB 上下文中的 net id、层名、线宽和坐标含义。\n"
+        "- 如果用户在自然语言里指定了某个 selected net 的层，优先在该层生成该网络的主走线。\n"
         "- 如果缺失走线描述中包含内部 KiCad start/end 端点，输出的 segment/via 必须精确连接这些端点。\n"
         "- 缺失走线描述中的前端原始坐标只用于展示，禁止直接作为 KiCad patch 坐标。\n"
         "- 优先短的曼哈顿或近似曼哈顿路径，避免不同网络在同一铜层交叉。\n"

@@ -1,0 +1,18 @@
+{
+    "boundary": [
+        [185.04,185.04],
+        [854.34,854.34],
+    ],
+    "origin": {
+        "x": 519.69,
+        "y": 519.69,
+    },
+    "pin_radius": 8,
+    "pin_spacing": 4,
+    "linewidth": 3,
+    "pairspacing": 4.5,
+    "viaradius": 8,
+    "vialinespacing": 3,
+    "keepoutlength": 8,
+    "keepoutradius": 14.5
+}

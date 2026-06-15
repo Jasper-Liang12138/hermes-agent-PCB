@@ -274,6 +274,74 @@ def test_websocket_reroute_intent_loads_reroute_skill_without_bootstrap():
 @pytest.mark.parametrize(
     "text",
     [
+        "请重布 net13，走 Top 层",
+        "net13 走 SIG03，net17 走 SIG04，然后布线",
+        "route NET_U1_B7 on Top",
+    ],
+)
+def test_websocket_explicit_net_route_uses_reroute_without_router_choice(text):
+    adapter = _make_adapter()
+    decision = adapter._decide_route("sess-nl-net-reroute", text)
+
+    assert decision.mode == "pcb"
+    assert decision.intent == "pcb_reroute_selected"
+    assert decision.reason == "pcb_reroute_selected"
+    assert decision.bootstrap_get_project is False
+    assert adapter._session_flow_states["sess-nl-net-reroute"] == "reroute"
+
+
+def test_websocket_fanout_memory_iteration_preempts_net_reroute(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-fanout-memory"
+    monkeypatch.setattr(adapter, "_has_fanout_memory_history", lambda _session_id: True)
+
+    decision = adapter._decide_route(
+        session_id,
+        "再来一轮，从初始版图开始，用第1版参数，net13 走 SIG03，然后布线",
+    )
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "fanout_memory"
+    assert adapter._session_flow_states.get(session_id, "idle") != "reroute"
+    request = adapter._session_fanout_memory_requests[session_id]
+    assert request["baseLayoutVersion"] == 0
+    assert request["restoredFromVersion"] == 1
+    assert request["autoRoute"] is True
+
+
+def test_websocket_fanout_memory_request_without_history_is_explicit(monkeypatch):
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_has_fanout_memory_history", lambda _session_id: False)
+
+    decision = adapter._decide_route("sess-no-fanout-memory", "回到第1版参数")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "fanout_memory_missing"
+    assert "还没有可恢复的 fanout 历史" in decision.immediate_reply
+
+
+def test_websocket_fanout_memory_pipeline_random_restore_request(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-random-restore"
+    restored_version = 2
+    monkeypatch.setattr(adapter, "_has_fanout_memory_history", lambda _session_id: True)
+
+    decision = adapter._decide_route(
+        session_id,
+        f"我觉得第{restored_version}版比较好，回到第{restored_version}版参数",
+    )
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "fanout_memory"
+    request = adapter._session_fanout_memory_requests[session_id]
+    assert request["intent"] == "restore_params"
+    assert request["restoredFromVersion"] == restored_version
+    assert request["autoRoute"] is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "删除我框选的线重新布线",
         "请对当前框选走线拆线重布",
         "把我选中的 traces 删除后重新走线",
@@ -566,7 +634,7 @@ def test_websocket_natural_language_bga_reselect_invalidates_fanout_params():
 
     assert decision.mode == "pcb"
     assert decision.reason == "reselect_before_confirm"
-    assert decision.immediate_reply
+    assert not decision.immediate_reply
     assert adapter._session_selected_targets[session_id] == "U23"
     assert adapter._session_flow_states[session_id] == "wait_router_type"
     assert session_id not in adapter._session_fanout_params
@@ -1275,7 +1343,9 @@ def test_fanout_params_visible_content_is_normalized():
         {"fanoutParams": fanout_params},
     )
 
-    assert normalized == "已完成逃逸参数配置，请确认"
+    assert normalized.startswith("已完成逃逸参数配置，请确认")
+    assert "GND -> Top" in normalized
+    assert "VCC -> Art03" in normalized
 
 
 def test_direct_fanout_payload_is_sent_as_fanout_params():

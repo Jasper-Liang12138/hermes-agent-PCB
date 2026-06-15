@@ -1,0 +1,8 @@
+{
+    "linewidth": 3,
+    "pairspacing": 4,
+    "viaradius": 8,
+    "vialinespacing": 3,
+    "keepoutlength": 8,
+    "keepoutradius": 14.5
+}

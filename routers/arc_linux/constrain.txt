@@ -1,0 +1,2 @@
+LineWidth:3
+LineSpacing:4.5

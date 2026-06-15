@@ -332,6 +332,28 @@ def outline_only_untranslate(point: Point) -> Point:
     return (point[0] - OUTLINE_ONLY_ORIGIN_X, point[1] - OUTLINE_ONLY_ORIGIN_Y)
 
 
+def outline_bounds_use_outline_only_translation(bounds: Tuple[int, int, int, int]) -> bool:
+    min_x, min_y, max_x, max_y = bounds
+    return (
+        min_x == OUTLINE_ONLY_ORIGIN_X
+        and min_y == OUTLINE_ONLY_ORIGIN_Y
+        and max_x == OUTLINE_ONLY_ORIGIN_X + OUTLINE_ONLY_SIZE_X
+        and max_y == OUTLINE_ONLY_ORIGIN_Y + OUTLINE_ONLY_SIZE_Y
+    )
+
+
+def kicad_mm_point_to_txt_dbu(
+    x_mm: float,
+    y_mm: float,
+    *,
+    outline_only_translation: bool,
+) -> Point:
+    point = (mm_to_dbu(float(x_mm)), mm_to_dbu(float(y_mm)))
+    if outline_only_translation:
+        return outline_only_untranslate(point)
+    return point
+
+
 def dbu_to_mil(value: int) -> float:
     return value / 100.0
 
@@ -1846,6 +1868,30 @@ def write_kicad(board: BoardModel) -> str:
     return "\n".join(lines) + "\n"
 
 
+def kicad_board_uses_outline_only_translation(text: str) -> bool:
+    sections = extract_root_children(text, "kicad_pcb")
+    outline_points: List[Point] = []
+    for sec in sections:
+        if sec.name != "gr_line":
+            continue
+        node = parse_sexpr(sec.text)
+        if child_text(node, "layer", "") != "Edge.Cuts":
+            continue
+        start = next(child_nodes(node, "start"), None)
+        end = next(child_nodes(node, "end"), None)
+        if start is None or end is None or len(start) < 3 or len(end) < 3:
+            continue
+        outline_points.extend(
+            [
+                (mm_to_dbu(float(start[1])), mm_to_dbu(float(start[2]))),
+                (mm_to_dbu(float(end[1])), mm_to_dbu(float(end[2]))),
+            ]
+        )
+    return bool(outline_points) and outline_bounds_use_outline_only_translation(
+        infer_bounds_from_points(outline_points)
+    )
+
+
 def parse_kicad_board(path: Path) -> BoardModel:
     text = path.read_text(encoding="utf-8", errors="replace")
     sections = extract_root_children(text, "kicad_pcb")
@@ -2091,12 +2137,7 @@ def parse_kicad_board(path: Path) -> BoardModel:
     for outline in board.outlines:
         pts.extend(flatten_steps(outline.steps))
     min_x, min_y, max_x, max_y = infer_bounds_from_points(pts)
-    if (
-        min_x == OUTLINE_ONLY_ORIGIN_X
-        and min_y == OUTLINE_ONLY_ORIGIN_Y
-        and max_x == OUTLINE_ONLY_ORIGIN_X + OUTLINE_ONLY_SIZE_X
-        and max_y == OUTLINE_ONLY_ORIGIN_Y + OUTLINE_ONLY_SIZE_Y
-    ):
+    if outline_bounds_use_outline_only_translation((min_x, min_y, max_x, max_y)):
         for comp in board.components:
             comp.x, comp.y = outline_only_untranslate((comp.x, comp.y))
             for pin in comp.pins:

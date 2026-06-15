@@ -1,4 +1,5 @@
 import json
+import re
 
 from collections import defaultdict
 
@@ -66,6 +67,16 @@ def _is_power_or_ground_net(net: str) -> bool:
         return False
 
     net_u = net.upper().strip()
+    compact = re.sub(r"\s+", "", net_u)
+
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?V", compact):
+        return True
+
+    if re.search(
+        r"(?:^|[^A-Z0-9])(?:[+-]?\d+(?:\.\d+)?V|\d+V\d+|V\d+P\d+|\d+P\d+V?)(?:$|[^A-Z0-9])",
+        net_u,
+    ):
+        return True
 
     # 1) 普通关键字：子串匹配
     for kw in POWER_GROUND_KEYWORDS:

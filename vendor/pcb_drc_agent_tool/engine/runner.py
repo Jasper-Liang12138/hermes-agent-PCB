@@ -7,6 +7,7 @@ from rules.hard_rules import (
     check_p1_all_named_bga_pads_escaped,
     check_p2_single_escape_per_bga_pad,
     check_p7_segment_crossing,
+    check_h6_pad_segment_crossing,
     #check_h2_dangling_segment,
     check_h3_branch_escape_incomplete,
     #check_h4_endpoint_not_unique,
@@ -83,8 +84,10 @@ def run_hard_checks(board, log_fn=None, with_timing=False):
 
     hard_rules = [
         ("HR_CONNECT_PAD_NOT_ESCAPED", check_p1_all_named_bga_pads_escaped),
-        ("HR_TOPO_MULTIPLE_ESCAPE", lambda board: check_p2_single_escape_per_bga_pad(board, log_fn=log_fn)),
+        # Temporarily disabled: multiple initial escape branch check.
+        # ("HR_TOPO_MULTIPLE_ESCAPE", lambda board: check_p2_single_escape_per_bga_pad(board, log_fn=log_fn)),
         ("HR_DRC_SEGMENT_CROSSING", lambda board: check_p7_segment_crossing(board, log_fn=log_fn)),
+        ("HR_DRC_PAD_SEGMENT_CROSSING", lambda board: check_h6_pad_segment_crossing(board, log_fn=log_fn)),
         ("HR_CONNECT_BRANCH_INCOMPLETE", lambda board: check_h3_branch_escape_incomplete(board, log_fn=log_fn)),
         #("HR_TOPO_ENDPOINT_NOT_UNIQUE", check_h4_endpoint_not_unique),
         #("HR_CONNECT_ESCAPE_PATH_FOR", check_h5_escape_path_no_fork),

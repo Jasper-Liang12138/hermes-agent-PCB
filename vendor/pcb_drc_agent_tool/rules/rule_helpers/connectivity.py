@@ -279,6 +279,10 @@ def _segments_of_net(board, net: str):
     return [s for s in board.segments if s.net == net and _is_signal_net(s.net)]
 
 
+def _arcs_of_net(board, net: str):
+    return [a for a in getattr(board, "arcs", []) if a.net == net and _is_signal_net(a.net)]
+
+
 def _vias_of_net(board, net: str):
     return [v for v in board.vias if v.net == net and _is_signal_net(v.net)]
 
@@ -369,15 +373,26 @@ def _build_net_connectivity_graph(board, net: str):
     graph = defaultdict(set)
 
     segs = _segments_of_net(board, net)
+    arcs = _arcs_of_net(board, net)
     vias = _vias_of_net(board, net)
 
     seg_points = []
+    arc_points = []
     via_points = []
 
     for seg in segs:
         s = _canonical_point(seg.start)
         e = _canonical_point(seg.end)
         seg_points.append((seg, s, e))
+        graph[s].add(e)
+        graph[e].add(s)
+
+    # For connectivity, a routed arc is an edge between its exact start/end.
+    # The midpoint describes curvature and is not needed for graph traversal.
+    for arc in arcs:
+        s = _canonical_point(arc.start)
+        e = _canonical_point(arc.end)
+        arc_points.append((arc, s, e))
         graph[s].add(e)
         graph[e].add(s)
 
@@ -394,6 +409,13 @@ def _build_net_connectivity_graph(board, net: str):
                 graph[vp].add(s)
                 graph[s].add(vp)
             if near_point(seg.end, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(e)
+                graph[e].add(vp)
+        for arc, s, e in arc_points:
+            if near_point(arc.start, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(s)
+                graph[s].add(vp)
+            if near_point(arc.end, real_vp, PAD_NEAR_VIA_TOL):
                 graph[vp].add(e)
                 graph[e].add(vp)
 

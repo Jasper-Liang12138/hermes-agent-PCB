@@ -9,6 +9,8 @@ from tools.pcb_bjut_router import (
     _combine_route_reports,
     _compact_rl_explanation_report,
     _fallback_rl_explanation_report,
+    _ga_eval_budget,
+    _run_ga_fanout_search,
     _rl_eval_budget,
     _rl_python_executable,
     _run_rl_fanout_search,
@@ -27,12 +29,18 @@ def test_normalize_router_type_aliases():
     assert normalize_router_type("135度") == "135"
     assert normalize_router_type("RL") == "rl"
     assert normalize_router_type("rl_arc") == "rl_arc"
+    assert normalize_router_type("GA") == "ga"
+    assert normalize_router_type("ga_arc") == "ga_arc"
+    assert normalize_router_type("auto") == "auto"
 
 
 def test_router_execution_family():
     assert router_execution_family("135") == "135"
     assert router_execution_family("rl") == "135"
     assert router_execution_family("rl_arc") == "arc"
+    assert router_execution_family("ga") == "135"
+    assert router_execution_family("ga_arc") == "arc"
+    assert router_execution_family("auto_135") == "135"
 
 
 def test_parse_order_input_text():
@@ -158,6 +166,21 @@ def test_non_rl_router_does_not_read_rl_explanation(tmp_path):
     assert _read_rl_explanation_report(work_dir, router_dir, "135") == ""
 
 
+def test_ga_explanation_report_is_read_from_search_runs(tmp_path):
+    work_dir = tmp_path / "work"
+    router_dir = tmp_path / "135_linux"
+    explanation_dir = router_dir / "ga" / "search_runs" / "demo_ga_layer_order_seed0_budget4"
+    explanation_dir.mkdir(parents=True)
+    (explanation_dir / "explanation.md").write_text("# GA 解释\n优化了层分配。", encoding="utf-8")
+
+    explanation = pcb_bjut_router._read_search_explanation_report(work_dir, router_dir, "ga")
+    report = _combine_route_reports("布线连通率: 100%", explanation)
+
+    assert "布线连通率: 100%" in report
+    assert "层分配和逃逸顺序生成报告" in report
+    assert "优化了层分配" in report
+
+
 def test_rl_fallback_explanation_summarizes_order_input(tmp_path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
@@ -230,6 +253,83 @@ def test_run_rl_fanout_search_copies_best_order_and_explanation(monkeypatch, tmp
     assert (router_dir / "402Pin_08BGA_8L_S_01141700.txt").read_text(encoding="utf-8") == "board"
 
 
+def test_run_ga_fanout_search_copies_best_order_and_explanation(monkeypatch, tmp_path):
+    work_dir = tmp_path / "work"
+    router_dir = tmp_path / "135_linux"
+    ga_dir = router_dir / "ga"
+    work_dir.mkdir()
+    ga_dir.mkdir(parents=True)
+    (ga_dir / "train_ga_135.py").write_text("print('fake')\n", encoding="utf-8")
+    layout_path = work_dir / "layout_input.txt"
+    layout_path.write_text("board", encoding="utf-8")
+    (work_dir / "order_input.txt").write_text("U22\n1\n1\nBASE Top 1\n", encoding="utf-8")
+    (work_dir / "order_out.txt").write_text("BASE TOP 1\n", encoding="utf-8")
+
+    def fake_run_process(args, cwd, timeout=300):
+        output_root = Path(args[args.index("--output-root") + 1])
+        run_dir = output_root / "hermes_ga_ga_layer_order_seed20260422_budget1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "best_layer_order.txt").write_text("GA_NET TOP 1\n", encoding="utf-8")
+        (run_dir / "explanation.md").write_text("# GA explanation\nbetter order", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(pcb_bjut_router, "_run_process", fake_run_process)
+    monkeypatch.setenv("PCB_GA_EVAL_BUDGET", "1")
+
+    best_order = _run_ga_fanout_search(work_dir, router_dir, "ga", layout_path)
+
+    assert best_order.name == "best_layer_order.txt"
+    assert "GA_NET TOP 1" in (work_dir / "order_out.txt").read_text(encoding="utf-8")
+    assert "GA_NET TOP 1" in (work_dir / "order_input.txt").read_text(encoding="utf-8")
+    assert (work_dir / "explanation.md").read_text(encoding="utf-8").startswith("# GA explanation")
+    assert (router_dir / "402Pin_08BGA_8L_S_01141700.txt").read_text(encoding="utf-8") == "board"
+
+
+def test_generate_auto_fanout_params_picks_best_candidate(monkeypatch, tmp_path):
+    work_dir = tmp_path / "work"
+    calls = []
+
+    monkeypatch.setattr(pcb_bjut_router, "bjut_router_available", lambda router_type, work_dir=None: True)
+
+    def fake_single(**kwargs):
+        router_type = kwargs["router_type"]
+        candidate_dir = kwargs["work_dir"]
+        candidate_dir.mkdir(parents=True)
+        calls.append(router_type)
+        order_net = "GA_NET" if router_type == "ga_135" else "RL_NET"
+        (candidate_dir / "order_input.txt").write_text(f"U22\n1\n1\n{order_net} Top 1\n", encoding="utf-8")
+        summary_text = (
+            '{"primary_best_kind":"best_full","best_full":{"stats":{"routed_nets":10,'
+            '"completion_rate":1.0,"total_wire_length":80,"vias":0}}}'
+            if router_type == "ga_135"
+            else '{"primary_best_kind":"best_partial","best_partial":{"stats":{"routed_nets":8,'
+            '"completion_rate":0.8,"total_wire_length":70,"vias":0}}}'
+        )
+        (candidate_dir / "summary.json").write_text(summary_text, encoding="utf-8")
+        return {
+            "selectedBGA": "U22",
+            "routerType": router_type,
+            "orderLines": [{"net": order_net, "layer": "Top", "order": 1}],
+            "constraints": {"LineWidth": 4, "LineSpacing": 3},
+        }
+
+    monkeypatch.setattr(pcb_bjut_router, "_generate_single_fanout_params", fake_single)
+
+    result = pcb_bjut_router.generate_fanout_params(
+        project_data="board",
+        selected_bga="U22",
+        router_type="auto_135",
+        work_dir=work_dir,
+        constraints={"LineWidth": 4, "LineSpacing": 3},
+    )
+
+    assert calls[:2] == ["ga_135", "rl_135"]
+    assert result["routerType"] == "ga_135"
+    assert result["autoRouterType"] == "auto_135"
+    assert result["orderLines"][0]["net"] == "GA_NET"
+    assert "GA_NET" in (work_dir / "order_input.txt").read_text(encoding="utf-8")
+
+
 def test_rl_runtime_config_resolves_relative_python(monkeypatch, tmp_path):
     parser = configparser.ConfigParser()
     parser["router"] = {
@@ -243,6 +343,7 @@ def test_rl_runtime_config_resolves_relative_python(monkeypatch, tmp_path):
 
     assert _rl_python_executable() == str((tmp_path / "python_runtime" / "python.exe").resolve())
     assert _rl_eval_budget("rl") == 12
+    assert _ga_eval_budget("ga") == 500
 
 
 def test_rl_runtime_env_overrides_config(monkeypatch, tmp_path):
