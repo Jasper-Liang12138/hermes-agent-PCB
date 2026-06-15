@@ -32,11 +32,16 @@ class SkillGroundingItem:
 
 
 def _candidate_skill_paths() -> list[Path]:
-    root = Path(__file__).resolve().parents[2]
-    return [
-        root / "skills" / "hardware" / "pcb-intelligence" / "SKILL.md",
-        root / "skills" / "hardware" / "pcb-reroute" / "SKILL.md",
-    ]
+    try:
+        from agent.swsd.experience.skill_bank import iter_pcb_skill_paths
+
+        return iter_pcb_skill_paths()
+    except Exception:
+        root = Path(__file__).resolve().parents[2]
+        return [
+            root / "skills" / "hardware" / "pcb-intelligence" / "SKILL.md",
+            root / "skills" / "hardware" / "pcb-reroute" / "SKILL.md",
+        ]
 
 
 def _score_skill(text: str, workflow_state: str, content: str) -> float:

@@ -8977,6 +8977,7 @@ class AIAgent:
             if self.session_id:
                 from hermes_state import SessionDB
                 from agent.swsd.context_packager import build_context_package
+                from agent.swsd.experience.resolver import build_experience_context_block
 
                 _swsd_db = self._session_db or SessionDB()
                 _workflow_state = _swsd_db.get_workflow_state(self.session_id)
@@ -8996,6 +8997,18 @@ class AIAgent:
                             limit=20,
                         ),
                     )
+                    _experience_block = build_experience_context_block(
+                        db=_swsd_db,
+                        session_id=self.session_id,
+                        query=original_user_message if isinstance(original_user_message, str) else "",
+                        workflow_id=_workflow_id,
+                        workflow_state=str(_workflow_state.get("current_state") or "idle"),
+                    )
+                    if _experience_block:
+                        _swsd_user_context = (
+                            f"{_swsd_user_context}\n\n{_experience_block}"
+                            if _swsd_user_context else _experience_block
+                        )
         except Exception as exc:
             logger.debug("SWSD context packaging skipped: %s", exc)
 

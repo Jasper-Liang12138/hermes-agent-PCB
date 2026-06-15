@@ -44,6 +44,10 @@ from agent.swsd.intent_policy import apply_swsd2_policy, apply_swsd3_policy, app
 from agent.swsd.skill_grounding import retrieve_skill_memory
 from agent.swsd.runtime_bridge import WebSocketSWSDRuntimeBridge
 from agent.swsd.workflow_controller import WebSocketWorkflowController
+from agent.swsd.experience.policies import alias_for_target, minimal_reroute_final
+from agent.swsd.experience.recorder import PCBExperienceRecorder, record_body_fields
+from agent.swsd.experience.resolver import PCBExperienceResolver
+from agent.swsd.experience.schema import PCBExperienceEvent
 from gateway.config import PlatformConfig, Platform
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
@@ -402,6 +406,8 @@ class WebSocketAdapter(BasePlatformAdapter):
             intent_pcb_confirm_route=_INTENT_PCB_CONFIRM_ROUTE,
             confirm_re=_CONFIRM_RE,
         )
+        self._pcb_experience_resolver = PCBExperienceResolver(self._swsd_db)
+        self._pcb_experience_recorder = PCBExperienceRecorder(self._swsd_db)
         self._route_lock_seconds = float(extra.get("route_lock_seconds", 90))
         self._route_intent_llm_enabled = self._as_bool(extra.get("route_intent_llm_enabled", True))
         self._route_intent_llm_timeout = float(extra.get("route_intent_llm_timeout", 8.0))
@@ -929,6 +935,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         if not isinstance(turn_options, dict):
             turn_options = {}
 
+        self._recover_experience_from_inbound_body(session_id, project_id, body)
+
         flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
         body_fanout_params = self._body_fanout_params(body.get("fanoutParams"))
         content_fanout_params = (
@@ -1064,6 +1072,8 @@ class WebSocketAdapter(BasePlatformAdapter):
         """Run the BGA analysis tool from the adapter layer instead of asking the LLM to tool-call it."""
         if not bootstrap_context:
             return False
+        ws_info = self._connections.get(session_id)
+        project_id = ws_info[1] if ws_info else ""
 
         try:
             from tools import pcb_chunking_tool
@@ -1126,6 +1136,46 @@ class WebSocketAdapter(BasePlatformAdapter):
                 await self.send(
                     chat_id=session_id,
                     content=(
+                        f"{self._router_type_prompt(session_id)}\n\n"
+                        "##PCB_FIELDS##\n"
+                        f"{json.dumps(fields, ensure_ascii=False)}\n"
+                        "##PCB_FIELDS_END##"
+                    ),
+                )
+                return True
+
+            experience_hints = self._resolve_pcb_experience(
+                session_id,
+                project_id=project_id,
+                query=requested_target,
+                workflow_id=_SWSD_ESCAPE_FLOW,
+                workflow_state="select_bga",
+            )
+            fallback_label = alias_for_target(experience_hints, requested_target, labels)
+            if fallback_label:
+                self._session_selected_targets[session_id] = fallback_label
+                self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+                self._record_pcb_experience(
+                    session_id=session_id,
+                    project_id=project_id,
+                    workflow_id=_SWSD_ESCAPE_FLOW,
+                    stage="selection",
+                    outcome="recovered",
+                    kind="target_resolution",
+                    summary=f"Requested BGA {requested_target} resolved to detected candidate {fallback_label}.",
+                    signals={
+                        "requestedRefdes": requested_target,
+                        "resolvedRefdes": fallback_label,
+                        "candidateLabels": labels,
+                        "resolution": "alias_or_single_candidate_fallback",
+                    },
+                )
+                await self.send(
+                    chat_id=session_id,
+                    content=(
+                        f"未在 BGA 候选中找到 {requested_target}，当前可识别候选为 {fallback_label}，"
+                        f"已按 {fallback_label} 继续。\n\n"
                         f"{self._router_type_prompt(session_id)}\n\n"
                         "##PCB_FIELDS##\n"
                         f"{json.dumps(fields, ensure_ascii=False)}\n"
@@ -2892,6 +2942,111 @@ class WebSocketAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("SWSD update failed: session=%s workflow=%s state=%s", session_id, workflow_id, state, exc_info=True)
 
+    def _resolve_pcb_experience(
+        self,
+        session_id: str,
+        *,
+        project_id: str = "",
+        query: str = "",
+        workflow_id: str = "",
+        workflow_state: str = "idle",
+    ):
+        try:
+            return self._pcb_experience_resolver.resolve(
+                session_id=session_id,
+                project_id=project_id,
+                query=query,
+                workflow_id=workflow_id,
+                workflow_state=workflow_state,
+            )
+        except Exception:
+            logger.debug("PCB experience resolve skipped: session=%s", session_id, exc_info=True)
+            from agent.swsd.experience.schema import PCBContextHints
+
+            return PCBContextHints(session_id=session_id, project_id=project_id)
+
+    def _record_pcb_experience(
+        self,
+        *,
+        session_id: str,
+        project_id: str,
+        workflow_id: str,
+        stage: str,
+        outcome: str,
+        kind: str,
+        summary: str,
+        signals: Dict[str, Any],
+    ) -> None:
+        self._pcb_experience_recorder.record(
+            PCBExperienceEvent(
+                kind=kind,
+                session_id=session_id,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                stage=stage,
+                outcome=outcome,
+                summary=summary,
+                signals=signals,
+                source="websocket",
+                confidence=0.85,
+            )
+        )
+
+    def _recover_experience_from_inbound_body(self, session_id: str, project_id: str, body: Dict[str, Any]) -> None:
+        if not isinstance(body, dict):
+            return
+        flow_state = self._session_flow_states.get(session_id, _FLOW_IDLE)
+        workflow_id, workflow_state = self._swsd_state_from_legacy_flow(flow_state)
+        record_body_fields(
+            self._swsd_db,
+            session_id=session_id,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            stage=workflow_state,
+            body=body,
+        )
+
+        fields = self._collect_pcb_fields(body)
+        if not fields:
+            return
+        self._remember_board_analysis(session_id, fields)
+
+        selection = fields.get("selection")
+        if isinstance(selection, list) and selection:
+            self._session_bga_selection[session_id] = tuple(item for item in selection if isinstance(item, dict))
+            labels = self._selection_labels_from_items(selection)
+            if labels:
+                self._session_selection_labels[session_id] = tuple(labels)
+                self._session_selected_targets.setdefault(session_id, labels[0])
+
+        fanout_params = fields.get("fanoutParams")
+        if isinstance(fanout_params, dict) and fanout_params:
+            self._remember_fanout_params_from_frontend(session_id, fanout_params)
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            self._set_flow_state(session_id, _FLOW_WAIT_CONFIRM)
+            self._swsd_update(
+                session_id,
+                _SWSD_ESCAPE_FLOW,
+                "review",
+                self._swsd_escape_payload(session_id, {"recoveredFromBody": True}),
+                event_type="experience_recovery",
+                intent="recover_fanout_params",
+                action_type="state_recovery",
+                checkpoint_label="body fanoutParams recovery",
+            )
+        elif isinstance(selection, list) and selection:
+            self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+            self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+            self._swsd_update(
+                session_id,
+                _SWSD_ESCAPE_FLOW,
+                "layer_assign",
+                self._swsd_escape_payload(session_id, {"recoveredFromBody": True}),
+                event_type="experience_recovery",
+                intent="recover_selection",
+                action_type="state_recovery",
+            )
+
     @staticmethod
     def _as_bool(value: Any) -> bool:
         if isinstance(value, bool):
@@ -3381,6 +3536,8 @@ class WebSocketAdapter(BasePlatformAdapter):
                 reroute_result.pop("routedLayoutTxtFilePath", None)
                 reroute_result.pop("importLinesFilePath", None)
             return fields
+        if "rerouteResult" in fields:
+            fields = minimal_reroute_final(fields)
         import_status = await self._import_reroute_result(session_id, fields)
         if import_status:
             explanation = str(fields.get("explanation") or "").strip()
@@ -4069,6 +4226,40 @@ class WebSocketAdapter(BasePlatformAdapter):
                     intent=_INTENT_PCB_SELECT_TARGET,
                 )
             if _CONFIRM_RE.search(text):
+                labels = list(self._session_selection_labels.get(session_id) or ())
+                requested = self._session_requested_bga_targets.get(session_id, "")
+                hints = self._resolve_pcb_experience(
+                    session_id,
+                    query=requested or text,
+                    workflow_id=_SWSD_ESCAPE_FLOW,
+                    workflow_state="select_bga",
+                )
+                recovered_label = alias_for_target(hints, requested, labels)
+                if recovered_label:
+                    self._session_selected_targets[session_id] = recovered_label
+                    self._set_session_mode(session_id, _ROUTE_MODE_PCB)
+                    self._set_flow_state(session_id, _FLOW_WAIT_ROUTER_TYPE)
+                    self._record_pcb_experience(
+                        session_id=session_id,
+                        project_id="",
+                        workflow_id=_SWSD_ESCAPE_FLOW,
+                        stage="selection",
+                        outcome="recovered",
+                        kind="target_resolution",
+                        summary=f"Confirmation recovered BGA target {recovered_label}.",
+                        signals={
+                            "requestedRefdes": requested,
+                            "resolvedRefdes": recovered_label,
+                            "candidateLabels": labels,
+                            "resolution": "confirm_single_candidate_recovery",
+                        },
+                    )
+                    return _RouteDecision(
+                        mode=_ROUTE_MODE_PCB,
+                        immediate_reply=self._router_type_prompt(session_id),
+                        reason="experience_selection_recovery",
+                        intent=_INTENT_PCB_SELECT_TARGET,
+                    )
                 return _RouteDecision(
                     mode=_ROUTE_MODE_PCB,
                     immediate_reply=(
