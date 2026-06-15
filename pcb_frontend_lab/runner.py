@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 import time
 import uuid
@@ -31,6 +32,7 @@ INTERIM_STATUS_CONTENTS = {
     "已收到，进入PCB 智能布线 skill，正在处理...",
     "正在导入版图，请稍候...",
 }
+TOOL_PROGRESS_RE = re.compile(r"^\s*⚙️\s*[A-Za-z0-9_.-]+(?:\([^)]*\))?\.\.\.\s*$")
 
 
 @dataclass
@@ -42,6 +44,8 @@ class LabConfig:
     session_prefix: str = "lab"
     stop_on_fail: bool = False
     verbose_frames: bool = False
+    reroute_board_path: Path | None = None
+    reroute_mock_mode: str = "off"
 
 
 @dataclass
@@ -54,6 +58,150 @@ class CaseRuntime:
     frames: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
+    mock_artifacts: dict[str, Any] = field(default_factory=dict)
+    generated_artifacts: list[Path] = field(default_factory=list)
+
+
+DEFAULT_REROUTE_BOARD_PATH = Path(r"F:\doctor\hermes-agent\邮件\450Pin_080BGA_10L_D_01281040.txt")
+_LINESEG_RE = re.compile(
+    r'(?P<indent>\s*)\(lineseg\s*\n'
+    r'(?P=indent)\s*\(pt\s+(?P<x1>-?\d+(?:\.\d+)?)\s+(?P<y1>-?\d+(?:\.\d+)?)\)\s*\n'
+    r'(?P=indent)\s*\(w\s+(?P<width>-?\d+(?:\.\d+)?)\)\s*\n'
+    r'(?P=indent)\)',
+    re.MULTILINE,
+)
+_NET_RE = re.compile(r'\(net\s+"([^"]+)"\)')
+_LAYER_RE = re.compile(r'\(layer\s+"([^"]+)"\)')
+
+
+class RerouteMockError(RuntimeError):
+    """Raised when the lab cannot synthesize a reroute selection fixture."""
+
+
+_ACTIVE_CONFIG = LabConfig(ws_url="", cases_path=Path("."), out_path=Path("."), reroute_mock_mode="off")
+
+
+def _normalize_reroute_mock_mode(value: str | None) -> str:
+    text = str(value or "off").strip().lower()
+    if text in {"", "off", "none", "disabled"}:
+        return "off"
+    if text in {"dynamic-segment-delete", "dynamic", "segment-delete"}:
+        return "dynamic-segment-delete"
+    raise ValueError(f"unsupported reroute mock mode: {value}")
+
+
+def _parse_reroute_board_fixture(board_text: str) -> dict[str, Any]:
+    wires_anchor = board_text.find("(wires")
+    if wires_anchor < 0:
+        raise RerouteMockError("reroute mock board does not contain a wires section")
+
+    net_matches = list(_NET_RE.finditer(board_text, wires_anchor))
+    layer_matches = list(_LAYER_RE.finditer(board_text, wires_anchor))
+    segment_match = _LINESEG_RE.search(board_text, wires_anchor)
+    if not segment_match:
+        raise RerouteMockError("reroute mock board does not contain a simple lineseg")
+
+    segment_start = segment_match.start()
+    segment_end = segment_match.end()
+    net_name = ""
+    layer_name = ""
+    for match in net_matches:
+        if match.start() < segment_start:
+            net_name = match.group(1)
+        else:
+            break
+    for match in layer_matches:
+        if match.start() > segment_end:
+            layer_name = match.group(1)
+            break
+    if not net_name:
+        raise RerouteMockError("failed to resolve net name for the selected lineseg")
+    if not layer_name:
+        raise RerouteMockError("failed to resolve layer name for the selected lineseg")
+
+    x1 = float(segment_match.group("x1"))
+    y1 = float(segment_match.group("y1"))
+    x2 = x1
+    y2 = y1
+    next_match = _LINESEG_RE.search(board_text, segment_end)
+    if next_match and next_match.start() - segment_end < 200:
+        x2 = float(next_match.group("x1"))
+        y2 = float(next_match.group("y1"))
+
+    dropped_board = board_text[:segment_start] + board_text[segment_end:]
+    missing_route = {
+        "net_name": net_name,
+        "start": {"layer": layer_name, "x": x1, "y": y1},
+        "end": {"layer": layer_name, "x": x2, "y": y2},
+    }
+    deleted_segment = {
+        "net": net_name,
+        "layer": layer_name,
+        "start": {"x": x1, "y": y1},
+        "end": {"x": x2, "y": y2},
+        "width": float(segment_match.group("width")),
+    }
+    return {
+        "missing_routes": [missing_route],
+        "projectData": dropped_board,
+        "localContext": {
+            "source": "pcb_frontend_lab_mock",
+            "selectionCount": 1,
+            "missingRoutes": [missing_route],
+            "deletedSegment": deleted_segment,
+        },
+        "selectedNets": [net_name],
+        "selectedTraceIds": [],
+        "deletedSegment": deleted_segment,
+    }
+
+
+def _build_dynamic_reroute_tool_result(runtime: CaseRuntime, config: LabConfig) -> Any:
+    board_path = (config.reroute_board_path or DEFAULT_REROUTE_BOARD_PATH).expanduser().resolve()
+    try:
+        board_text = board_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RerouteMockError(f"failed to read reroute mock board: {board_path} ({exc})") from exc
+
+    payload = _parse_reroute_board_fixture(board_text)
+    artifact_dir = (config.out_path.parent / f"{config.out_path.stem}_artifacts").expanduser().resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_index = len(runtime.generated_artifacts) + 1
+    dropped_board_path = artifact_dir / f"{safe_file_stem(runtime.case_id)}_reroute_drop_{artifact_index}.txt"
+    dropped_board_path.write_text(str(payload.get("projectData") or ""), encoding="utf-8", errors="replace")
+    runtime.generated_artifacts.append(dropped_board_path)
+
+    runtime.mock_artifacts["reroute_mock"] = {
+        "mode": config.reroute_mock_mode,
+        "board_path": str(board_path),
+        "deleted_segment": payload.get("deletedSegment"),
+        "dropped_board_path": str(dropped_board_path),
+    }
+    payload["localContext"]["boardFile"] = str(board_path)
+    payload["localContext"]["boardDataFilePath"] = str(dropped_board_path)
+    payload["localContext"]["droppedBoardDataFilePath"] = str(dropped_board_path)
+    payload["mockSource"] = "dynamic-segment-delete"
+    payload["boardFile"] = str(board_path)
+    payload["projectDataFilePath"] = str(dropped_board_path)
+    payload["droppedBoardDataFilePath"] = str(dropped_board_path)
+    payload["originalBoardDataFilePath"] = str(board_path)
+    payload["projectData"] = str(dropped_board_path)
+    deleted_segment = payload.pop("deletedSegment", None)
+    payload["missingRoutes"] = payload.get("missing_routes", [])
+    payload["droppedObjects"] = [deleted_segment] if deleted_segment else []
+    return payload
+
+
+def _case_reroute_mock_mode(case: dict[str, Any], config: LabConfig) -> str:
+    labels = case.get("labels", {})
+    if not isinstance(labels, dict):
+        labels = {}
+    explicit = case.get("reroute_mock_mode") or labels.get("reroute_mock_mode")
+    if explicit:
+        return _normalize_reroute_mock_mode(str(explicit))
+    if labels.get("reroute_mock") is True:
+        return "dynamic-segment-delete"
+    return _normalize_reroute_mock_mode(config.reroute_mock_mode)
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
@@ -80,10 +228,21 @@ def safe_file_stem(value: str) -> str:
     return cleaned.strip("._") or "case"
 
 
-def make_user_message(session_id: str, project_id: str, content: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+def make_user_message(
+    session_id: str,
+    project_id: str,
+    content: str,
+    options: dict[str, Any] | None = None,
+    body_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     body: dict[str, Any] = {"role": "user", "content": content}
     if options:
         body["options"] = options
+    if body_overrides:
+        for key, value in body_overrides.items():
+            if key in {"role", "content", "options"}:
+                continue
+            body[key] = value
     return {
         "sessionId": session_id,
         "projectid": project_id,
@@ -127,11 +286,39 @@ def frame_summary(frame: dict[str, Any]) -> dict[str, Any]:
         summary["tool"] = content.get("name")
         summary["call_id"] = content.get("id")
         summary["arguments"] = content.get("arguments")
+    elif frame.get("type") == "tool-results":
+        summary["call_id"] = content.get("id")
+        result = content.get("result")
+        result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        summary["result_length"] = len(result_text)
+        summary["result_preview"] = result_text[:240]
     elif frame.get("type") == "error":
         summary["code"] = body.get("code")
         summary["message"] = body.get("message")
         summary["details"] = body.get("details")
     return summary
+
+
+def transcript_frame(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("type") != "tool-results":
+        return payload
+    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+    content = body.get("content") if isinstance(body.get("content"), dict) else {}
+    result = content.get("result")
+    result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    if len(result_text) <= 1000:
+        return payload
+    compact = dict(payload)
+    compact_body = dict(body)
+    compact_content = dict(content)
+    compact_content["result"] = {
+        "__omitted_large_tool_result__": True,
+        "length": len(result_text),
+        "preview": result_text[:500],
+    }
+    compact_body["content"] = compact_content
+    compact["body"] = compact_body
+    return compact
 
 
 def is_final_message(frame: dict[str, Any]) -> bool:
@@ -146,6 +333,17 @@ def is_interim_status(frame: dict[str, Any]) -> bool:
         return False
     body = frame.get("body") if isinstance(frame.get("body"), dict) else {}
     return body.get("isFinal") is False and body.get("content") in INTERIM_STATUS_CONTENTS
+
+
+def is_tool_progress_message(frame: dict[str, Any]) -> bool:
+    if frame.get("type") != "message":
+        return False
+    body = frame.get("body") if isinstance(frame.get("body"), dict) else {}
+    content = str(body.get("content") or "")
+    if not TOOL_PROGRESS_RE.match(content):
+        return False
+    meaningful_fields = set(body) - {"msgId", "role", "content", "isFinal"}
+    return not meaningful_fields
 
 
 def tool_result_for_call(runtime: CaseRuntime, tool_name: str, call: dict[str, Any]) -> Any:
@@ -164,6 +362,11 @@ def tool_result_for_call(runtime: CaseRuntime, tool_name: str, call: dict[str, A
 
     chosen_key = next((key for key in candidates if key and key in specs), None)
     if not chosen_key:
+        if tool_name == "deleteTracesForRerouting":
+            mock_mode = _case_reroute_mock_mode(runtime.case, _ACTIVE_CONFIG)
+            runtime.case.setdefault("_resolved_reroute_mock_mode", mock_mode)
+            if mock_mode == "dynamic-segment-delete":
+                return _build_dynamic_reroute_tool_result(runtime, _ACTIVE_CONFIG)
         raise AssertionError(f"no fixture tool_result for tool '{tool_name}' call id '{call_id}'")
 
     spec = specs[chosen_key]
@@ -183,7 +386,7 @@ async def send_json(ws: Any, payload: dict[str, Any], runtime: CaseRuntime, dire
     record = {
         "direction": direction,
         "time": time.time(),
-        "frame": payload,
+        "frame": transcript_frame(payload),
         "summary": frame_summary(payload),
     }
     runtime.frames.append(record)
@@ -243,7 +446,7 @@ async def drain_turn(ws: Any, runtime: CaseRuntime, config: LabConfig) -> None:
             break
 
         if frame_type == "message":
-            if is_interim_status(frame):
+            if is_interim_status(frame) or is_tool_progress_message(frame):
                 continue
             if is_final_message(frame):
                 saw_terminal_frame = True
@@ -280,14 +483,16 @@ async def run_case(case: dict[str, Any], config: LabConfig) -> dict[str, Any]:
                     if isinstance(turn, dict):
                         content = str(turn.get("content") or "")
                         options = turn.get("options") if isinstance(turn.get("options"), dict) else None
+                        body_overrides = turn.get("body") if isinstance(turn.get("body"), dict) else None
                     else:
                         content = str(turn)
                         options = None
+                        body_overrides = None
                     if not content:
                         raise AssertionError("turn content must not be empty")
                     await send_json(
                         ws,
-                        make_user_message(session_id, project_id, content, options),
+                        make_user_message(session_id, project_id, content, options, body_overrides),
                         runtime,
                         "frontend_to_agent",
                         config.verbose_frames,
@@ -298,6 +503,8 @@ async def run_case(case: dict[str, Any], config: LabConfig) -> dict[str, Any]:
 
     result["transcript"] = runtime.frames
     result["actual"] = collect_actual(runtime)
+    if runtime.mock_artifacts:
+        result["actual"]["mockArtifacts"] = runtime.mock_artifacts
     result["failures"].extend(evaluate_case(case, runtime))
     result["passed"] = not result["failures"]
     return result
@@ -356,6 +563,14 @@ def evaluate_case(case: dict[str, Any], runtime: CaseRuntime) -> list[dict[str, 
             failures.append({
                 "type": "tool_calls_mismatch",
                 "expected": expected_tools,
+                "actual": actual_tools,
+            })
+
+    for tool_name in expect.get("required_tool_calls") or []:
+        if tool_name not in actual_tools:
+            failures.append({
+                "type": "missing_required_tool_call",
+                "tool": tool_name,
                 "actual": actual_tools,
             })
 
@@ -437,6 +652,8 @@ async def run_all(config: LabConfig) -> list[dict[str, Any]]:
         raise SystemExit("aiohttp is required to run pcb_frontend_lab. Install the Hermes messaging extra or aiohttp.")
 
     cases = load_cases(config.cases_path)
+    global _ACTIVE_CONFIG
+    _ACTIVE_CONFIG = config
     config.out_path.parent.mkdir(parents=True, exist_ok=True)
     transcript_dir = config.out_path.parent / f"{config.out_path.stem}_transcripts"
     transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -489,6 +706,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-prefix", default="lab", help="Generated sessionId prefix")
     parser.add_argument("--stop-on-fail", action="store_true", help="Stop after the first failing case")
     parser.add_argument("--verbose-frames", action="store_true", help="Print each WebSocket frame summary")
+    parser.add_argument(
+        "--reroute-board",
+        type=Path,
+        default=DEFAULT_REROUTE_BOARD_PATH,
+        help="Readable board text used to synthesize reroute selection fixtures",
+    )
+    parser.add_argument(
+        "--reroute-mock-mode",
+        default="off",
+        choices=["off", "dynamic-segment-delete"],
+        help="How to synthesize deleteTracesForRerouting results when a case omits them",
+    )
     return parser
 
 
@@ -502,6 +731,8 @@ def main(argv: list[str] | None = None) -> int:
         session_prefix=args.session_prefix,
         stop_on_fail=args.stop_on_fail,
         verbose_frames=args.verbose_frames,
+        reroute_board_path=args.reroute_board,
+        reroute_mock_mode=args.reroute_mock_mode,
     )
     try:
         results = asyncio.run(run_all(config))

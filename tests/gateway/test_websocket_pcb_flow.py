@@ -1006,6 +1006,44 @@ def test_websocket_chat_turn_uses_chat_mode_without_pcb_skills():
     asyncio.get_event_loop().run_until_complete(_run_websocket_chat_turn_uses_chat_mode_without_pcb_skills())
 
 
+async def _run_websocket_slash_command_passthrough() -> None:
+    """Slash commands from the WebSocket client must reach gateway dispatch
+    unwrapped so /skill-name commands can be resolved."""
+    port = _free_port()
+    adapter = _make_adapter(port)
+
+    seen: dict[str, Any] = {}
+
+    async def handler(event):
+        seen["text"] = event.text
+        seen["auto_skill"] = event.auto_skill
+        seen["options"] = event.raw_message.get("options", {})
+        return "slash-ok"
+
+    adapter.set_message_handler(handler)
+    await adapter.connect()
+
+    try:
+        uri = f"http://127.0.0.1:{port}"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
+                await ws.send_str(_user_message("sess-slash-1", "proj-slash-1", "/fresh-skill inspect this"))
+                msg = await _recv_json(ws)
+                assert msg["type"] == "message"
+                assert msg["body"]["content"] == "slash-ok"
+    finally:
+        await adapter.disconnect()
+
+    assert seen["text"] == "/fresh-skill inspect this"
+    assert seen["auto_skill"] is None
+    assert seen["options"]["route_mode"] == "chat"
+    assert seen["options"]["pcb_agent_loop"] is False
+
+
+def test_websocket_slash_command_passthrough():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_slash_command_passthrough())
+
+
 async def _run_websocket_turn_options_passthrough() -> None:
     """WebSocket body.options 应透传到 MessageEvent.raw_message.options。"""
     port = _free_port()
@@ -2248,6 +2286,159 @@ def test_rule_validation_rejects_followup_without_pcb_context():
 
     assert decision.mode == "chat"
     assert decision.reason == "default_chat"
+
+
+def test_route_decision_supports_reroute_reentry_from_report_state():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-reentry"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+    adapter._swsd_update(
+        session_id,
+        "pcb_reroute_flow",
+        "report",
+        {"finalFields": {"rerouteResult": {"drcPassed": True}}},
+        event_type="checkpoint",
+        intent="reroute_result",
+        checkpoint_label="reroute result",
+    )
+
+    decision = adapter._decide_route(session_id, "再 reroute 一次")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "reroute_reentry"
+    assert decision.intent == "pcb_reroute_selected"
+
+
+def test_route_decision_supports_reroute_checkpoint_rollback():
+    adapter = _make_adapter()
+    session_id = "sess-reroute-rollback"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+    adapter._swsd_update(
+        session_id,
+        "pcb_reroute_flow",
+        "rip_up",
+        {"routerType": "arc"},
+        event_type="checkpoint",
+        intent="ripup_complete",
+        checkpoint_label="ripup",
+    )
+    adapter._swsd_update(
+        session_id,
+        "pcb_reroute_flow",
+        "report",
+        {"routerType": "arc", "finalFields": {"rerouteResult": {"drcPassed": True}}},
+        event_type="checkpoint",
+        intent="reroute_result",
+        checkpoint_label="report",
+    )
+
+    decision = adapter._decide_route(session_id, "回到上一步")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "reroute_rollback"
+    assert "恢复" in (decision.immediate_reply or "")
+
+
+def test_route_decision_supports_escape_target_change_from_review_state():
+    adapter = _make_adapter()
+    session_id = "sess-fanout-change-target"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._session_bga_selection[session_id] = ({"label": "U23"}, {"label": "U55"})
+    adapter._session_selected_targets[session_id] = "U23"
+    adapter._session_router_types[session_id] = "135"
+    adapter._session_fanout_params[session_id] = {"routerType": "135+RL"}
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {
+            "selection": [{"label": "U23"}, {"label": "U55"}],
+            "selectedBGA": "U23",
+            "routerType": "135",
+            "fanoutParams": {"routerType": "135+RL"},
+        },
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    decision = adapter._decide_route(session_id, "换成 U55")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "escape_change_target"
+    assert decision.intent == "pcb_select_target"
+    assert adapter._session_selected_targets[session_id] == "U55"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+
+def test_route_decision_supports_escape_param_modify_from_review_state():
+    adapter = _make_adapter()
+    session_id = "sess-fanout-modify-params"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._session_selected_targets[session_id] = "U23"
+    adapter._session_fanout_params[session_id] = {"routerType": "135+RL"}
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {
+            "selectedBGA": "U23",
+            "routerType": "135",
+            "fanoutParams": {"routerType": "135+RL"},
+        },
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    decision = adapter._decide_route(session_id, "改成 arc")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "escape_modify_params"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert adapter._session_route_algorithms[session_id] == "arc"
+
+
+def test_route_decision_supports_escape_checkpoint_rollback():
+    adapter = _make_adapter()
+    session_id = "sess-fanout-rollback"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "layer_assign",
+        {
+            "selection": [{"label": "U23"}],
+            "selectedBGA": "U23",
+            "routerType": "135",
+        },
+        event_type="checkpoint",
+        intent="router_type_step",
+        checkpoint_label="layer assign",
+    )
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {
+            "selection": [{"label": "U23"}],
+            "selectedBGA": "U23",
+            "routerType": "135",
+            "fanoutParams": {"routerType": "135+RL"},
+        },
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    decision = adapter._decide_route(session_id, "回到上一步")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "escape_rollback"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert adapter._session_selected_targets[session_id] == "U23"
 
 
 @pytest.mark.asyncio

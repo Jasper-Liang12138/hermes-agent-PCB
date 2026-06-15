@@ -20,6 +20,8 @@ def transition_for(
         return Transition(current_state, "idle", intent, ActionType.CANCEL, "user cancelled workflow")
     if intent == "rollback":
         return Transition(current_state, current_state, intent, ActionType.ROLLBACK, "rollback requested")
+    if intent in {"reroute_again", "reroute_reentry"} and workflow_id == "pcb_reroute_flow":
+        return Transition(current_state, "rip_up", intent, ActionType.USER_JUMP, "reroute re-entry")
     transition = workflow.next_transition(current_state, intent)
     if transition:
         return transition

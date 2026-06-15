@@ -1214,10 +1214,14 @@ class SessionDB:
                 cursor = self._conn.execute(
                     """SELECT * FROM workflow_checkpoints
                        WHERE session_id = ? AND workflow_id = ?
-                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                       ORDER BY created_at DESC, id DESC LIMIT 2""",
                     (session_id, workflow_id),
                 )
-            row = cursor.fetchone()
+            rows = cursor.fetchall()
+        if checkpoint_id:
+            row = rows[0] if rows else None
+        else:
+            row = rows[1] if len(rows) >= 2 else (rows[0] if rows else None)
         if not row:
             return None
         checkpoint = dict(row)

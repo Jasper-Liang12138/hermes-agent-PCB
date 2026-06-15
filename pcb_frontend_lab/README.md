@@ -34,6 +34,81 @@ python pcb_frontend_lab/runner.py `
 - `--stop-on-fail`：遇到第一个失败用例后停止。
 - `--verbose-frames`：运行时打印每个 WebSocket 帧摘要。
 
+## SWSD3 Mock 流程实验
+
+仓库里现在有三份可直接使用的 SWSD3 mock case：
+
+- `pcb_frontend_lab/cases.swsd3_templates.jsonl`
+  - 全量模板库，包含“当前应通过”与“已知缺口”两类
+- `pcb_frontend_lab/cases.swsd3_core_pass.jsonl`
+  - 当前实现应稳定通过的主回归集
+- `pcb_frontend_lab/cases.swsd3_gap.jsonl`
+  - 已知能力缺口跟踪集，不建议作为 fail gate
+
+如果你当前连接的是本地 `ws://127.0.0.1:7074` 服务，建议直接使用：
+
+- `pcb_frontend_lab/cases.swsd3_core_pass_7074.jsonl`
+  - 针对 7074 的实际行为收缩后的主回归集
+  - 已补上 `deleteTracesForRerouting` 的 mock 返回
+  - 去掉了当前 7074 下不稳定的 fanout 选择/确认链条假设
+
+推荐先跑主回归集：
+
+```powershell
+python pcb_frontend_lab/runner.py `
+  --ws-url ws://127.0.0.1:7073 `
+  --cases pcb_frontend_lab/cases.swsd3_core_pass.jsonl `
+  --out pcb_frontend_lab/reports/swsd3_core_pass_report.jsonl `
+  --timeout 120
+```
+
+如果你的服务端口是 `7074`，推荐用这组：
+
+```powershell
+python pcb_frontend_lab/runner.py `
+  --ws-url ws://127.0.0.1:7074 `
+  --cases pcb_frontend_lab/cases.swsd3_core_pass_7074.jsonl `
+  --out pcb_frontend_lab/reports/swsd3_core_pass_7074_report.jsonl `
+  --timeout 120
+```
+
+再单独跑 gap 集：
+
+```powershell
+python pcb_frontend_lab/runner.py `
+  --ws-url ws://127.0.0.1:7073 `
+  --cases pcb_frontend_lab/cases.swsd3_gap.jsonl `
+  --out pcb_frontend_lab/reports/swsd3_gap_report.jsonl `
+  --timeout 120
+```
+
+如果你不想依赖真实模型、真实 PCB Builder 和真实 router，可以直接运行仓库自带的 deterministic harness：
+
+```powershell
+python pcb_frontend_lab/run_swsd_comparison.py `
+  --out-dir pcb_frontend_lab/reports/swsd_latest `
+  --timeout 30
+```
+
+这个 harness 会在进程内启动一个可控的 `WebSocketAdapter`，适合快速检查协议、状态流转和 SWSD 持久化。
+
+## 关于第二轮 reroute
+
+当前实现下，一轮 reroute 结果落地后，session 会 reset 回 `idle/chat`。因此：
+
+- “第二轮 reroute”应按**新的 reroute 入口**建模
+- 不应假设它是上一轮 reroute 的自然续跑
+
+也就是说，下面这种 case 是合理的：
+
+- 第一轮 reroute 完成
+- 用户再次发送 `再 reroute 一次`
+- 系统按新的 reroute 请求重新进入 reroute 流程
+
+下面这种 case 目前不适合作为主回归假设：
+
+- 第一轮 reroute 完成后，直接沿用同一轮 reroute state 继续第二轮内部步骤
+
 ## JSONL 用例格式
 
 每一行是一个测试用例：

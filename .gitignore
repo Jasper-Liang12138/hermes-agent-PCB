@@ -111,3 +111,8 @@ models/**/.DS_Store
 /pcb_frontend_lab/reports/**/*.json
 /pcb_frontend_lab/reports/**/*.jsonl
 /pcb_frontend_lab/reports/**/*.db
+/pcb_frontend_lab/reports/**/*_artifacts/
+/pcb_frontend_lab/reports/**/*_artifacts/**
+/pcb_frontend_lab/cases*.jsonl
+/pcb_frontend_lab/SWSD*.sh
+/out_artifacts/

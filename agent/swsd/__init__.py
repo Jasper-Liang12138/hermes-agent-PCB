@@ -10,7 +10,9 @@ from agent.swsd.graph import (
     WorkflowSessionState,
 )
 from agent.swsd.registry import get_workflow, list_workflows
+from agent.swsd.runtime_bridge import WebSocketSWSDRuntimeBridge
 from agent.swsd.state_manager import WorkflowStateManager
+from agent.swsd.workflow_controller import WebSocketWorkflowController
 
 __all__ = [
     "ActionType",
@@ -21,6 +23,8 @@ __all__ = [
     "WorkflowEvent",
     "WorkflowSessionState",
     "WorkflowStateManager",
+    "WebSocketSWSDRuntimeBridge",
+    "WebSocketWorkflowController",
     "get_workflow",
     "list_workflows",
 ]

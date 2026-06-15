@@ -38,7 +38,7 @@ PCB_ESCAPE_FLOW = WorkflowDef(
 PCB_REROUTE_FLOW = WorkflowDef(
     workflow_id="pcb_reroute_flow",
     description="PCB selected-trace rip-up and reroute workflow.",
-    initial_state="rip_up",
+    initial_state="idle",
     terminal_states=("idle", "import"),
     states=states(
         [
@@ -52,6 +52,7 @@ PCB_REROUTE_FLOW = WorkflowDef(
         ]
     ),
     transitions=(
+        Transition("idle", "rip_up", "reroute_entry"),
         Transition("rip_up", "confirm", "ripup_complete"),
         Transition("confirm", "reroute_llm", "confirm_reroute"),
         Transition("reroute_llm", "drc_loop", "model_generated"),
@@ -59,6 +60,9 @@ PCB_REROUTE_FLOW = WorkflowDef(
         Transition("drc_loop", "report", "drc_passed"),
         Transition("report", "import", "confirm_import"),
         Transition("import", "idle", "complete"),
+        Transition("report", "rip_up", "reroute_again", ActionType.USER_JUMP),
+        Transition("import", "rip_up", "reroute_again", ActionType.USER_JUMP),
+        Transition("drc_loop", "rip_up", "reroute_again", ActionType.USER_JUMP),
     ),
 )
 

@@ -164,3 +164,51 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
     # Whatever /reload_mcp returns, it must not be the unknown-command guard.
     if result is not None:
         assert "Unknown command" not in result
+
+
+@pytest.mark.asyncio
+async def test_new_skill_command_rescans_stale_cache(monkeypatch, tmp_path):
+    """A skill created while the gateway is running should be callable without
+    restarting the process."""
+    import agent.skill_commands as skill_commands
+    import gateway.run as gateway_run
+    import tools.skills_tool as skills_tool
+
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "fresh-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: fresh-skill\n"
+        "description: Fresh skill\n"
+        "---\n"
+        "# Fresh Skill\n"
+        "Follow the fresh skill instructions.\n",
+        encoding="utf-8",
+    )
+
+    stale_dir = tmp_path / "stale-skill"
+    stale_dir.mkdir()
+    skill_commands._skill_commands = {
+        "/stale-skill": {
+            "name": "stale-skill",
+            "description": "Stale skill",
+            "skill_md_path": str(stale_dir / "SKILL.md"),
+            "skill_dir": str(stale_dir),
+        }
+    }
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(return_value="agent-ok")
+
+    result = await runner._handle_message(_make_event("/fresh-skill inspect this"))
+
+    assert result == "agent-ok"
+    handled_event = runner._handle_message_with_agent.await_args.args[0]
+    assert 'invoked the "fresh-skill" skill' in handled_event.text
+    assert "inspect this" in handled_event.text
+    assert "/fresh-skill" in skill_commands.get_skill_commands()
