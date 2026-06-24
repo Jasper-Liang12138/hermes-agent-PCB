@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent.swsd.action_candidates import ActionCandidate
 from agent.swsd.intent_field import IntentFieldOutput
 from agent.swsd.intent_policy import (
     FLOW_IDLE,
@@ -67,6 +68,71 @@ def _candidate_intent(candidate: Any) -> str:
         return str(candidate.get("intent") or "")
     return str(getattr(candidate, "intent", "") or "")
 
+
+
+@dataclass(frozen=True)
+class SWSDDecision:
+    action: str
+    confidence: float = 0.0
+    accepted_candidates: tuple[ActionCandidate, ...] = ()
+    rejected_candidates: tuple[ActionCandidate, ...] = ()
+    requires_confirmation: bool = False
+    reason: str = ""
+
+
+def decide_workflow_action(
+    *,
+    workflow_context: WorkflowContext,
+    candidates: list[ActionCandidate] | tuple[ActionCandidate, ...] | None = None,
+    explicit_action: str = "",
+    tool_result_action: str = "",
+    experience_actions: list[ActionCandidate] | tuple[ActionCandidate, ...] | None = None,
+) -> SWSDDecision:
+    """Pick one SWSD action from advisory candidates."""
+    allowed = set(workflow_context.allowed_transitions or ())
+    if tool_result_action:
+        if not allowed or tool_result_action in allowed:
+            return SWSDDecision(tool_result_action, 1.0, reason="tool_result_priority")
+        return SWSDDecision(
+            "",
+            0.0,
+            rejected_candidates=(ActionCandidate(tool_result_action, 1.0, source="tool_result"),),
+            requires_confirmation=True,
+            reason="tool_result_action_not_allowed",
+        )
+    if explicit_action:
+        if not allowed or explicit_action in allowed:
+            return SWSDDecision(explicit_action, 1.0, reason="explicit_action_priority")
+        return SWSDDecision("", 0.0, requires_confirmation=True, reason="explicit_action_not_allowed")
+
+    ranked = sorted(
+        tuple(candidates or ()) + tuple(experience_actions or ()),
+        key=lambda item: item.confidence,
+        reverse=True,
+    )
+    rejected: list[ActionCandidate] = []
+    for candidate in ranked:
+        if not candidate.action or candidate.confidence < 0.55:
+            rejected.append(candidate)
+            continue
+        if allowed and candidate.action not in allowed:
+            rejected.append(candidate)
+            continue
+        return SWSDDecision(
+            candidate.action,
+            candidate.confidence,
+            accepted_candidates=(candidate,),
+            rejected_candidates=tuple(rejected),
+            requires_confirmation=candidate.confidence < 0.75,
+            reason="candidate_accepted",
+        )
+    return SWSDDecision(
+        "",
+        0.0,
+        rejected_candidates=tuple(rejected),
+        requires_confirmation=bool(ranked),
+        reason="no_candidate_accepted" if ranked else "no_candidates",
+    )
 
 def decide_with_intent_field(
     *,

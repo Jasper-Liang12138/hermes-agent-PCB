@@ -62,10 +62,11 @@ class PCBExperienceResolver:
             return []
         for event in events:
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            if event.get("event_type") != "experience" and payload.get("kind") not in {"body_fields", "target_resolution", "final_fields"}:
+            if event.get("event_type") != "experience" and payload.get("kind") not in {"body_fields", "target_resolution", "final_fields", "fanout_version"}:
                 continue
             signals = payload.get("signals") if isinstance(payload.get("signals"), dict) else payload
-            key = str(payload.get("kind") or event.get("intent") or "workflow_fact")
+            raw_key = str(payload.get("kind") or event.get("intent") or "workflow_fact")
+            key = "fanoutVersionHistory" if raw_key == "fanout_version" else raw_key
             hints.append(
                 PCBExperienceHint(
                     layer="memory_fact",

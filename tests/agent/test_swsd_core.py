@@ -15,12 +15,12 @@ def test_builtin_workflows_validate_and_transition():
 
     assert escape is not None
     assert reroute is not None
-    assert escape.next_transition("select_bga", "select_target").to_state == "layer_assign"
+    assert escape.next_transition("select_bga", "select_target").to_state == "layer_assign_escape_order"
     assert reroute.next_transition("drc_loop", "drc_failed").action_type == ActionType.FALLBACK
 
 
 def test_transition_policy_handles_jump_and_cancel():
-    jump = transition_for("pcb_escape_flow", "escape_order", "change_target")
+    jump = transition_for("pcb_escape_flow", "layer_assign_escape_order", "change_target")
     cancel = transition_for("pcb_escape_flow", "routing", "cancel")
 
     assert jump.action_type == ActionType.USER_JUMP
@@ -59,7 +59,7 @@ def test_swsd_intent_llm_uses_tool_planning_stage(monkeypatch):
 
     monkeypatch.setattr(pcb_model_runtime, "chat_completion_text", fake_chat_completion_text)
 
-    result = classify_intent_with_planning_model("确认", current_state="escape_order", workflow_id="pcb_escape_flow")
+    result = classify_intent_with_planning_model("确认", current_state="layer_assign_escape_order", workflow_id="pcb_escape_flow")
 
     assert result["intent"] == "confirm_route"
     assert captured["stage"] == pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT

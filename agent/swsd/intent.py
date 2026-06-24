@@ -1,4 +1,4 @@
-"""SWSD intent understanding with tool-planning-chat model isolation."""
+﻿"""SWSD intent understanding with tool-planning-chat model isolation."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import re
 from typing import Any
 
+from agent.swsd.control_signals import matches_cancel_signal, matches_confirm_signal, matches_rollback_signal
 from tools import pcb_model_runtime
 
 
@@ -18,15 +19,15 @@ _CHANGE_TARGET_RE = re.compile(r"目标.*改|换.*BGA|选择|选\s*[A-Za-z]", re
 
 def classify_intent_rules(text: str, current_state: str = "") -> str:
     text = str(text or "")
-    if _CANCEL_RE.search(text):
+    if matches_cancel_signal(text):
         return "cancel"
-    if _ROLLBACK_RE.search(text):
+    if matches_rollback_signal(text):
         return "rollback"
     if _REROUTE_RE.search(text):
         return "pcb_reroute_selected"
     if _CHANGE_TARGET_RE.search(text):
         return "select_target" if current_state in {"select_bga", "idle", ""} else "change_target"
-    if _CONFIRM_RE.search(text):
+    if matches_confirm_signal(text):
         return "confirm_route"
     return "chat"
 
@@ -68,3 +69,6 @@ def classify_intent_with_planning_model(
         "modelStage": meta.get("stage") or pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
         "raw": content,
     }
+
+
+

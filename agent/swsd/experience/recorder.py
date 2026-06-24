@@ -8,6 +8,7 @@ from typing import Any
 from agent.swsd.experience.schema import PCBExperienceEvent
 
 logger = logging.getLogger(__name__)
+EXPERIENCE_RECORD_FAILURE_COUNT = 0
 
 
 class PCBExperienceRecorder:
@@ -29,8 +30,10 @@ class PCBExperienceRecorder:
                 payload=event.as_dict(),
                 model_stage="experience",
             )
-        except Exception:
-            logger.debug("PCB experience record skipped", exc_info=True)
+        except Exception as exc:
+            global EXPERIENCE_RECORD_FAILURE_COUNT
+            EXPERIENCE_RECORD_FAILURE_COUNT += 1
+            logger.warning("PCB experience record skipped: %s", exc, exc_info=True)
 
 
 def record_body_fields(

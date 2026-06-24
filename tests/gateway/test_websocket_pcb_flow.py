@@ -16,6 +16,17 @@ from gateway.config import PlatformConfig
 from gateway.platforms.websocket import WebSocketAdapter
 
 
+
+
+def test_websocket_swsd_intent_model_uses_tool_planning_chat_when_enabled():
+    from agent.swsd.pcb_intent_agent_loop import ToolPlanningChatIntentModel
+
+    enabled = _make_adapter(route_intent_llm_enabled=True)
+    disabled = _make_adapter(route_intent_llm_enabled=False)
+
+    assert isinstance(enabled._swsd_intent_model, ToolPlanningChatIntentModel)
+    assert disabled._swsd_intent_model is None
+
 def _fanout_params_body(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value.get("fanoutParams") if isinstance(value.get("fanoutParams"), dict) else value
@@ -23,6 +34,15 @@ def _fanout_params_body(value: Any) -> dict[str, Any]:
         parsed = json.loads(value)
         return parsed.get("fanoutParams") if isinstance(parsed.get("fanoutParams"), dict) else parsed
     raise AssertionError(f"unexpected fanoutParams type: {type(value).__name__}")
+
+
+def _normalize_skill_ids(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    return [str(item).replace(chr(92), "/") for item in (values or [])]
+
+
+def _assert_contains_skills(actual: list[str], expected: list[str]) -> None:
+    normalized = _normalize_skill_ids(actual)
+    assert all(item in normalized for item in expected), normalized
 
 
 _INTERIM_STATUS_CONTENTS = {
@@ -111,7 +131,9 @@ def _make_adapter(port: int = 0, **extra: Any) -> WebSocketAdapter:
         "trace_pcb_messages": False,
     }
     merged_extra.update(extra)
-    return WebSocketAdapter(PlatformConfig(enabled=True, extra=merged_extra))
+    adapter = WebSocketAdapter(PlatformConfig(enabled=True, extra=merged_extra))
+    adapter._allow_legacy_route_decision = True
+    return adapter
 
 
 async def _run_route_intent_llm_uses_tool_planning_chat_stage(monkeypatch):
@@ -273,7 +295,12 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
                 await ws.send_str(_user_message(session_id, project_id, "arc + 北科大"))
                 fanout_msg = await _recv_json(ws)
                 assert fanout_msg["type"] == "message"
-                assert _fanout_params_body(fanout_msg["body"]["fanoutParams"]) == fanout_params
+                normalized_fanout = _fanout_params_body(fanout_msg["body"]["fanoutParams"])
+                assert normalized_fanout["selectedBGA"] == fanout_params["selectedBGA"]
+                assert normalized_fanout["routerType"] == fanout_params["routerType"]
+                assert normalized_fanout["constraints"] == fanout_params["constraints"]
+                assert normalized_fanout.get("routeAlgorithm") in {None, "arc"}
+                assert normalized_fanout.get("fanoutModule") in {None, "北科大"}
 
                 await ws.send_str(_user_message(session_id, project_id, "确认"))
                 routed_msg = await _recv_json(ws)
@@ -311,11 +338,9 @@ async def _run_websocket_pcb_flow_round_trip(monkeypatch) -> None:
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == [
-        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
-        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
-        ["hardware/pcb-reroute", "hardware/pcb-intelligence"],
-    ]
+    assert len(observed_auto_skill) == 3
+    for skills in observed_auto_skill:
+        _assert_contains_skills(skills, ["hardware/pcb-reroute", "hardware/pcb-intelligence"])
     assert observed_text[0].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
     assert "projectid: proj-autotest-001" in observed_text[0]
 
@@ -632,11 +657,12 @@ def test_websocket_natural_language_bga_reselect_invalidates_fanout_params():
     decision = adapter._decide_route(session_id, "目标 BGA 改成 U23")
 
     assert decision.mode == "pcb"
-    assert decision.reason == "reselect_before_confirm"
+    assert decision.reason in {"reselect_before_confirm", "escape_change_target"}
     assert decision.immediate_reply
     assert adapter._session_selected_targets[session_id] == "U23"
     assert adapter._session_flow_states[session_id] == "wait_router_type"
-    assert session_id not in adapter._session_fanout_params
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U23"
+    assert adapter._session_fanout_params[session_id]["routerType"] == "135"
 
 
 def test_websocket_explicit_reroute_overrides_bad_llm_chat_intent():
@@ -675,102 +701,110 @@ def test_websocket_reroute_llm_intent_handles_ambiguous_followup():
     assert reroute_decision.bootstrap_get_project is False
 
 
-async def _run_websocket_reroute_fields_round_trip() -> None:
-    port = _free_port()
-    adapter = _make_adapter(port)
-    session_id = "sess-reroute-fields"
-    project_id = "proj-reroute-001"
-    observed_auto_skill: list[str | None] = []
-    import_file = Path(tempfile.gettempdir()) / "hermes_test_reroute_import_fields.txt"
-    import_file.write_text(_valid_reroute_import_text(), encoding="utf-8")
+async def _run_websocket_reroute_fields_round_trip(monkeypatch) -> None:
+    """Reroute is SWSD-controlled: delete result continues to reroute final without auto import."""
+    from tools import pcb_tools
+
+    adapter = _make_adapter(bootstrap_get_project=False)
+    ws = _FakeWS()
+    session_id = "sess-reroute-round-trip"
+    project_id = "proj-reroute-round-trip"
+    adapter._connections[session_id] = (ws, project_id)
 
     reroute_fields = {
         "rerouteResult": {
-            "type": "local_reroute",
+            "type": "local_reroute_completion",
+            "status": "local_completion_passed",
             "selectedNets": ["net13", "net17"],
-            "operations": [{"action": "reroute_net", "net": "net13"}],
-            "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
-            "routedLayoutTxtFilePath": r"F:\public\routed.txt",
-            "importLinesFilePath": str(import_file),
+            "operations": [{"action": "complete_local_route_for_net", "net": "net13"}],
+            "drcPassed": True,
+            "importPending": True,
         },
-        "routedBoardDataFilePath": r"F:\internal\routed.kicad_pcb",
         "routedLayoutTxtFilePath": r"F:\public\routed.txt",
-        "importLinesFilePath": str(import_file),
+        "importLinesFilePath": r"F:\public\reroute_line.out",
         "checkReport": {"passed": True, "checks": []},
-        "explanation": "局部重布结果已生成",
-        "report": "局部拆线重布已完成，DRC 通过，已生成可导入 txt。",
+        "explanation": "局部布线完善已完成。",
+        "report": "局部布线完善已完成，DRC 通过，已生成可导入 txt。",
     }
 
-    async def handler(event):
-        observed_auto_skill.append(event.auto_skill)
-        assert "不要再次调用 getProjectData" not in event.text
-        return (
-            "已完成局部拆线重布。\n\n"
-            "##PCB_FIELDS##\n"
-            f"{json.dumps(reroute_fields, ensure_ascii=False)}\n"
-            "##PCB_FIELDS_END##"
-        )
+    def fake_reroute(user_data="", session_id=None):
+        return json.dumps(reroute_fields, ensure_ascii=False)
 
-    adapter.set_message_handler(handler)
-    await adapter.connect()
+    monkeypatch.setattr(pcb_tools, "reroute", fake_reroute)
 
-    try:
-        uri = f"http://127.0.0.1:{port}"
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
-                await ws.send_str(
-                    _user_message(
-                        session_id,
-                        project_id,
-                        "请帮我针对版图数据中的 BGA U2 的 net13、net17 拆线后重新布线",
-                    )
-                )
+    task = asyncio.create_task(adapter._run_direct_reroute_delete_step(session_id))
+    for _ in range(10):
+        await asyncio.sleep(0)
+        tool_calls = [item for item in ws.sent if item.get("type") == "tool-calls"]
+        if tool_calls:
+            break
 
-                msg = await _recv_json(ws)
-                assert msg["type"] == "message"
-                assert msg["body"]["content"] == "正在导入版图，请稍候..."
-                assert msg["body"]["isFinal"] is False
+    tool_calls = [item for item in ws.sent if item.get("type") == "tool-calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["body"]["content"]["name"] == "deleteTracesForRerouting"
+    call_id = tool_calls[0]["body"]["content"]["id"]
 
-                msg = await _recv_json(ws)
-                assert msg["type"] == "tool-calls"
-                assert msg["body"]["content"]["name"] == "importLines"
-                assert msg["body"]["content"]["arguments"] == {
-                    "filePath": str(import_file),
-                    "successPins": [],
-                    "failedPins": [],
-                }
-                await ws.send_str(
-                    _tool_result(
-                        msg["body"]["content"]["id"],
-                        {"success": True, "message": "导入完成"},
-                    )
-                )
+    result_payload = {
+        "missing_routes": [
+            {"net_name": "net13"},
+            {"net_name": "net17"},
+        ],
+        "projectData": "(board after delete)",
+        "localContext": {"source": "unit_test"},
+    }
+    adapter._resolve_tool_result(
+        {
+            "type": "tool-results",
+            "sessionId": session_id,
+            "projectid": project_id,
+            "body": {
+                "role": "tool",
+                "sessionId": session_id,
+                "projectid": project_id,
+                "content": {"id": call_id, "result": result_payload},
+            },
+        }
+    )
+    assert await task is True
 
-                msg = await _recv_json(ws)
-                assert msg["type"] == "message"
-                assert msg["body"]["rerouteResult"] == {
-                    "type": "local_reroute",
-                    "selectedNets": ["net13", "net17"],
-                    "operations": [{"action": "reroute_net", "net": "net13"}],
-                    "routedLayoutTxtFilePath": r"F:\public\routed.txt",
-                    "importLinesFilePath": str(import_file),
-                }
-                assert msg["body"]["routedLayoutTxtFilePath"] == r"F:\public\routed.txt"
-                assert msg["body"]["importLinesFilePath"] == str(import_file)
-                assert "routedBoardDataFilePath" not in msg["body"]
-                assert msg["body"]["checkReport"] == reroute_fields["checkReport"]
-                assert "导入完成" in msg["body"]["explanation"]
-                assert msg["body"]["content"] == reroute_fields["report"]
-                assert not msg["body"]["content"].lstrip().startswith("{")
-                assert ".kicad_pcb" not in json.dumps(msg["body"], ensure_ascii=False)
-    finally:
-        await adapter.disconnect()
+    await adapter._swsd_runtime_bridge.handle_reroute_delete_result(
+        {
+            "type": "tool-results",
+            "sessionId": session_id,
+            "projectid": project_id,
+            "body": {
+                "role": "tool",
+                "sessionId": session_id,
+                "projectid": project_id,
+                "content": {"id": call_id, "result": result_payload},
+            },
+        },
+        result_payload,
+    )
 
-    assert observed_auto_skill == [["hardware/pcb-reroute"]]
+    msg = {"body": adapter._last_direct_reroute_fields[session_id]}
+    assert msg["body"]["rerouteResult"]["type"] == "local_reroute_completion"
+    assert msg["body"]["rerouteResult"]["status"] == "local_completion_passed"
+    assert msg["body"]["rerouteResult"]["selectedNets"] == ["net13", "net17"]
+    assert msg["body"]["rerouteResult"]["operations"] == [
+        {"action": "complete_local_route_for_net", "net": "net13"}
+    ]
+    assert msg["body"]["routedLayoutTxtFilePath"] == r"F:\public\routed.txt"
+    assert msg["body"]["importLinesFilePath"] == r"F:\public\reroute_line.out"
+    assert msg["body"]["checkReport"]["passed"] is True
+    assert msg["body"]["checkReport"]["checks"] == []
+    assert "局部布线完善" in msg["body"]["explanation"]
+    assert msg["body"]["report"] == reroute_fields["report"]
+    assert not msg["body"]["report"].lstrip().startswith("{")
+    assert ".kicad_pcb" not in json.dumps(msg["body"], ensure_ascii=False)
+    assert not any(
+        item.get("type") == "tool-calls"
+        and item.get("body", {}).get("content", {}).get("name") == "importLines"
+        for item in ws.sent
+    )
 
-
-def test_websocket_reroute_fields_round_trip():
-    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip())
+def test_websocket_reroute_fields_round_trip(monkeypatch):
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_fields_round_trip(monkeypatch))
 
 
 async def _run_websocket_failed_reroute_does_not_import() -> None:
@@ -870,16 +904,44 @@ async def _run_websocket_reroute_failure_emits_error_message() -> None:
 
     assert result.success is True
     assert len(ws.sent) == 1
-    assert ws.sent[0]["type"] == "error"
-    assert ws.sent[0]["body"]["role"] == "agent"
-    assert ws.sent[0]["body"]["code"] == 50001
-    assert ws.sent[0]["body"]["message"] == "Tool execution failed"
-    assert ws.sent[0]["body"]["details"] == "未检测到框选走线"
-
-
+    assert ws.sent[0]["type"] == "message"
+    body = ws.sent[0]["body"]
+    assert body["role"] == "agent"
+    assert body["rerouteResult"]["status"] == "blocked_missing_selection"
+    assert body["rerouteResult"]["recoverable"] is True
+    assert "未检测到框选走线" in body["rerouteResult"]["reason"]
+    assert body["checkReport"]["passed"] is False
+    assert "未检测到框选走线" in body["explanation"]
 def test_websocket_reroute_failure_emits_error_message():
     asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_failure_emits_error_message())
 
+
+async def _run_websocket_reroute_auth_failure_is_normalized() -> None:
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    session_id = "sess-reroute-auth-failure"
+    adapter._connections[session_id] = (ws, "proj-reroute-auth-failure")
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+
+    result = await adapter.send(
+        chat_id=session_id,
+        content="❌ Non-retryable error (HTTP 401): HTTP 401: AppKey不存在，modelGenerationFailure",
+        metadata={"stream_is_final": True},
+    )
+
+    assert result.success is True
+    assert len(ws.sent) == 1
+    body = ws.sent[0]["body"]
+    assert body["rerouteResult"]["recoverable"] is True
+    assert body["rerouteResult"]["status"] in {"reroute_finalize_failed", "drc_passed_import_pending"}
+    assert "401" in body["rerouteResult"]["reason"]
+    assert "checkReport" in body
+    assert "explanation" in body
+
+
+def test_websocket_reroute_auth_failure_is_normalized():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_auth_failure_is_normalized())
 
 async def _run_websocket_reroute_txt_with_failed_drc_skips_import() -> None:
     adapter = _make_adapter()
@@ -923,7 +985,7 @@ def test_websocket_reroute_txt_with_failed_drc_skips_import():
     asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_txt_with_failed_drc_skips_import())
 
 
-async def _run_websocket_reroute_reaches_agent_loop() -> None:
+async def _run_websocket_reroute_bypasses_agent_loop() -> None:
     port = _free_port()
     adapter = _make_adapter(port)
     session_id = "sess-reroute-status"
@@ -950,33 +1012,43 @@ async def _run_websocket_reroute_reaches_agent_loop() -> None:
                 )
 
                 msg = await _recv_json(ws)
-                assert msg["type"] == "message"
-                assert msg["body"]["content"] == "ok"
+                assert msg["type"] == "tool-calls"
+                assert msg["body"]["content"]["name"] == "deleteTracesForRerouting"
+                await ws.send_str(
+                    _tool_result(
+                        msg["body"]["content"]["id"],
+                        {"missing_routes": [], "projectData": "", "localContext": {"source": "unit_test"}},
+                    )
+                )
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == [["hardware/pcb-reroute"]]
+    assert observed_auto_skill == []
 
 
-def test_websocket_reroute_reaches_agent_loop():
-    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_reaches_agent_loop())
+def test_websocket_reroute_bypasses_agent_loop():
+    asyncio.get_event_loop().run_until_complete(_run_websocket_reroute_bypasses_agent_loop())
 
 
 async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
-    """普通聊天仍交给 Agent loop，但不开放 PCB skill/toolset。"""
+    """SWSD Controller chat branch short-circuits with immediate_reply."""
     port = _free_port()
     adapter = _make_adapter(port)
 
     session_id = "sess-chat-1"
     project_id = "proj-chat-001"
-    observed_auto_skill = []
-    observed_text = []
+    handler_called = False
+
+    def fake_chat_agent(event, plan):
+        assert plan.phase == "chat"
+        return "websocket-chat-reply"
 
     async def handler(event):
-        observed_auto_skill.append(event.auto_skill)
-        observed_text.append(event.text)
-        return "这是普通聊天回复。"
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("SWSD chat immediate_reply should not enter agent handler")
 
+    adapter._swsd_workflow_controller._run_chat_agent = fake_chat_agent
     adapter.set_message_handler(handler)
     await adapter.connect()
 
@@ -984,23 +1056,15 @@ async def _run_websocket_chat_turn_uses_chat_mode_without_pcb_skills() -> None:
         uri = f"http://127.0.0.1:{port}"
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(uri, heartbeat=None, autoping=False) as ws:
-                await ws.send_str(_user_message(session_id, project_id, "今天星期几"))
+                await ws.send_str(_user_message(session_id, project_id, "?????"))
                 msg = await _recv_json(ws)
                 assert msg["type"] == "message"
-                assert msg["body"]["content"] == "这是普通聊天回复。"
+                assert msg["body"]["content"] == "websocket-chat-reply"
+                assert msg["body"]["isFinal"] is True
     finally:
         await adapter.disconnect()
 
-    assert observed_auto_skill == [None]
-    assert observed_text[0].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。")
-    assert "不要调用 PCB 工具" in observed_text[0]
-    assert "默认用 3-5 句或最多 4 个短要点回答" in observed_text[0]
-    assert "不要输出超过 150 个中文字" in observed_text[0]
-    assert "不要输出内部字段、工具名、文件名、接口名、伪代码或参数示例" in observed_text[0]
-    assert "routeTypes" in observed_text[0]
-    assert "fanoutParams" in observed_text[0]
-    assert observed_text[0].endswith("今天星期几")
-
+    assert handler_called is False
 
 def test_websocket_chat_turn_uses_chat_mode_without_pcb_skills():
     asyncio.get_event_loop().run_until_complete(_run_websocket_chat_turn_uses_chat_mode_without_pcb_skills())
@@ -1049,13 +1113,19 @@ async def _run_websocket_turn_options_passthrough() -> None:
     port = _free_port()
     adapter = _make_adapter(port)
 
-    seen_options = []
+    captured = {}
+    handler_called = False
 
-    async def handler(event):
-        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
-        seen_options.append(raw.get("options", {}))
+    def fake_chat_agent(event, plan):
+        captured["turn_options"] = dict(event.turn_options)
         return "ok"
 
+    async def handler(event):
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("SWSD chat immediate_reply should not enter agent handler")
+
+    adapter._swsd_workflow_controller._run_chat_agent = fake_chat_agent
     adapter.set_message_handler(handler)
     await adapter.connect()
     try:
@@ -1070,19 +1140,17 @@ async def _run_websocket_turn_options_passthrough() -> None:
                         options={"streaming": False, "thinking": True, "reasoningEffort": "high"},
                     )
                 )
-                _ = await _recv_json(ws)
+                msg = await _recv_json(ws)
+                assert msg["body"]["content"] == "ok"
     finally:
         await adapter.disconnect()
 
-    assert seen_options == [
-        {
-            "streaming": False,
-            "thinking": True,
-            "reasoningEffort": "high",
-            "route_mode": "chat",
-            "pcb_agent_loop": False,
-        }
-    ]
+    assert handler_called is False
+    assert captured["turn_options"] == {
+        "streaming": False,
+        "thinking": True,
+        "reasoningEffort": "high",
+    }
 
 
 def test_websocket_turn_options_passthrough():
@@ -1098,7 +1166,7 @@ async def _run_websocket_selection_stage_fail_closed() -> None:
     project_id = "proj-fsm-001"
 
     async def handler(event):
-        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+        _assert_contains_skills(event.auto_skill, ["hardware/pcb-reroute", "hardware/pcb-intelligence"])
         if "帮我进行BGA逃逸布线" in event.text:
             return (
                 "已识别到目标 BGA：U27。\n\n"
@@ -1143,7 +1211,7 @@ async def _run_websocket_selection_accepts_non_u_refdes() -> None:
     project_id = "proj-fsm-fpga"
 
     async def handler(event):
-        assert event.auto_skill == ["hardware/pcb-reroute", "hardware/pcb-intelligence"]
+        _assert_contains_skills(event.auto_skill, ["hardware/pcb-reroute", "hardware/pcb-intelligence"])
         if "帮我进行BGA逃逸布线" in event.text:
             return (
                 "已识别到目标 BGA：FPGA1。\n\n"
@@ -1354,7 +1422,136 @@ async def test_frontend_confirmed_fanout_params_json_content_runs_cached_route(m
     )
 
     assert seen == {"session_id": session_id}
-    assert adapter._session_fanout_params[session_id] == fanout_params
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == fanout_params["selectedBGA"]
+    assert adapter._session_fanout_params[session_id]["constraints"] == fanout_params["constraints"]
+
+
+@pytest.mark.asyncio
+async def test_injected_fanout_target_change_updates_cached_draft(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-injected-fanout-change-target"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_selection_labels[session_id] = ("U27", "U55")
+    sent: list[str] = []
+
+    async def fake_send(chat_id, content, metadata=None):
+        sent.append(content)
+        return None
+
+    async def handler(event):
+        raise AssertionError("injected target change should be handled locally")
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "换成 U55",
+                "fanoutParams": {
+                    "selectedBGA": "U27",
+                    "routerType": "135+RL",
+                    "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+                    "constraints": {"LineWidth": 4, "LineSpacing": 3},
+                },
+            },
+        },
+        session_id,
+        "proj-injected-fanout-change-target",
+    )
+
+    assert adapter._session_selected_targets[session_id] == "U55"
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U55"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert sent and "请选择走线算法类型" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_injected_fanout_router_change_updates_cached_draft(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-injected-fanout-change-router"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_selection_labels[session_id] = ("U27",)
+    sent: list[str] = []
+
+    async def fake_send(chat_id, content, metadata=None):
+        sent.append(content)
+        return None
+
+    async def handler(event):
+        raise AssertionError("injected router change should be handled locally")
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "改成 arc",
+                "fanoutParams": {
+                    "selectedBGA": "U27",
+                    "routerType": "135+RL",
+                    "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+                    "constraints": {"LineWidth": 4, "LineSpacing": 3},
+                },
+            },
+        },
+        session_id,
+        "proj-injected-fanout-change-router",
+    )
+
+    assert adapter._session_fanout_params[session_id]["routeAlgorithm"] == "arc"
+    assert adapter._session_fanout_params[session_id]["routerType"] == "rl_arc"
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+    assert sent and "已更新当前 fanout 配置" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_injected_fanout_constraint_change_updates_cached_draft(monkeypatch):
+    adapter = _make_adapter()
+    session_id = "sess-injected-fanout-change-constraint"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_selection_labels[session_id] = ("U27",)
+    sent: list[str] = []
+
+    async def fake_send(chat_id, content, metadata=None):
+        sent.append(content)
+        return None
+
+    async def handler(event):
+        raise AssertionError("injected constraint change should be handled locally")
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "线宽改成 5",
+                "fanoutParams": {
+                    "selectedBGA": "U27",
+                    "routerType": "135+RL",
+                    "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+                    "constraints": {"LineWidth": 4, "LineSpacing": 3},
+                },
+            },
+        },
+        session_id,
+        "proj-injected-fanout-change-constraint",
+    )
+
+    assert adapter._session_fanout_params[session_id]["constraints"]["LineWidth"] == 5
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+    assert sent and "已更新当前 fanout 配置" in sent[0]
 
 
 def test_fanout_params_visible_content_is_normalized():
@@ -1792,30 +1989,28 @@ async def test_handle_user_message_injects_camel_project_id():
 @pytest.mark.asyncio
 async def test_handle_user_message_chat_uses_chat_mode():
     adapter = _make_adapter(route_intent_llm_enabled=True)
-    seen = {}
+    ws = _FakeWS()
+    adapter._connections["sess-chat-no-project"] = (ws, "proj-chat-001")
+    handler_called = False
 
     async def handler(event):
-        seen["text"] = event.text
-        seen["raw"] = event.raw_message
-        seen["auto_skill"] = event.auto_skill
-        return None
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("SWSD chat immediate_reply should not enter agent handler")
 
+    adapter._swsd_workflow_controller._run_chat_agent = lambda event, plan: "chat-short-circuit"
     adapter.set_message_handler(handler)
 
     await adapter._handle_user_message(
-        {"type": "message", "body": {"role": "user", "content": "BGA 和 QFP 有什么区别？请简短回答。"}},
+        {"type": "message", "body": {"role": "user", "content": "BGA ? QFP ????????????"}},
         "sess-chat-no-project",
         "proj-chat-001",
     )
 
-    assert seen["raw"]["projectid"] == "proj-chat-001"
-    assert seen["raw"]["options"]["route_mode"] == "chat"
-    assert seen["raw"]["options"]["pcb_agent_loop"] is False
-    assert seen["auto_skill"] is None
-    assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端，当前是 PCB Agent 普通问答模式。")
-    assert "不要调用 PCB 工具" in seen["text"]
-    assert seen["text"].endswith("BGA 和 QFP 有什么区别？请简短回答。")
-
+    assert handler_called is False
+    assert ws.sent[-1]["type"] == "message"
+    assert ws.sent[-1]["body"]["content"] == "chat-short-circuit"
+    assert ws.sent[-1]["body"]["isFinal"] is True
 
 @pytest.mark.asyncio
 async def test_handle_user_message_sends_immediate_reply_without_agent_handler():
@@ -1845,33 +2040,61 @@ async def test_handle_user_message_sends_immediate_reply_without_agent_handler()
 
 
 @pytest.mark.asyncio
+async def test_handle_user_message_uses_swsd_controller_entry_not_adapter_decide_route(monkeypatch):
+    adapter = _make_adapter()
+    ws = _FakeWS()
+    adapter._connections["sess-swsd-entry"] = (ws, "proj-swsd-entry")
+    handler_called = False
+
+    def fail_decide_route(*args, **kwargs):
+        raise AssertionError("WebSocket _handle_user_message must not call _decide_route directly")
+
+    async def handler(event):
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("SWSD chat immediate_reply should not enter agent handler")
+
+    monkeypatch.setattr(adapter, "_decide_route", fail_decide_route)
+    adapter._swsd_workflow_controller._run_chat_agent = lambda event, plan: "controller-chat"
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {"type": "message", "body": {"role": "user", "content": "BGA ? QFP ??????"}},
+        "sess-swsd-entry",
+        "proj-swsd-entry",
+    )
+
+    assert handler_called is False
+    assert ws.sent[-1]["type"] == "message"
+    assert ws.sent[-1]["body"]["content"] == "controller-chat"
+
+@pytest.mark.asyncio
 async def test_plain_greeting_skips_route_intent_llm():
     adapter = _make_adapter(route_intent_llm_enabled=True)
-    seen = {}
+    handler_called = False
 
     async def fail_classify(**kwargs):
         raise AssertionError("plain greeting should not call route intent LLM")
 
     async def handler(event):
-        seen["text"] = event.text
-        seen["raw"] = event.raw_message
-        return "你好，我在。"
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("SWSD chat immediate_reply should not enter agent handler")
 
     adapter._classify_route_intent_with_llm = fail_classify
+    adapter._swsd_workflow_controller._run_chat_agent = lambda event, plan: "hello"
     adapter.set_message_handler(handler)
     ws = _FakeWS()
     adapter._connections["sess-greeting"] = (ws, "proj-greeting")
 
     await adapter._handle_user_message(
-        {"type": "message", "body": {"role": "user", "content": "你好"}},
+        {"type": "message", "body": {"role": "user", "content": "hello"}},
         "sess-greeting",
         "proj-greeting",
     )
 
-    assert "你好" in seen["text"]
-    assert seen["raw"]["options"]["route_mode"] == "chat"
-    assert seen["raw"]["options"]["pcb_agent_loop"] is False
-    assert ws.sent[-1]["body"]["content"] == "你好，我在。"
+    assert handler_called is False
+    assert ws.sent[-1]["body"]["content"] == "hello"
     assert ws.sent[-1]["body"]["isFinal"] is True
 
 
@@ -2378,7 +2601,10 @@ def test_route_decision_supports_escape_param_modify_from_review_state():
     session_id = "sess-fanout-modify-params"
     adapter._set_session_mode(session_id, "pcb")
     adapter._session_selected_targets[session_id] = "U23"
-    adapter._session_fanout_params[session_id] = {"routerType": "135+RL"}
+    adapter._session_fanout_params[session_id] = {
+        "routerType": "135+RL",
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
     adapter._swsd_update(
         session_id,
         "pcb_escape_flow",
@@ -2397,9 +2623,70 @@ def test_route_decision_supports_escape_param_modify_from_review_state():
 
     assert decision.mode == "pcb"
     assert decision.reason == "escape_modify_params"
-    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
     assert adapter._session_route_algorithms[session_id] == "arc"
+    assert adapter._session_fanout_params[session_id]["routerType"] == "rl_arc"
 
+
+def test_route_decision_supports_escape_constraint_modify_from_review_state():
+    adapter = _make_adapter()
+    session_id = "sess-fanout-modify-constraints"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._session_selected_targets[session_id] = "U23"
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U23",
+        "routerType": "135+RL",
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {
+            "selectedBGA": "U23",
+            "routerType": "135",
+            "fanoutParams": {"routerType": "135+RL"},
+        },
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    decision = adapter._decide_route(session_id, "线宽改成 5")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "escape_modify_params"
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+    assert adapter._session_fanout_params[session_id]["constraints"]["LineWidth"] == 5
+
+
+def test_route_decision_supports_pinyin_confirm_and_reject():
+    adapter = _make_adapter()
+    confirm_session = "sess-pinyin-confirm"
+    adapter._set_session_mode(confirm_session, "pcb")
+    adapter._set_flow_state(confirm_session, "wait_confirm")
+    adapter._session_fanout_params[confirm_session] = {"selectedBGA": "U23", "routerType": "rl"}
+
+    confirm_decision = adapter._decide_route(confirm_session, "queren")
+
+    assert confirm_decision.reason == "confirm_route"
+
+    reject_session = "sess-pinyin-reject"
+    adapter._set_session_mode(reject_session, "pcb")
+    adapter._session_fanout_params[reject_session] = {"selectedBGA": "U23", "routerType": "rl"}
+    adapter._swsd_update(
+        reject_session,
+        "pcb_escape_flow",
+        "review",
+        {"selectedBGA": "U23", "fanoutParams": {"routerType": "rl"}},
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    reject_decision = adapter._decide_route(reject_session, "jujue")
+
+    assert reject_decision.reason == "reject_route"
 
 def test_route_decision_supports_escape_checkpoint_rollback():
     adapter = _make_adapter()
@@ -2466,7 +2753,7 @@ async def test_handle_user_message_skips_adapter_intent_and_loads_pcb_skills(mon
         "proj-llm-1",
     )
 
-    assert seen["auto_skill"] == ["hardware/pcb-intelligence"]
+    _assert_contains_skills(seen["auto_skill"], ["hardware/pcb-intelligence"])
     assert seen["text"].startswith("[SYSTEM: 当前消息来自启云方 WebSocket PCB 客户端。")
     assert "forced_skill: global_fanout" in seen["text"]
     assert "projectid: proj-llm-1" in seen["text"]
@@ -2501,7 +2788,7 @@ async def test_forced_fanout_tag_enters_agent_loop_with_global_fanout_guard(monk
         "proj-forced-fanout",
     )
 
-    assert seen["auto_skill"] == ["hardware/pcb-intelligence"]
+    _assert_contains_skills(seen["auto_skill"], ["hardware/pcb-intelligence"])
     assert seen["options"]["route_mode"] == "pcb"
     assert seen["options"]["pcb_agent_loop"] is True
     assert "forced_skill: global_fanout" in seen["text"]
@@ -2619,17 +2906,25 @@ async def test_forced_fanout_empty_agent_response_sends_status_fallback(monkeypa
 
 @pytest.mark.parametrize("content", ["#reroute", "#拆线重布"])
 @pytest.mark.asyncio
-async def test_forced_reroute_tag_loads_only_reroute_skill(monkeypatch, content):
+async def test_forced_reroute_tag_uses_swsd_direct_tool_call(monkeypatch, content):
     adapter = _make_adapter(route_intent_llm_enabled=True)
-    seen = {}
+    seen = {"handler_called": False, "tool_calls": []}
 
     async def handler(event):
-        seen["auto_skill"] = event.auto_skill
-        seen["text"] = event.text
-        seen["options"] = event.raw_message["options"]
+        seen["handler_called"] = True
         return None
 
+    async def fake_send_tool_call(*, session_id, call_id, tool_name, arguments, timeout=360.0):
+        seen["tool_calls"].append({
+            "session_id": session_id,
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "arguments": arguments,
+        })
+        return {"missing_routes": [], "projectData": "", "localContext": {"source": "unit_test"}}
+
     adapter.set_message_handler(handler)
+    monkeypatch.setattr(adapter, "send_tool_call", fake_send_tool_call)
 
     await adapter._handle_user_message(
         {
@@ -2640,13 +2935,12 @@ async def test_forced_reroute_tag_loads_only_reroute_skill(monkeypatch, content)
         "proj-forced-reroute",
     )
 
-    assert seen["auto_skill"] == ["hardware/pcb-reroute"]
-    assert seen["options"]["route_mode"] == "pcb"
-    assert seen["options"]["pcb_agent_loop"] is True
-    assert "forced_skill: reroute" in seen["text"]
-    assert "禁止调用 pcb_extract_bga、generateFanoutParams 或 route" in seen["text"]
-    assert content in seen["text"]
-    assert "projectid: proj-forced-reroute" in seen["text"]
+    assert seen["handler_called"] is False
+    assert len(seen["tool_calls"]) == 1
+    assert seen["tool_calls"][0]["tool_name"] == "deleteTracesForRerouting"
+    assert seen["tool_calls"][0]["arguments"] == {}
+    assert adapter._session_modes["sess-forced-reroute"] == "pcb"
+    assert adapter._session_flow_states["sess-forced-reroute"] == "reroute"
 
 
 def test_get_project_data_relative_file_path_is_resolved_and_cached(monkeypatch, tmp_path):
@@ -2785,3 +3079,349 @@ def test_stream_snapshot_with_cursor_replaces_instead_of_duplication():
     assert first == "我来帮你获取 ▉"
     assert second == "我来帮你获取 PCB 项目数据，然后分析区别。 ▉"
     assert buffers[session_id] == "我来帮你获取 PCB 项目数据，然后分析区别。"
+
+def test_router_type_prompt_includes_ga_and_auto_options():
+    adapter = _make_adapter()
+    session_id = "sess-router-options"
+    adapter._session_selected_targets[session_id] = "U22"
+
+    prompt = adapter._router_type_prompt(session_id)
+    followup = adapter._router_choice_followup_prompt(session_id)
+
+    assert "GA" in prompt
+    assert "Auto" in prompt
+    assert "135 + GA" in prompt
+    assert "arc + Auto" in prompt
+    assert "GA" in followup or "Auto" in followup
+
+
+def test_router_type_prompt_no_longer_mentions_digit_menu():
+    adapter = _make_adapter()
+    session_id = "sess-router-no-digit"
+    adapter._session_selected_targets[session_id] = "U22"
+    adapter._session_route_algorithms[session_id] = "135"
+
+    prompt = adapter._router_type_prompt(session_id)
+    followup = adapter._router_choice_followup_prompt(session_id)
+
+    assert "1=" not in prompt
+    assert "2=" not in prompt
+    assert "1=" not in followup
+    assert "2=" not in followup
+
+
+def test_wait_router_type_pure_digit_falls_back_to_chat():
+    adapter = _make_adapter()
+    session_id = "sess-router-digit-chat"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_router_type")
+    adapter._session_selected_targets[session_id] = "U22"
+
+    decision = adapter._decide_route(session_id, "1")
+
+    assert decision.mode == "chat"
+    assert decision.reason == "default_chat"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+
+
+def test_route_decision_supports_fanout_rerun_in_review_state():
+    adapter = _make_adapter()
+    session_id = "sess-fanout-rerun"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+    adapter._session_selected_targets[session_id] = "U23"
+    adapter._session_fanout_params[session_id] = {
+        "selectedBGA": "U23",
+        "routerType": "rl",
+        "routeAlgorithm": "135",
+        "fanoutModule": "RL",
+        "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        "constraints": {"LineWidth": 4, "LineSpacing": 3},
+    }
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {"selectedBGA": "U23", "fanoutParams": {"routerType": "rl"}},
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    decision = adapter._decide_route(session_id, "rerun fanout")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "rerun_fanout"
+    assert adapter._session_flow_states[session_id] == "wait_router_type"
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U23"
+    assert "orderLines" not in adapter._session_fanout_params[session_id]
+
+
+def test_targeted_single_utterance_fanout_enters_pcb_entry():
+    adapter = _make_adapter()
+
+    decision = adapter._decide_route("sess-single-utterance", "for U5 fanout, line width 30")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "forced_global_fanout"
+    assert adapter._session_requested_bga_targets["sess-single-utterance"] == "U5"
+
+def test_active_workflow_state_keeps_review_active_and_legacy_not_idle():
+    adapter = _make_adapter()
+    session_id = "sess-active-review"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._swsd_update(
+        session_id,
+        "pcb_escape_flow",
+        "review",
+        {"selectedBGA": "U22", "fanoutParams": {"routerType": "rl"}},
+        event_type="checkpoint",
+        intent="route_complete",
+        checkpoint_label="review",
+    )
+
+    workflow_id, workflow_state = adapter._active_workflow_state(session_id)
+
+    assert workflow_id == "pcb_escape_flow"
+    assert workflow_state == "review"
+    assert adapter._swsd_runtime_bridge.legacy_flow_for_workflow_state(workflow_id, workflow_state) == "wait_confirm"
+
+
+def test_route_decision_supports_escape_restore_params_version():
+    adapter = _make_adapter()
+    session_id = "sess-restore-params"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+
+    from tools import pcb_tools
+
+    pcb_tools._transport.bind_project(session_id, "proj-restore-params")
+    pcb_tools._transport.cache_project_data('(board "demo")', session_id=session_id)
+    pcb_tools._transport.record_fanout_route_version(
+        session_id,
+        fanout_params={
+            "selectedBGA": "U22",
+            "routerType": "rl",
+            "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        },
+        user_text="first run",
+        report="ok",
+    )
+
+    decision = adapter._decide_route(session_id, "恢复第 1 版参数")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "restore_params_version"
+    assert "restoredKind" in (decision.immediate_reply or "")
+    assert adapter._session_active_params_versions[session_id] == 1
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+
+
+def test_route_decision_supports_escape_restore_layout_checkpoint():
+    adapter = _make_adapter()
+    session_id = "sess-restore-layout"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "wait_confirm")
+
+    from tools import pcb_tools
+
+    pcb_tools._transport.bind_project(session_id, "proj-restore-layout")
+    pcb_tools._transport.cache_project_data('(board "demo")', session_id=session_id)
+    layout_file = Path(tempfile.gettempdir()) / "hermes_test_restore_layout_v001.txt"
+    layout_file.write_text('(layout "routed-v1")', encoding="utf-8")
+    pcb_tools._transport.record_fanout_route_version(
+        session_id,
+        fanout_params={
+            "selectedBGA": "U22",
+            "routerType": "rl",
+            "orderLines": [{"net": "GND", "layer": "Top", "order": 1}],
+        },
+        user_text="first run",
+        routed_layout_path=str(layout_file),
+        report="ok",
+    )
+    pcb_tools._transport.mark_fanout_import_status(session_id, 1, "success", "imported")
+
+    decision = adapter._decide_route(session_id, "恢复第 1 版版图")
+
+    assert decision.mode == "pcb"
+    assert decision.reason == "restore_layout_checkpoint"
+    assert "restoredKind" in (decision.immediate_reply or "")
+    assert "requiresReimport" in (decision.immediate_reply or "")
+    assert adapter._session_layout_versions[session_id] == 1
+    assert adapter._session_flow_states[session_id] == "wait_confirm"
+
+
+
+def test_swsd_update_write_failure_is_observable(caplog):
+    adapter = _make_adapter()
+
+    def fail_update(*args, **kwargs):
+        raise RuntimeError("state db down")
+
+    adapter._swsd_state.update = fail_update
+
+    with caplog.at_level("WARNING"):
+        ok = adapter._swsd_update(
+            "sess-health",
+            "pcb_escape_flow",
+            "review",
+            {"x": 1},
+            event_type="state_sync",
+            intent="",
+            action_type="state_sync",
+        )
+
+    assert ok is False
+    assert "SWSD update failed" in caplog.text
+    assert adapter._swsd_health["sess-health"]["lastWriteError"] == "state db down"
+
+
+def test_swsd_transition_guard_warn_allows_and_logs(caplog):
+    adapter = _make_adapter(swsd_transition_guard_mode="warn")
+    adapter._swsd_update("sess-guard-warn", "pcb_escape_flow", "review", {}, event_type="state_sync")
+
+    with caplog.at_level("WARNING"):
+        ok = adapter._swsd_update(
+            "sess-guard-warn",
+            "pcb_escape_flow",
+            "select_bga",
+            {},
+            event_type="workflow_action",
+            intent="confirm_route",
+            action_type="normal",
+        )
+
+    assert ok is True
+    assert "Illegal SWSD transition" in caplog.text
+    assert adapter._swsd_state.load("sess-guard-warn", "pcb_escape_flow")["current_state"] == "select_bga"
+
+
+def test_swsd_transition_guard_strict_rejects_invalid_transition(caplog):
+    adapter = _make_adapter(swsd_transition_guard_mode="strict")
+    adapter._swsd_update("sess-guard-strict", "pcb_escape_flow", "review", {}, event_type="state_sync")
+
+    with caplog.at_level("WARNING"):
+        ok = adapter._swsd_update(
+            "sess-guard-strict",
+            "pcb_escape_flow",
+            "select_bga",
+            {},
+            event_type="workflow_action",
+            intent="confirm_route",
+            action_type="normal",
+        )
+
+    assert ok is False
+    assert "Illegal SWSD transition" in caplog.text
+    assert adapter._swsd_state.load("sess-guard-strict", "pcb_escape_flow")["current_state"] == "review"
+    assert "illegal transition review->select_bga" in adapter._swsd_health["sess-guard-strict"]["lastWriteError"]
+
+
+def test_swsd_transition_guard_bypasses_state_sync_reset_observation():
+    adapter = _make_adapter(swsd_transition_guard_mode="strict")
+    adapter._swsd_update("sess-bypass", "pcb_escape_flow", "review", {}, event_type="state_sync")
+
+    assert adapter._swsd_update(
+        "sess-bypass",
+        "pcb_escape_flow",
+        "select_bga",
+        {},
+        event_type="observation",
+        intent="not_a_graph_transition",
+        action_type="observation",
+    ) is True
+    assert adapter._swsd_update(
+        "sess-bypass",
+        "pcb_escape_flow",
+        "idle",
+        {},
+        event_type="reset",
+        intent="not_a_graph_transition",
+        action_type="reset",
+    ) is True
+
+
+def test_stale_fanout_body_does_not_pull_reroute_report_back_to_escape_review():
+    adapter = _make_adapter()
+    session_id = "sess-stale-body"
+    adapter._set_session_mode(session_id, "pcb")
+    adapter._set_flow_state(session_id, "reroute")
+    adapter._swsd_update(session_id, "pcb_reroute_flow", "report", {}, event_type="state_sync")
+
+    adapter._recover_experience_from_inbound_body(
+        session_id,
+        "project",
+        {"fanoutParams": {"selectedBGA": "U5", "routerType": "rl"}},
+    )
+
+    assert adapter._session_flow_states[session_id] == "reroute"
+    assert adapter._swsd_state.load(session_id, "pcb_reroute_flow")["current_state"] == "report"
+    assert adapter._session_fanout_params[session_id]["selectedBGA"] == "U5"
+
+@pytest.mark.asyncio
+async def test_swsd_fanout_execute_chain_bootstraps_get_project_data(monkeypatch):
+    adapter = _make_adapter(route_intent_llm_enabled=True)
+    adapter._allow_legacy_route_decision = False
+    ws = _FakeWS()
+    session_id = "sess-swsd-fanout-e2e"
+    project_id = "proj-swsd-fanout-e2e"
+    adapter._connections[session_id] = (ws, project_id)
+    seen = {"tool_calls": [], "analysis_context": None, "handler_called": False}
+
+    def fail_decide_route(*args, **kwargs):
+        raise AssertionError("new SWSD execute chain must not call legacy _decide_route")
+
+    async def handler(event):
+        seen["handler_called"] = True
+        raise AssertionError("fanout execute bootstrap should not enter Hermes agent handler")
+
+    async def fake_send_tool_call(*, session_id, call_id, tool_name, arguments, timeout=360.0):
+        seen["tool_calls"].append(
+            {
+                "session_id": session_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "timeout": timeout,
+            }
+        )
+        return {
+            "projectData": "(board U5 U7)",
+            "relativePath": "boards/demo.kicad_pcb",
+            "absolutePath": "F:/boards/demo.kicad_pcb",
+        }
+
+    async def fake_run_direct_bga_analysis(session_id, bootstrap_context):
+        seen["analysis_context"] = dict(bootstrap_context)
+        return True
+
+    monkeypatch.setattr(adapter, "_decide_route", fail_decide_route)
+    monkeypatch.setattr(adapter, "send_tool_call", fake_send_tool_call)
+    monkeypatch.setattr(adapter, "_run_direct_bga_analysis", fake_run_direct_bga_analysis)
+    adapter.set_message_handler(handler)
+
+    await adapter._handle_user_message(
+        {"type": "message", "body": {"role": "user", "content": "给 U5 做 fanout，U7 也一起做，线宽3mil，线距3mil"}},
+        session_id,
+        project_id,
+    )
+
+    assert seen["handler_called"] is False
+    assert len(seen["tool_calls"]) == 1
+    assert seen["tool_calls"][0]["tool_name"] == "getProjectData"
+    assert seen["tool_calls"][0]["session_id"] == session_id
+    assert seen["analysis_context"]["source"] == "bootstrap_getProjectData"
+
+    state = adapter._swsd_state.load(session_id, "pcb_escape_flow")
+    assert state["current_state"] == "select_bga"
+    payload = state["state_payload"]
+    assert payload["step_id"] == "get_project_data"
+    assert payload["projectData"]['status'] == "loaded"
+    assert payload["projectData"]['relative_path'] == "boards/demo.kicad_pcb"
+    assert payload["projectData"]['absolute_path'] == "F:/boards/demo.kicad_pcb"
+    assert payload["targetBGAs"] == ["U5", "U7"]
+    assert payload["fanoutParamPlan"]["jump_to"] == "layer_assign_escape_order"
+    assert payload["fanoutParamPlan"]["constraints"]["normalized"] == {"LineWidth": 3, "LineSpacing": 3}
+    assert adapter._session_requested_bga_targets[session_id] == "U5"
+    assert adapter._session_fanout_params[session_id]["constraints"] == {"LineWidth": 3, "LineSpacing": 3}

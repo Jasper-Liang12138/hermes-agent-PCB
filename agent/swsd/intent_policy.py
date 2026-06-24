@@ -1,4 +1,4 @@
-"""SWSD hierarchical intent policy and state-constrained decoding."""
+﻿"""SWSD hierarchical intent policy and state-constrained decoding."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ _META_BLOCK_RE = re.compile(
     r"先别执行|不要执行|不用执行|别执行|仅说明|只说明|先说明|先不执行|不要调用工具|不用调用工具|不要布线|先不布线|只分析|只解释",
     re.IGNORECASE,
 )
-_CANCEL_RE = re.compile(r"取消|退出|中止|停止|不做了|结束当前流程|cancel|abort|exit", re.IGNORECASE)
+_CANCEL_RE = re.compile(r"取消|退出|中止|停止|不做了|结束当前流程|cancel|abort|exit|buyao|jujue|jvjue", re.IGNORECASE)
 _REROUTE_RE = re.compile(r"拆线|重布|重新布|重新走|重走|reroute|rip-?up|删除.*(?:线|走线|trace|net|框选|选中)|未布通网络.*整理|网络.*重新整理", re.IGNORECASE)
 _NEGATED_REROUTE_RE = re.compile(r"(?:不要|不是|别|无需|不用|不需要).{0,8}(?:reroute|拆线|重布|重新布|重走)", re.IGNORECASE)
 _NEGATED_FANOUT_RE = re.compile(r"(?:不要|不是|别|无需|不用|不需要).{0,8}(?:fanout|扇出|逃逸|布线)", re.IGNORECASE)
@@ -56,8 +56,8 @@ _DIRECT_EXECUTE_RE = re.compile(
 )
 _DISCUSSION_RE = re.compile(r"会不会|有什么影响|利弊|影响|风险|分几步|一般|什么是|为什么|是什么意思|意思|区别|差异|对比|列出|有哪些|看看|看一下|分析|只分析|不要执行|走线太密.{0,8}重布|能.{0,8}重布吗", re.IGNORECASE)
 _ENGINEERING_OBJECT_RE = re.compile(r"PCB|BGA|fanout|reroute|rip-?up|U\d+|IC\d+|FPGA\d+|BGA\d+|走线|网络|板子|布线|逃逸|扇出|重布|拆线", re.IGNORECASE)
-_CONFIRM_RE = re.compile(r"确认|继续|执行|开始|开始布线|go\b|yes\b|ok\b", re.IGNORECASE)
-_STRONG_CONFIRM_RE = re.compile(r"确认|继续|执行|开始|开始布线|开始执行|go\b|run\b|yes\b|ok\b", re.IGNORECASE)
+_CONFIRM_RE = re.compile(r"确认|继续|执行|开始|开始布线|go\b|yes\b|ok\b|qu\s*ren|queren|jixu", re.IGNORECASE)
+_STRONG_CONFIRM_RE = re.compile(r"确认|继续|执行|开始|开始布线|开始执行|go\b|run\b|yes\b|ok\b|qu\s*ren|queren|jixu", re.IGNORECASE)
 _WEAK_CONFIRM_RE = re.compile(r"^(?:嗯+|好|好的|行|可以|收到|随便|都行|可以吧)[，。！？?!\s（）()]*$", re.IGNORECASE)
 _PARAM_RE = re.compile(r"线宽|间距|linewidth|linespacing|width|spacing|改成|修改|调整|调到|\d+\s*mil", re.IGNORECASE)
 _ROUTER_RE = re.compile(r"\b(?:arc|rl|135|rl_arc|rl_135)\b|圆弧|北科大|折角|135\s*度", re.IGNORECASE)
@@ -530,3 +530,4 @@ def apply_swsd4_policy(
         skill_grounding=grounding,
     )
     return decision.as_policy_decision()
+

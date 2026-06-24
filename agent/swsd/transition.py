@@ -16,10 +16,16 @@ def transition_for(
     workflow = get_workflow(workflow_id)
     if workflow is None:
         return Transition(current_state, fallback_state, intent, ActionType.FALLBACK, "unknown workflow")
-    if intent == "cancel":
-        return Transition(current_state, "idle", intent, ActionType.CANCEL, "user cancelled workflow")
-    if intent == "rollback":
-        return Transition(current_state, current_state, intent, ActionType.ROLLBACK, "rollback requested")
+    if intent in {"cancel", "cancel_flow"}:
+        transition = workflow.next_transition(current_state, "cancel_flow", ActionType.CANCEL)
+        if transition:
+            return transition
+        return Transition(current_state, "idle", "cancel_flow", ActionType.CANCEL, "user cancelled workflow")
+    if intent in {"rollback", "rollback_checkpoint"}:
+        transition = workflow.next_transition(current_state, "rollback_checkpoint", ActionType.ROLLBACK)
+        if transition:
+            return transition
+        return Transition(current_state, current_state, "rollback_checkpoint", ActionType.ROLLBACK, "rollback requested")
     if intent in {"reroute_again", "reroute_reentry"} and workflow_id == "pcb_reroute_flow":
         return Transition(current_state, "rip_up", intent, ActionType.USER_JUMP, "reroute re-entry")
     transition = workflow.next_transition(current_state, intent)
