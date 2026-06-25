@@ -12,7 +12,7 @@ from agent.swsd.pcb_intent_agent_loop.loops import (
     agent_proposal_loop,
     run_pcb_intent_agent_loops,
 )
-from agent.swsd.pcb_intent_agent_loop.tool_planning_chat_model import ToolPlanningChatIntentModel
+from agent.swsd.pcb_intent_agent_loop.tool_planning_chat_model import ToolPlanningChatIntentModel, file_trace_sink
 
 __all__ = [
     "BaseSWSDIntentLoop",
@@ -26,4 +26,5 @@ __all__ = [
     "agent_proposal_loop",
     "run_pcb_intent_agent_loops",
     "ToolPlanningChatIntentModel",
+    "file_trace_sink",
 ]

@@ -8,6 +8,8 @@ a readable fallback prompt when arbitration fails.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -82,13 +84,41 @@ class LocalRuleIntentModel:
     """
 
     def propose_candidates(self, request: IntentAgentLoopInput, feedback: tuple[str, ...] = ()) -> IntentCandidateSet:
-        candidates = request.fallback_candidates or (ActionCandidate("chat", 0.8, reason="no intent model candidates", source="default"),)
+        candidates = request.fallback_candidates or self._rule_candidates(request)
+        if not candidates:
+            candidates = (ActionCandidate("chat", 0.8, reason="no intent model candidates", source="default"),)
         return IntentCandidateSet(
             workflow=request.workflow_id,
             current_state=request.workflow_state,
             candidate_actions=tuple(candidates),
             model_source="local_rule_intent_model",
         )
+
+    def _rule_candidates(self, request: IntentAgentLoopInput) -> tuple[ActionCandidate, ...]:
+        text = request.user_text or ""
+        state = request.workflow_state or "idle"
+        allowed = set(request.allowed_actions or ())
+        candidates: list[ActionCandidate] = []
+
+        def add(action: str, confidence: float, *, entities: dict[str, Any] | None = None, reason: str = "") -> None:
+            if allowed and action not in allowed:
+                return
+            candidates.append(ActionCandidate(action, confidence, entities or {}, reason, "local_rule_intent_model"))
+
+        if re.search(r"回到上一步|上一步|rollback|撤回|退回", text, flags=re.IGNORECASE):
+            add("rollback_checkpoint", 0.97, reason="local rollback signal")
+        if re.search(r"拆线重布|reroute|ripup|rip-up|删除.*(?:走线|线|trace|traces)", text, flags=re.IGNORECASE):
+            add("reroute_entry", 0.96, reason="local reroute signal")
+        if re.search(r"\b(arc|135|rl|ga|auto)\b|北科大|遗传|自动", text, flags=re.IGNORECASE):
+            add("layer_assigned", 0.9, entities={"routerText": text}, reason="local router choice signal")
+            add("modify_params", 0.86, entities={"routerText": text}, reason="local router modify signal")
+        if re.search(r"线宽|线距|spacing|width|mil|参数|改成|修改", text, flags=re.IGNORECASE):
+            add("modify_params", 0.84, entities={"rawText": text}, reason="local parameter modify signal")
+        if re.search(r"fanout|扇出|逃逸|布线|BGA", text, flags=re.IGNORECASE) and state in {"idle", "select_bga"}:
+            add("pcb_entry", 0.9, reason="local fanout entry signal")
+        if not candidates:
+            add("chat", 0.8, reason="local default chat")
+        return tuple(candidates)
 
     def judge_candidates(
         self,

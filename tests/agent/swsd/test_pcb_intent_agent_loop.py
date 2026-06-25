@@ -152,3 +152,93 @@ def test_tool_planning_chat_intent_model_uses_configured_stage(monkeypatch):
     assert result.final_action == "rollback_checkpoint"
     assert calls
     assert all(call["stage"] == pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT for call in calls)
+
+
+def test_local_rule_fallback_recognizes_rollback_without_fallback_candidates():
+    request = _request(fallback=())
+    result = run_pcb_intent_agent_loops(request, None)
+
+    assert result.accepted is True
+    assert result.final_action == "rollback_checkpoint"
+    assert result.candidate_set.candidate_actions[0].source == "local_rule_intent_model"
+
+
+def test_local_rule_fallback_recognizes_reroute_entry():
+    request = IntentAgentLoopInput(
+        user_text="拆线重布",
+        workflow_id="pcb_reroute_flow",
+        workflow_state="idle",
+        allowed_actions=("reroute_entry", "chat"),
+    )
+
+    result = run_pcb_intent_agent_loops(request, None)
+
+    assert result.accepted is True
+    assert result.final_action == "reroute_entry"
+
+
+def test_tool_planning_chat_intent_model_parses_relaxed_candidate_shapes(monkeypatch):
+    calls = []
+
+    def fake_chat_completion_text(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return (
+                '```json\n{"actionCandidates":[{"intent":"rollback_checkpoint","confidence":"0.96","entities":"{\\"target_step\\":\\"previous\\"}","why":"previous"}],"modelSource":"tool_planning_chat"}\n```',
+                {"stage": kwargs["stage"]},
+            )
+        return '{"accepted":"true","action":"rollback_checkpoint","confidence":0.96,"reason":"valid"}', {"stage": kwargs["stage"]}
+
+    monkeypatch.setattr(pcb_model_runtime, "chat_completion_text", fake_chat_completion_text)
+
+    result = run_pcb_intent_agent_loops(_request(), ToolPlanningChatIntentModel(timeout_s=1.0))
+
+    assert result.accepted is True
+    assert result.final_action == "rollback_checkpoint"
+    assert result.candidate_set.candidate_actions[0].entities == {"target_step": "previous"}
+
+def test_tool_planning_chat_intent_model_normalizes_entity_only_router_output(monkeypatch):
+    calls = []
+
+    def fake_chat_completion_text(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return '{"routerType":"135+RL"}', {"stage": kwargs["stage"]}
+        return '{"accept":true,"action":"layer_assigned","confidence":0.91,"reason":"valid router choice"}', {"stage": kwargs["stage"]}
+
+    monkeypatch.setattr(pcb_model_runtime, "chat_completion_text", fake_chat_completion_text)
+    request = IntentAgentLoopInput(
+        user_text="135 + RL",
+        workflow_id="pcb_escape_flow",
+        workflow_state="layer_assign_escape_order",
+        allowed_actions=("layer_assigned", "modify_params", "chat"),
+    )
+
+    result = run_pcb_intent_agent_loops(request, ToolPlanningChatIntentModel(timeout_s=1.0))
+
+    assert result.accepted is True
+    assert result.final_action == "layer_assigned"
+    assert result.candidate_set.candidate_actions[0].entities == {"routerType": "135+RL"}
+
+
+def test_confidence_loop_accepts_exactly_five_of_six_votes():
+    class OneJudgeRejectModel(RecordingIntentModel):
+        def judge_candidates(self, request, candidate_set, policy_feedback=""):
+            self.judge_calls += 1
+            return self.judge_calls != 2
+
+    model = OneJudgeRejectModel()
+    request = _request()
+    candidate_set = IntentCandidateSet(
+        request.workflow_id,
+        request.workflow_state,
+        (ActionCandidate("rollback_checkpoint", 0.96, source="intent_model"),),
+    )
+
+    policy, accepted, votes, feedback = agent_confidence_loop(request, candidate_set, model)
+
+    assert accepted is True
+    assert policy.action == "rollback_checkpoint"
+    assert len(votes) == 6
+    assert sum(votes) == 5
+    assert model.judge_calls == 3
