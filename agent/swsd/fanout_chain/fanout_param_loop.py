@@ -195,15 +195,40 @@ def _validate_plan(plan: FanoutParamPlan) -> tuple[bool, tuple[str, ...]]:
 
 
 def _model_prompt(user_text: str, feedback: tuple[str, ...]) -> list[dict[str, str]]:
-    system = (
-        "You are expert F for PCB fanout parameter intent. Output only JSON. "
-        "Schema: {\"intent_kind\":\"global_fanout|target_fanout|global_fanout_with_constraints|target_fanout_with_constraints\","
-        "\"target_bgas\":[{\"raw\":\"U5\",\"normalized\":\"U5\"}],"
-        "\"constraints\":{\"raw\":\"line width/spacing 3mil\",\"normalized\":{\"LineWidth\":3,\"LineSpacing\":3}},"
-        "\"jump_to\":\"select_bga|layer_assign_escape_order\",\"skip_select_bga\":false,\"reason\":\"...\"}. "
-        "Examples: fanout => global_fanout/select_bga; 给U5布线 => target_fanout/layer_assign_escape_order; "
-        "fanout，线宽/线距3mil => global_fanout_with_constraints; 给U5布线，线宽/线距3mil => target_fanout_with_constraints."
-    )
+    system = """你是 PCB fanout 参数识别专家 / Expert F。
+
+任务：从用户中文输入中识别 fanout 参数计划，用于 SWSD fanout execute chain。
+
+硬性规则:
+- Return only JSON. No Markdown. No explanation.
+- 不要调用工具，不要执行 route。
+- JSON key 保持英文。
+- 只识别用户明确表达或高度确定的信息。
+- 支持多个 BGA，例如 “U5 和 U7” => targetBGAs=["U5","U7"]。
+- 支持线宽/线距，例如 “线宽3mil，线距3mil” => constraints={"LineWidth":3,"LineSpacing":3}。
+- 支持 routerType，例如 “135 + RL” => routerType="135+RL"。
+- 如果用户只说 fanout/扇出/逃逸/布线，但没有目标，仍可输出 intent="fanout_entry"，不要编造 selectedBGA。
+- 如果用户指定目标 BGA，可以建议 jump_to="layer_assign_escape_order"，因为可跳过 select_bga。
+- 保留 raw_constraints 与 normalized 两份约束：raw_constraints 保存用户原始表达，constraints 保存规范字段。
+
+输出格式:
+{
+  "intent": "fanout_entry",
+  "selectedBGA": "U5",
+  "targetBGAs": ["U5", "U7"],
+  "routerType": "135+RL",
+  "constraints": {"LineWidth": 3, "LineSpacing": 3},
+  "raw_constraints": {"line_width": "3mil", "line_spacing": "3mil"},
+  "jump_to": "layer_assign_escape_order",
+  "reason": "用户指定了 U5/U7 和线宽线距参数"
+}
+
+例子:
+- “fanout” => {"intent":"fanout_entry","reason":"用户请求进入 fanout"}
+- “给 U5 布线” => {"intent":"fanout_entry","selectedBGA":"U5","targetBGAs":["U5"],"jump_to":"layer_assign_escape_order"}
+- “fanout，线宽/线距3mil” => {"intent":"fanout_entry","constraints":{"LineWidth":3,"LineSpacing":3},"raw_constraints":{"line_width":"3mil","line_spacing":"3mil"}}
+- “给 U5 布线，线宽3mil，线距3mil” => {"intent":"fanout_entry","selectedBGA":"U5","targetBGAs":["U5"],"constraints":{"LineWidth":3,"LineSpacing":3},"jump_to":"layer_assign_escape_order"}
+    """
     payload = {"user_text": user_text, "validation_feedback": list(feedback)}
     return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
 
@@ -220,7 +245,14 @@ def run_fanout_param_loop(user_text: str, *, model: Any = None, max_rounds: int 
                 data = {}
         else:
             try:
-                raw_output = pcb_model_runtime.chat_completion_text(pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT, _model_prompt(user_text, feedback))
+                raw_output, _meta = pcb_model_runtime.chat_completion_text(
+                    stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+                    messages=_model_prompt(user_text, feedback),
+                    max_tokens=4096,
+                    temperature=0,
+                    top_p=1,
+                    stream_until_json=True,
+                )
                 data = _json_from_text(raw_output)
             except Exception:
                 data = {}

@@ -811,7 +811,7 @@ def chat_completion_text(
     stage: str,
     messages: list[dict[str, str]],
     runtime: dict[str, str] | None = None,
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
     temperature: float | None = 0.2,
     top_p: float | None = None,
     timeout_s: float = 180,

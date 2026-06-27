@@ -72,3 +72,34 @@ def test_record_step_merges_payload_and_checkpoint():
     assert state["state_payload"]["projectData"]["status"] == "requested"
     assert state["state_payload"]["targetBGAs"] == ["U5"]
     assert manager.latest_checkpoint("s", "pcb_escape_flow")["state"] == "select_bga"
+def test_escape_wait_confirm_maps_to_param_review():
+    from agent.swsd.runtime_bridge import WebSocketSWSDRuntimeBridge
+
+    class Adapter:
+        _session_flow_states = {}
+        _session_bga_selection = {}
+        _session_selected_targets = {}
+        _session_requested_bga_targets = {}
+        _session_router_types = {}
+        _session_route_algorithms = {}
+        _session_fanout_modules = {}
+        _session_fanout_params = {}
+        _session_board_summaries = {}
+        _session_layout_versions = {}
+        _session_active_params_versions = {}
+        _session_fanout_contexts = {}
+
+    bridge = WebSocketSWSDRuntimeBridge(
+        Adapter(),
+        escape_flow_id="pcb_escape_flow",
+        reroute_flow_id="pcb_reroute_flow",
+        flow_idle="idle",
+        flow_wait_selection="wait_selection",
+        flow_wait_router_type="wait_router_type",
+        flow_wait_confirm="wait_confirm",
+        flow_routing="routing",
+        flow_reroute="reroute",
+    )
+
+    assert bridge.swsd_state_from_legacy_flow("wait_confirm") == ("pcb_escape_flow", "param_review")
+    assert bridge.legacy_flow_for_workflow_state("pcb_escape_flow", "param_review") == "wait_confirm"

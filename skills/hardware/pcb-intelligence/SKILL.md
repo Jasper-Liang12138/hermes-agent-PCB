@@ -9,6 +9,12 @@ metadata:
   hermes:
     tags: [PCB, BGA, fanout, routing, hardware, EDA, 逃逸布线]
     category: hardware
+    websocket_pcb:
+      enabled: true
+      intents: [fanout, mixed]
+      priority: 200
+      mode: inject_only
+      persistent_websocket_session: true
 ---
 
 # PCB Intelligence Skill - BGA 逃逸布线智能体

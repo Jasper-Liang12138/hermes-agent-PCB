@@ -82,105 +82,33 @@ class WebSocketSWSDRuntimeBridge:
             setattr(self.adapter, "_last_direct_reroute_fields", cache)
         cache[session_id] = fields
     async def handle_reroute_delete_result(self, data: Dict[str, Any], result: Any) -> None:
-        """Advance reroute after deleteTracesForRerouting returns.
+        """Deliver deleteTracesForRerouting tool-result into the SWSD reroute chain.
 
-        SWSD owns this continuation edge:
-        rip_up + deleteTracesForRerouting.result -> complete_reroute -> report.
-        The WebSocket adapter only delivers the event.
+        WebSocket/RuntimeBridge only adapts the protocol event here. Reroute state,
+        confirmation, report rendering, and follow-up tool calls are owned by
+        agent.swsd.reroute_chain.RerouteExecuteChain.
         """
-        body = data.get("body", {}) if isinstance(data, dict) else {}
-        session_id = str(body.get("sessionId") or data.get("sessionId") or "").strip()
-        project_id = str(
-            body.get("projectid")
-            or body.get("projectID")
-            or data.get("projectid")
-            or data.get("projectID")
-            or ""
-        ).strip()
-        if not session_id:
-            return
+        from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
 
-        adapter = self.adapter
-        adapter._set_session_mode(session_id, "pcb")
-        adapter._set_flow_state(session_id, self.flow_reroute)
-        adapter._swsd_update(
-            session_id,
-            self.reroute_flow_id,
-            "reroute_llm",
-            self.reroute_payload(session_id, {"deleteTracesResult": result}),
-            event_type="tool_result",
-            intent="complete_reroute",
-            action_type="tool_result",
-            checkpoint_label="reroute delete result",
-        )
+        await RerouteExecuteChain(self.adapter._swsd_workflow_controller).handle_delete_result(data, result)
 
-        try:
-            from tools import pcb_tools
+    async def handle_reroute_tool_result(self, data: Dict[str, Any], result: Any) -> None:
+        """Deliver reroute tool-result into the SWSD reroute chain."""
+        from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
 
-            transport = pcb_tools.WebSocketTransportSingleton.get_instance()
-            transport.current_session_id = session_id
-            transport.set_session_mode(session_id, "pcb")
-            if project_id:
-                transport.bind_project(session_id, project_id)
-            if isinstance(result, dict):
-                transport.cache_reroute_context(result, session_id=session_id)
+        await RerouteExecuteChain(self.adapter._swsd_workflow_controller).handle_reroute_result(data, result)
 
-            reroute_request = {"localRerouteCompletionPolicy": {"mode": "selected_net_local_first"}}
-            reroute_json = await asyncio.to_thread(
-                pcb_tools.reroute,
-                json.dumps(reroute_request, ensure_ascii=False),
-                session_id,
-            )
-            try:
-                reroute_payload = json.loads(reroute_json) if isinstance(reroute_json, str) else {}
-            except json.JSONDecodeError:
-                reroute_payload = {"explanation": str(reroute_json or "").strip()}
-            if not isinstance(reroute_payload, dict):
-                reroute_payload = {"explanation": str(reroute_payload or "").strip()}
+    async def handle_reroute_import_result(self, data: Dict[str, Any], result: Any) -> None:
+        """Deliver reroute importLines result into the SWSD reroute chain."""
+        from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
 
-            visible = str(
-                reroute_payload.get("content")
-                or reroute_payload.get("report")
-                or reroute_payload.get("explanation")
-                or ""
-            )
-            reroute_payload = SWSDResponseBuilder.reroute_final(reroute_payload, visible_text=visible)
-            self._remember_reroute_fields(session_id, reroute_payload)
-            adapter._swsd_update(
-                session_id,
-                self.reroute_flow_id,
-                "report",
-                self.reroute_payload(session_id, {"rerouteResultPayload": reroute_payload}),
-                event_type="workflow_action",
-                intent="complete_reroute",
-                action_type="tool_result_continuation",
-                checkpoint_label="reroute complete",
-            )
-            content = adapter._fallback_visible_content_for_fields("", reroute_payload)
-            await adapter.send(
-                chat_id=session_id,
-                content=content,
-                metadata={"is_final": True, "pcb_fields": reroute_payload},
-            )
-        except Exception as exc:
-            logger.exception("Failed completing SWSD reroute after deleteTracesForRerouting result: %s", exc)
-            fields = SWSDResponseBuilder.recoverable_reroute_error(str(exc), status="reroute_finalize_failed")
-            self._remember_reroute_fields(session_id, fields)
-            adapter._swsd_update(
-                session_id,
-                self.reroute_flow_id,
-                "report",
-                self.reroute_payload(session_id, {"rerouteResultPayload": fields, "completionError": str(exc)}),
-                event_type="workflow_action",
-                intent="complete_reroute_failed",
-                action_type="tool_result_continuation",
-                checkpoint_label="reroute complete failed",
-            )
-            await adapter.send(
-                chat_id=session_id,
-                content=adapter._fallback_visible_content_for_fields("拆线重布未能完成。", fields),
-                metadata={"is_final": True, "pcb_fields": fields},
-            )
+        await RerouteExecuteChain(self.adapter._swsd_workflow_controller).handle_import_result(data, result)
+
+    async def handle_reroute_project_data_refresh_result(self, data: Dict[str, Any], result: Any) -> None:
+        """Deliver post-import getProjectData result into the SWSD reroute chain."""
+        from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
+
+        await RerouteExecuteChain(self.adapter._swsd_workflow_controller).handle_project_data_refresh_result(data, result)
     def swsd_state_from_legacy_flow(self, flow_state: str) -> tuple[str, str]:
         if flow_state == self.flow_reroute:
             return self.reroute_flow_id, "rip_up"
@@ -189,7 +117,7 @@ class WebSocketSWSDRuntimeBridge:
         if flow_state == self.flow_wait_router_type:
             return self.escape_flow_id, "layer_assign_escape_order"
         if flow_state == self.flow_wait_confirm:
-            return self.escape_flow_id, "review"
+            return self.escape_flow_id, "param_review"
         if flow_state == self.flow_routing:
             return self.escape_flow_id, "routing"
         return self.escape_flow_id, "idle"
@@ -204,6 +132,8 @@ class WebSocketSWSDRuntimeBridge:
         if state == "layer_assign":
             return self.flow_wait_router_type
         if state == "escape_order":
+            return self.flow_wait_confirm
+        if state == "param_review":
             return self.flow_wait_confirm
         if state == "review":
             return self.flow_wait_confirm
@@ -258,6 +188,4 @@ class WebSocketSWSDRuntimeBridge:
         current_layout_version = payload.get("currentLayoutVersion")
         if current_layout_version not in (None, ""):
             self.adapter._session_layout_versions[session_id] = current_layout_version
-
-
 

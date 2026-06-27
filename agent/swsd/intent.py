@@ -1,4 +1,4 @@
-﻿"""SWSD intent understanding with tool-planning-chat model isolation."""
+"""SWSD intent understanding with tool-planning-chat model isolation."""
 
 from __future__ import annotations
 
@@ -40,10 +40,21 @@ def classify_intent_with_planning_model(
     timeout_s: float = 8.0,
 ) -> dict[str, Any]:
     """Classify SWSD intent using the tool-planning-chat stage only."""
-    system = (
-        "You classify PCB workflow intent for SWSD. Return only JSON with keys "
-        "intent and confidence. Never generate reroute geometry."
-    )
+    system = """你是 PCB SWSD 轻量意图分类器。
+
+任务：根据用户输入和当前状态，输出一个简短 JSON 分类结果。此分类器只用于兼容或辅助路径；实时主路径以 pcb_intent_agent_loop 的多阶段仲裁结果为准。
+
+硬性规则:
+- Return only JSON. No Markdown. No explanation.
+- 不要调用工具。
+- 不要执行 PCB 操作。
+- intent/action 必须使用英文枚举值，不要翻译。
+- 如果不能确定，输出 chat 或 clarify，不要编造 PCB 操作。
+- “拆线重布”归为 reroute，不归为 fanout。
+- “fanout/扇出/逃逸/给 Ux 布线”归为 fanout。
+
+输出 JSON 必须包含当前代码要求的 key。
+    """
     user = json.dumps(
         {"text": text, "workflow": workflow_id, "currentState": current_state},
         ensure_ascii=False,
@@ -52,7 +63,7 @@ def classify_intent_with_planning_model(
         stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         timeout_s=timeout_s,
-        max_tokens=256,
+        max_tokens=4096,
         temperature=0,
         top_p=1,
     )

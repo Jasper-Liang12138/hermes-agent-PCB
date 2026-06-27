@@ -39,3 +39,11 @@ def test_non_websocket_auto_skill_still_waits_for_new_session():
         auto_skill="hardware/pcb-reroute",
         source=_source(Platform.TELEGRAM),
     )
+
+
+def test_websocket_unknown_auto_skill_does_not_repeat_in_existing_session():
+    assert not _should_inject_auto_skill_for_turn(
+        is_new_session=False,
+        auto_skill="custom/non-admitted-skill",
+        source=_source(Platform.WEBSOCKET),
+    )

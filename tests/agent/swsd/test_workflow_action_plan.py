@@ -249,6 +249,53 @@ def test_execute_reroute_plan_dispatches_skeleton_decision():
     result = controller.dispatch_plan(event, plan)
 
     assert result.plan is plan
-    assert result.decision.reason == "pcb_reroute_selected"
+    assert result.decision.reason == "reroute_rip_up_request"
     assert result.decision.mode == "pcb"
+    assert result.decision.tool_call["name"] == "deleteTracesForRerouting"
 
+
+def test_action_plan_normalization_maps_reroute_entry_to_reroute_workflow():
+    controller = _make_controller()
+    candidate = ActionCandidate("reroute_entry", 0.96, {}, "explicit reroute", "intent_model")
+    candidate_set = IntentCandidateSet(
+        workflow="pcb_escape_flow",
+        current_state="idle",
+        candidate_actions=(candidate,),
+        model_source="intent_model",
+    )
+    loop_input = IntentAgentLoopInput(
+        user_text="reroute",
+        workflow_id="pcb_escape_flow",
+        workflow_state="idle",
+        allowed_actions=("reroute_entry", "chat"),
+    )
+    loop_result = IntentAgentLoopResult(
+        candidate_set=candidate_set,
+        policy=SWSDDecision(action="reroute_entry", confidence=0.96, accepted_candidates=(candidate,), reason="candidate_accepted"),
+        accepted=True,
+        final_action="reroute_entry",
+        stage="confidence",
+        votes=(True, True, True, True, True, True),
+    )
+
+    plan = controller._workflow_action_plan_from_loop_result(loop_input, loop_result)
+
+    assert plan.action == "reroute_entry"
+    assert plan.phase == "execute"
+    assert plan.workflow_id == "pcb_reroute_flow"
+    assert plan.workflow_state == "idle"
+
+
+def test_execute_chain_routes_reroute_action_before_escape_workflow():
+    controller = _make_controller()
+    plan = WorkflowActionPlan(
+        workflow_id="pcb_escape_flow",
+        workflow_state="idle",
+        allowed_actions=("reroute_entry", "chat"),
+        action="reroute_entry",
+        phase="execute",
+        reason="confidence",
+        accepted=True,
+    )
+
+    assert controller._execute_chain_for_plan(plan) == "reroute"

@@ -9,6 +9,12 @@ metadata:
   hermes:
     tags: [PCB, reroute, rip-up, selected-traces, local-reroute, DRC, EDA]
     category: hardware
+    websocket_pcb:
+      enabled: true
+      intents: [reroute, mixed]
+      priority: 220
+      mode: inject_only
+      persistent_websocket_session: true
 ---
 
 # PCB Reroute Skill - Selected Trace Rip-Up And Local Reroute

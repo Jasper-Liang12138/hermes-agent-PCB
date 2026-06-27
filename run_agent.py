@@ -7187,7 +7187,11 @@ class AIAgent:
             }
         if self.tools and self._tool_call_shim_enabled():
             sanitized_messages = self._prepare_tool_call_shim_messages(sanitized_messages)
-            sanitized_messages.append(self._tool_call_shim_system_message())
+            shim_message = self._tool_call_shim_system_message()
+            if sanitized_messages and sanitized_messages[0].get("role") in {"system", "developer"}:
+                sanitized_messages.insert(1, shim_message)
+            else:
+                sanitized_messages.insert(0, shim_message)
             api_kwargs["messages"] = sanitized_messages
         elif self.tools and not self._should_omit_tool_schemas_for_endpoint():
             api_kwargs["tools"] = self.tools

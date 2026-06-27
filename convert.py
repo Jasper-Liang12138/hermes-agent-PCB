@@ -332,6 +332,33 @@ def outline_only_untranslate(point: Point) -> Point:
     return (point[0] - OUTLINE_ONLY_ORIGIN_X, point[1] - OUTLINE_ONLY_ORIGIN_Y)
 
 
+def outline_bounds_use_outline_only_translation(bounds: Tuple[int, int, int, int] | None) -> bool:
+    if not bounds:
+        return False
+    min_x, min_y, max_x, max_y = bounds
+    return (
+        min_x >= OUTLINE_ONLY_ORIGIN_X // 2
+        and min_y >= OUTLINE_ONLY_ORIGIN_Y // 2
+        and max_x > OUTLINE_ONLY_ORIGIN_X
+        and max_y > OUTLINE_ONLY_ORIGIN_Y
+    )
+
+
+def kicad_mm_point_to_txt_dbu(x_mm: float, y_mm: float, *, outline_only: bool = False) -> Point:
+    point = (mm_to_dbu(float(x_mm)), mm_to_dbu(float(y_mm)))
+    return outline_only_translate(point) if outline_only else point
+
+
+def kicad_board_uses_outline_only_translation(board: Any) -> bool:
+    outlines = getattr(board, "outlines", None) or []
+    points: List[Point] = []
+    for outline in outlines:
+        points.extend(flatten_steps(getattr(outline, "steps", []) or []))
+    if not points:
+        return False
+    return outline_bounds_use_outline_only_translation(infer_bounds_from_points(points))
+
+
 def dbu_to_mil(value: int) -> float:
     return value / 100.0
 

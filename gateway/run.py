@@ -531,14 +531,14 @@ def _should_inject_auto_skill_for_turn(
         return False
     if is_new_session:
         return True
-    skill_names = _auto_skill_names(auto_skill)
-    return (
-        source.platform == Platform.WEBSOCKET
-        and (
-            "hardware/pcb-reroute" in skill_names
-            or "hardware/pcb-intelligence" in skill_names
-        )
-    )
+    if source.platform != Platform.WEBSOCKET:
+        return False
+    try:
+        from agent.swsd.websocket_skill_admission import auto_skill_persists_for_websocket
+
+        return auto_skill_persists_for_websocket(auto_skill)
+    except Exception:
+        return False
 
 logger = logging.getLogger(__name__)
 

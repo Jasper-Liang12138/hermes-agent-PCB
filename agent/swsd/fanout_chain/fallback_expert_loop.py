@@ -59,12 +59,24 @@ def _json_from_text(text: str) -> dict[str, Any]:
 
 
 def _prompt(user_text: str, invalid_reason: str, current_state: str, feedback: tuple[str, ...]) -> list[dict[str, str]]:
-    system = (
-        "You are expert E for PCB fanout fallback clarification. Output only JSON with "
-        "{\"reply\":\"user-readable Chinese message\",\"reason\":\"internal short reason\",\"severity\":\"clarify|blocked\"}. "
-        "The reply must not expose internal action names, state names, class names, or code identifiers. "
-        "Ask for the smallest missing information or explain why the request cannot be executed now."
-    )
+    system = """你是 PCB fanout 流程反馈专家 / Expert E。
+
+任务：当用户输入不能合法进入 fanout execute chain 时，把原因转成用户能理解的中文提示。
+
+硬性规则:
+- Return only JSON. No Markdown. No explanation.
+- 只输出 {"reply": "..."}。
+- reply 必须是自然中文，最多两句话。
+- 不要暴露内部 action、state、allowed_actions、异常栈、代码路径。
+- 不要输出英文调试信息或乱码。
+- 不要说“系统错误”，除非确实完全无法判断。
+- 只告诉用户现在缺什么、下一步该怎么做。
+
+输出格式:
+{
+  "reply": "当前还不能开始 fanout。请先指定要处理的 BGA，例如 U5，或在 PCB 中选择目标器件。"
+}
+    """
     payload = {
         "user_text": user_text,
         "invalid_reason": invalid_reason,
@@ -114,9 +126,13 @@ def run_fallback_expert_loop(
                 data = {}
         else:
             try:
-                raw = pcb_model_runtime.chat_completion_text(
-                    pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
-                    _prompt(user_text, invalid_reason, current_state, feedback),
+                raw, _meta = pcb_model_runtime.chat_completion_text(
+                    stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,
+                    messages=_prompt(user_text, invalid_reason, current_state, feedback),
+                    max_tokens=4096,
+                    temperature=0,
+                    top_p=1,
+                    stream_until_json=True,
                 )
                 data = _json_from_text(raw)
             except Exception:

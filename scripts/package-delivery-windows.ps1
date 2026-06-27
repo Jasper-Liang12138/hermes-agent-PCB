@@ -134,6 +134,18 @@ foreach ($name in @("install.bat", "start.bat", "uninstall.bat", "stop-agent-api
     }
 }
 
+
+$SoulSrc = Join-Path $RepoRoot "SOUL.md"
+if (-not (Test-Path $SoulSrc)) {
+    throw "SOUL.md not found: $SoulSrc"
+}
+Write-Info "Copying PCB Agent SOUL.md..."
+Copy-Item -Force $SoulSrc $OutputDir
+$SoulOutput = Join-Path $OutputDir "SOUL.md"
+if (-not (Test-Path $SoulOutput)) {
+    throw "SOUL.md was not copied to delivery output: $SoulOutput"
+}
+
 if (Test-Path $ConfigSrc) {
     Write-Info "Copying editable config.ini..."
     Copy-Item -Force $ConfigSrc $OutputDir

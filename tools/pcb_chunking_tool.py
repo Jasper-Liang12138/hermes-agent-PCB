@@ -255,10 +255,23 @@ _CLOCK_NET_RE = re.compile(
 )
 _NC_NET_RE = re.compile(r"^(nc|n/c|no[_-]?connect|floating|none)$", re.IGNORECASE)
 
-_BOARD_ANALYSIS_SYSTEM_PROMPT = """你是一名资深 PCB 板级分析工程师，负责从超长版图上下文中提取可执行的 BGA 分析结果。
+_BOARD_ANALYSIS_SYSTEM_PROMPT = """你是一名资深 PCB 板级分析工程师，负责从超长 PCB 版图上下文中提取可执行的 BGA 分析结果。
 
-只输出 JSON，不要输出 Markdown、解释性段落或代码块。
-不要编造版图中不存在的数据；不确定时使用保守表述，并把缺失项留空数组或空字符串。
+任务：输出 BGA 候选 selection、boardSummary、fanoutContext，供后续 SWSD fanout 流程使用。
+
+硬性规则:
+- Return only JSON. No Markdown. No explanation.
+- 不要调用工具。
+- 不要选择最终 selectedBGA。
+- 不要推进 workflow state。
+- 不要生成 fanoutParams，不要执行 route。
+- 只根据输入版图内容提取事实；不确定的信息必须标注为低置信度或省略。
+- JSON key 保持英文。
+
+输出应包含:
+- selection: BGA 候选列表
+- boardSummary: 层叠、封装、网络等摘要
+- fanoutContext: 推荐层、线宽、线距、优先级建议和理由
 
 返回 JSON 对象，字段必须符合以下结构：
 {
@@ -1081,29 +1094,21 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "pcb_extract_bga",
-        "description": (
-            "从 getProjectData 返回的 PCB 版图文件路径中提取 BGA 候选 selection、"
-            "层叠/封装/网络摘要 boardSummary，以及 fanoutContext。"
-            "优先传 filePath/projectData 文件路径；兼容旧的 board_text 文本或 "
-            "__CACHED_PROJECT_DATA__。主链路使用规则脚本提取 BGA。"
-        ),
+        "description": "从已缓存或传入的 PCB 版图数据中提取 BGA 候选 selection、boardSummary 和 fanoutContext。仅在 project data 可用后使用。此工具只产出候选和分析上下文，不选择最终 selectedBGA，也不推进 workflow state。",
         "parameters": {
             "type": "object",
             "properties": {
                 "filePath": {
                     "type": "string",
-                    "description": "getProjectData 返回的 PCB 版图 txt 文件路径，支持绝对路径。",
+                    "description": "getProjectData 返回的 PCB 版图文件路径，优先使用绝对路径。",
                 },
                 "projectData": {
                     "type": "string",
-                    "description": "getProjectData 返回的 PCB 版图 txt 文件路径，兼容前端字段名。",
+                    "description": "兼容前端字段名；可以传入 getProjectData 返回的 PCB 版图文件路径。",
                 },
                 "board_text": {
                     "type": "string",
-                    "description": (
-                        "兼容旧链路：getProjectData 返回的 PCB 版图文本或文件路径。"
-                        "如果系统提示版图已缓存，可传 __CACHED_PROJECT_DATA__ 或省略该字段。"
-                    ),
+                    "description": "兼容旧链路；可以传入 PCB 版图文本、文件路径或 __CACHED_PROJECT_DATA__。",
                 }
             },
             "required": [],

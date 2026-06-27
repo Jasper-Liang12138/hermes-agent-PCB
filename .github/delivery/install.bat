@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-setlocal
+setlocal EnableDelayedExpansion
 
 set HERMES=%USERPROFILE%\.hermes
 set SCRIPT_DIR=%~dp0
@@ -24,6 +24,28 @@ if exist "%SCRIPT_DIR%memories\intention_memory.md" (
     ) else (
         echo [OK] MEMORY.md 已存在，跳过
     )
+)
+
+
+if exist "%SCRIPT_DIR%SOUL.md" (
+    if not exist "%HERMES%\SOUL.md" (
+        copy /Y "%SCRIPT_DIR%SOUL.md" "%HERMES%\SOUL.md" >nul
+        echo [OK] PCB Agent SOUL.md installed
+    ) else (
+        fc /B "%SCRIPT_DIR%SOUL.md" "%HERMES%\SOUL.md" >nul
+        if errorlevel 1 (
+            for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set SOUL_TS=%%I
+            set SOUL_BACKUP=%HERMES%\SOUL.md.bak-!SOUL_TS!
+            copy /Y "%HERMES%\SOUL.md" "!SOUL_BACKUP!" >nul
+            copy /Y "%SCRIPT_DIR%SOUL.md" "%HERMES%\SOUL.md" >nul
+            echo [OK] PCB Agent SOUL.md upgraded
+            echo [OK] Previous SOUL.md backup: "!SOUL_BACKUP!"
+        ) else (
+            echo [OK] SOUL.md unchanged
+        )
+    )
+) else (
+    echo [WARN] SOUL.md not found in delivery directory, skipped
 )
 
 if not exist "%HERMES%\.env" (

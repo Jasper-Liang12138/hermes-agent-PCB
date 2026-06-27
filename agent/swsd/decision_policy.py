@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,6 +82,116 @@ class SWSDDecision:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class ActionEvidence:
+    action: str
+    confidence: float = 0.0
+    candidate: ActionCandidate | None = None
+    evidence: tuple[str, ...] = ()
+    risk: str = ""
+    hard_reject: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class PolicyEvidenceSet:
+    top_candidates: tuple[ActionEvidence, ...] = ()
+    rejected_candidates: tuple[ActionEvidence, ...] = ()
+    reason: str = ""
+
+
+
+def _state_semantic_score(context: WorkflowContext, candidate: ActionCandidate) -> float:
+    text = str(context.tool_context.get("user_text") or "")
+    workflow_id = str(context.tool_context.get("workflow_id") or "")
+    state = context.workflow_state or FLOW_IDLE
+    action = candidate.action
+    score = 0.0
+
+    if action == "chat":
+        if re.search(r"\u4e3a\u4ec0\u4e48|\u89e3\u91ca|\u539f\u56e0|\u600e\u4e48\u7406\u89e3|what|why|how", text, flags=re.IGNORECASE):
+            score += 0.35
+        if re.search(r"fanout|\u6247\u51fa|\u9003\u9038|\u5e03\u7ebf|\u62c6\u7ebf|reroute|\u7ebf\u5bbd|\u7ebf\u8ddd|\u91cd\u65b0|\u4fee\u6539", text, flags=re.IGNORECASE):
+            score -= 0.25
+
+    if action == "reroute_entry" and re.search(r"\u62c6\u7ebf\u91cd\u5e03|reroute|ripup|rip-up|\u5220\u9664.*(?:\u8d70\u7ebf|\u7ebf|trace)", text, flags=re.IGNORECASE):
+        score += 0.45
+
+    fanout_inner_states = {"layer_assign", "escape_order", "layer_assign_escape_order", "param_review", "routing", "review", "import"}
+    if workflow_id == "pcb_escape_flow" and state in fanout_inner_states:
+        if action == "pcb_entry":
+            score -= 0.45
+        if action == "rerun_fanout" and re.search(r"\u91cd\u65b0\s*fanout|\u91cd\u65b0\u5e03\u7ebf|\u91cd\u8dd1|\u518d\u8dd1|\u91cd\u65b0\u6765", text, flags=re.IGNORECASE):
+            score += 0.5
+        if action in {"modify_params", "modify_constraints"} and re.search(r"\u7ebf\u5bbd|\u7ebf\u8ddd|\u53c2\u6570|routerType|\u6539|\u4fee\u6539|\u8c03\u6574|mil", text, flags=re.IGNORECASE):
+            score += 0.45
+        if action == "change_target" and re.search(r"\u6362|\u91cd\u65b0\u9009\u62e9|\u6539\u6210\s*U\d+|U\d+", text, flags=re.IGNORECASE):
+            score += 0.35
+
+    if workflow_id == "pcb_reroute_flow" and state in {"report", "import", "drc_loop"}:
+        if action == "reroute_again" and re.search(r"\u518d|\u91cd\u65b0|\u91cd\u6765|reroute|\u62c6\u7ebf\u91cd\u5e03", text, flags=re.IGNORECASE):
+            score += 0.4
+
+    return score
+
+
+def _evidence_for_candidate(context: WorkflowContext, candidate: ActionCandidate, *, hard_reject: bool, semantic_score: float) -> ActionEvidence:
+    evidence: list[str] = []
+    risk = ""
+    state = context.workflow_state or FLOW_IDLE
+    workflow_id = str(context.tool_context.get("workflow_id") or "")
+    if workflow_id:
+        evidence.append(f"\u5f53\u524d workflow/state \u4e3a {workflow_id}/{state}")
+    if candidate.reason:
+        evidence.append(f"\u5019\u9009\u6765\u6e90\u8bf4\u660e\uff1a{candidate.reason}")
+    evidence.append(f"\u6a21\u578b\u6216\u89c4\u5219\u7f6e\u4fe1\u5ea6\u4e3a {candidate.confidence:.2f}")
+    if semantic_score > 0:
+        evidence.append(f"\u72b6\u6001\u8bed\u4e49\u4f18\u5148\u7ea7\u52a0\u5206 {semantic_score:.2f}")
+    elif semantic_score < 0:
+        risk = f"\u72b6\u6001\u8bed\u4e49\u5b58\u5728\u51b2\u7a81\uff0c\u6263\u5206 {abs(semantic_score):.2f}"
+    if hard_reject:
+        risk = risk or "action \u4e0d\u5728 allowed_actions \u5185\u6216\u7f6e\u4fe1\u5ea6\u8fc7\u4f4e"
+    return ActionEvidence(
+        action=candidate.action,
+        confidence=max(0.0, min(1.0, candidate.confidence + semantic_score)),
+        candidate=candidate,
+        evidence=tuple(evidence),
+        risk=risk,
+        hard_reject=hard_reject,
+        reason="hard_reject" if hard_reject else "candidate_evidence",
+    )
+
+
+def build_policy_evidence(
+    *,
+    workflow_context: WorkflowContext,
+    candidates: list[ActionCandidate] | tuple[ActionCandidate, ...] | None = None,
+    experience_actions: list[ActionCandidate] | tuple[ActionCandidate, ...] | None = None,
+    top_n: int = 3,
+) -> PolicyEvidenceSet:
+    """Score candidates and produce evidence for ExpertB action voting."""
+    allowed = set(workflow_context.allowed_transitions or ())
+    merged = tuple(candidates or ()) + tuple(experience_actions or ())
+    by_action: dict[str, ActionEvidence] = {}
+    rejected: list[ActionEvidence] = []
+    for candidate in merged:
+        hard_reject = (
+            not candidate.action
+            or candidate.confidence < 0.55
+            or bool(allowed and candidate.action not in allowed)
+        )
+        semantic = _state_semantic_score(workflow_context, candidate)
+        evidence = _evidence_for_candidate(workflow_context, candidate, hard_reject=hard_reject, semantic_score=semantic)
+        if hard_reject:
+            rejected.append(evidence)
+            continue
+        existing = by_action.get(candidate.action)
+        if existing is None or evidence.confidence > existing.confidence:
+            by_action[candidate.action] = evidence
+    top = tuple(sorted(by_action.values(), key=lambda item: item.confidence, reverse=True)[:top_n])
+    reason = "top_candidate_evidence" if top else "no_viable_candidate_evidence"
+    return PolicyEvidenceSet(top_candidates=top, rejected_candidates=tuple(rejected), reason=reason)
+
 def decide_workflow_action(
     *,
     workflow_context: WorkflowContext,
@@ -105,33 +217,34 @@ def decide_workflow_action(
             return SWSDDecision(explicit_action, 1.0, reason="explicit_action_priority")
         return SWSDDecision("", 0.0, requires_confirmation=True, reason="explicit_action_not_allowed")
 
-    ranked = sorted(
-        tuple(candidates or ()) + tuple(experience_actions or ()),
-        key=lambda item: item.confidence,
-        reverse=True,
+    evidence_set = build_policy_evidence(
+        workflow_context=workflow_context,
+        candidates=candidates,
+        experience_actions=experience_actions,
+        top_n=1,
     )
     rejected: list[ActionCandidate] = []
-    for candidate in ranked:
-        if not candidate.action or candidate.confidence < 0.55:
-            rejected.append(candidate)
-            continue
-        if allowed and candidate.action not in allowed:
-            rejected.append(candidate)
+    for evidence in evidence_set.rejected_candidates:
+        if evidence.candidate is not None:
+            rejected.append(evidence.candidate)
+    for evidence in evidence_set.top_candidates:
+        candidate = evidence.candidate
+        if candidate is None:
             continue
         return SWSDDecision(
             candidate.action,
-            candidate.confidence,
+            evidence.confidence,
             accepted_candidates=(candidate,),
             rejected_candidates=tuple(rejected),
-            requires_confirmation=candidate.confidence < 0.75,
-            reason="candidate_accepted",
+            requires_confirmation=evidence.confidence < 0.75,
+            reason=evidence.reason,
         )
     return SWSDDecision(
         "",
         0.0,
         rejected_candidates=tuple(rejected),
-        requires_confirmation=bool(ranked),
-        reason="no_candidate_accepted" if ranked else "no_candidates",
+        requires_confirmation=bool(tuple(candidates or ()) + tuple(experience_actions or ())),
+        reason="no_candidate_accepted" if (candidates or experience_actions) else "no_candidates",
     )
 
 def decide_with_intent_field(

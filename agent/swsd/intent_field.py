@@ -92,16 +92,24 @@ def build_intent_field_prompt(
     allowed_transitions: list[str] | None = None,
     tool_context: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    system = (
-        "You estimate a soft semantic intent field for a PCB workflow agent. "
-        "Return only JSON. Do not classify with keywords or quote rules. "
-        "Estimate probabilities for chat, analyze, execute, meta and an uncertainty score. "
-        "chat means ordinary conversation or factual Q&A. "
-        "analyze means discussion, comparison, explanation, inspection, or planning without execution. "
-        "execute means the user is asking the system to perform a workflow/tool action. "
-        "meta means cancel/defer/permission/control instructions. "
-        "The four intent probabilities should sum to 1. uncertainty is 0..1."
-    )
+    system = """你是 PCB SWSD 字段抽取器。
+
+任务：从用户中文输入中抽取明确出现的结构化字段，用于辅助意图仲裁。
+
+硬性规则:
+- Return only JSON. No Markdown. No explanation.
+- 只抽取用户明确表达或高度确定的信息。
+- 不要仅靠关键词做 action 分类。
+- 不要编造 selectedBGA、routerType、constraints。
+- JSON key 保持英文。
+- 如果字段不存在，返回空对象或空字段，不要猜测。
+
+可抽取字段示例:
+- “给 U5 和 U7 布线” => {"targetBGAs":["U5","U7"]}
+- “线宽3mil，线距3mil” => {"constraints":{"LineWidth":3,"LineSpacing":3}}
+- “135+RL” => {"routerType":"135+RL"}
+- “拆线重布 netA” => {"rerouteHint":"拆线重布","nets":["netA"]}
+    """
     payload = {
         "user_text": str(user_text or ""),
         "flow_state": str(flow_state or "idle"),
@@ -125,7 +133,7 @@ def estimate_intent_field(
     allowed_transitions: list[str] | None = None,
     tool_context: dict[str, Any] | None = None,
     timeout_s: float = 8.0,
-    max_tokens: int = 256,
+    max_tokens: int = 4096,
 ) -> IntentFieldOutput:
     raw_output, _meta = pcb_model_runtime.chat_completion_text(
         stage=pcb_model_runtime.STAGE_TOOL_PLANNING_CHAT,

@@ -13,6 +13,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -23,7 +24,10 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ROUTER_TYPES = frozenset({"arc", "135", "rl", "rl_arc", "rl_135"})
+SUPPORTED_ROUTER_TYPES = frozenset({
+    "arc", "135", "rl", "rl_arc", "rl_135",
+    "ga", "ga_arc", "ga_135", "auto", "auto_arc", "auto_135",
+})
 _ROUTER_TYPE_ALIASES = {
     "arc": "arc",
     "arc_linux": "arc",
@@ -40,6 +44,14 @@ _ROUTER_TYPE_ALIASES = {
     "rl_135": "rl_135",
     "rl_arc": "rl_arc",
     "bk_routing": "rl",
+    "ga": "ga",
+    "ga_router": "ga",
+    "ga_135": "ga_135",
+    "ga_arc": "ga_arc",
+    "auto": "auto",
+    "auto_router": "auto",
+    "auto_135": "auto_135",
+    "auto_arc": "auto_arc",
 }
 
 
@@ -60,9 +72,26 @@ def normalize_router_type(value: Any) -> str:
 def router_execution_family(router_type: str) -> str:
     """Map public routerType to arc/135 execution family."""
     normalized = normalize_router_type(router_type)
-    if normalized in {"135", "rl", "rl_135"}:
+    if normalized in {"135", "rl", "rl_135", "ga", "ga_135", "auto", "auto_135"}:
         return "135"
     return "arc"
+
+
+def router_fallback_candidates(router_type: str) -> list[str]:
+    normalized = normalize_router_type(router_type)
+    if normalized == "auto_arc":
+        return ["ga_arc", "rl_arc", "arc"]
+    if normalized in {"auto", "auto_135"}:
+        return ["ga_135", "rl_135", "rl", "135"]
+    if normalized == "ga_arc":
+        return ["ga_arc", "rl_arc", "arc"]
+    if normalized in {"ga", "ga_135"}:
+        return ["ga_135", "rl_135", "rl", "135"]
+    if normalized == "rl_arc":
+        return ["rl_arc", "arc"]
+    if normalized in {"rl", "rl_135"}:
+        return [normalized, "135"] if normalized == "rl_135" else ["rl", "rl_135", "135"]
+    return [normalized] if normalized else []
 
 
 def _repo_root() -> Path:
@@ -132,6 +161,9 @@ def resolve_router_dir(router_type: str, work_dir: Path | None = None) -> Path:
         "rl_arc": ("ROUTER_RL_ARC_DIR", "RL_ARC_ROUTER_DIR"),
         "rl_135": ("ROUTER_RL_135_DIR", "RL_135_ROUTER_DIR"),
         "rl": ("ROUTER_RL_DIR", "ROUTER_RL_135_DIR", "RL_135_ROUTER_DIR"),
+        "ga_arc": ("ROUTER_GA_ARC_DIR", "GA_ARC_ROUTER_DIR"),
+        "ga_135": ("ROUTER_GA_135_DIR", "GA_135_ROUTER_DIR"),
+        "ga": ("ROUTER_GA_DIR", "ROUTER_GA_135_DIR", "GA_135_ROUTER_DIR"),
     }
     for key in env_map.get(normalized, ()):
         value = os.getenv(key, "").strip()
@@ -146,6 +178,9 @@ def resolve_router_dir(router_type: str, work_dir: Path | None = None) -> Path:
             "rl_arc": "rl_arc_dir",
             "rl_135": "rl_135_dir",
             "rl": "rl_135_dir",
+            "ga_arc": "ga_arc_dir",
+            "ga_135": "ga_135_dir",
+            "ga": "ga_135_dir",
         }
         config_key = key_by_type.get(normalized)
         if config_key:
@@ -156,6 +191,12 @@ def resolve_router_dir(router_type: str, work_dir: Path | None = None) -> Path:
             rl_root = _config_path(parser, "router", "rl_root_dir", base_dir=config_base_dir)
             if rl_root:
                 auto = _auto_rl_subdir(rl_root, router_execution_family(normalized))
+                if auto:
+                    return auto
+        if normalized.startswith("ga"):
+            ga_root = _config_path(parser, "router", "ga_root_dir", base_dir=config_base_dir)
+            if ga_root:
+                auto = _auto_rl_subdir(ga_root, router_execution_family(normalized))
                 if auto:
                     return auto
 
@@ -188,9 +229,62 @@ def bjut_router_available(router_type: str, work_dir: Path | None = None) -> boo
     return _find_binary(router_dir, main_stem) is not None
 
 
+def available_router_type(router_type: str, work_dir: Path | None = None) -> str:
+    for candidate in router_fallback_candidates(router_type):
+        if bjut_router_available(candidate, work_dir=work_dir):
+            return candidate
+    return ""
+
+
+def _elf_machine_code(binary_path: Path) -> int | None:
+    try:
+        data = binary_path.read_bytes()[:20]
+    except OSError:
+        return None
+    if len(data) < 20 or data[:4] != b"\x7fELF":
+        return None
+    return int.from_bytes(data[18:20], byteorder="little")
+
+
+def _elf_machine_name(code: int | None) -> str:
+    return {
+        0x03: "x86",
+        0x28: "ARM",
+        0x3E: "x86_64",
+        0xB7: "AArch64",
+    }.get(code, f"unknown({code})")
+
+
+def _elf_matches_current_machine(binary_path: Path) -> bool:
+    code = _elf_machine_code(binary_path)
+    if code is None:
+        return True
+    machine = platform.machine().lower()
+    if code == 0x3E:
+        return machine in {"x86_64", "amd64"}
+    if code == 0xB7:
+        return machine in {"aarch64", "arm64"}
+    if code == 0x03:
+        return machine in {"i386", "i686", "x86"}
+    if code == 0x28:
+        return machine.startswith("arm")
+    return False
+
+
 def _router_binary_args(binary_path: Path, *args: str) -> list[str]:
     header = binary_path.read_bytes()[:4]
     if header == b"\x7fELF":
+        if sys.platform == "win32":
+            raise RuntimeError(
+                f"{binary_path.name} 是 Linux ELF 可执行文件，当前 Windows 环境无法直接运行；"
+                "已阻止 Exec format error，请配置 Windows router 或使用 auto fallback。"
+            )
+        if not _elf_matches_current_machine(binary_path):
+            code = _elf_machine_code(binary_path)
+            raise RuntimeError(
+                f"{binary_path.name} ELF 架构为 {_elf_machine_name(code)}，"
+                f"当前机器为 {platform.machine()}，已阻止架构不匹配执行。"
+            )
         return [str(binary_path), *args]
     if header[:2] == b"MZ":
         if sys.platform == "win32":
@@ -825,6 +919,10 @@ def generate_fanout_params(
         raise ValueError(f"不支持的 routerType: {router_type}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    requested = normalized
+    resolved = available_router_type(normalized, work_dir=work_dir)
+    if resolved:
+        normalized = resolved
     router_dir = resolve_router_dir(normalized, work_dir=work_dir)
     if not bjut_router_available(normalized, work_dir=work_dir):
         raise RuntimeError(f"BJUT 布线器不可用: routerType={normalized}, dir={router_dir}")
@@ -855,6 +953,7 @@ def generate_fanout_params(
     return {
         "selectedBGA": selected_bga or parsed.get("selectedBGA") or "",
         "routerType": normalized,
+        "requestedRouterType": requested if requested != normalized else "",
         "orderLines": order_lines,
         "constraints": merged_constraints or {"LineWidth": 4, "LineSpacing": 3},
     }
@@ -881,6 +980,7 @@ def run_bjut_route(
     router_type = normalize_router_type(fanout_params.get("routerType") or "")
     if router_type not in SUPPORTED_ROUTER_TYPES:
         raise ValueError(f"不支持的 routerType: {router_type}")
+    requested_router_type = router_type
 
     selected_bga = str(fanout_params.get("selectedBGA") or "").strip()
     order_lines = fanout_params.get("orderLines") or []
@@ -890,6 +990,13 @@ def run_bjut_route(
         raise ValueError("fanoutParams.orderLines 不能为空")
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    resolved = available_router_type(router_type, work_dir=work_dir)
+    if resolved:
+        router_type = resolved
+        fanout_params = dict(fanout_params)
+        fanout_params["routerType"] = router_type
+        if requested_router_type != router_type:
+            fanout_params["requestedRouterType"] = requested_router_type
     router_dir = resolve_router_dir(router_type, work_dir=work_dir)
     if not bjut_router_available(router_type, work_dir=work_dir):
         raise RuntimeError(f"BJUT 布线器不可用: routerType={router_type}, dir={router_dir}")

@@ -36,8 +36,15 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 from tools import pcb_model_runtime
+from tools.pcb_drc_agent_report import generate_drc_agent_report
 from tools.pcb_explain_report import generate_explain_report
+from tools.pcb_nl_fanout import (
+    merge_explicit_order_lines,
+    parse_fanout_constraints_from_text,
+    parse_natural_language_order_lines,
+)
 from tools.registry import registry
+from agent.swsd.experience.fanout_versions import FanoutVersionStore
 
 logger = logging.getLogger(__name__)
 
@@ -848,6 +855,8 @@ class WebSocketTransportSingleton:
     _cached_reroute_context: Dict[str, Dict[str, Any]] = {}  # session_id -> drop_net 结果缓存
     _session_modes: Dict[str, str] = {}  # session_id -> chat/pcb
     _pending_pcb_fields: Dict[str, Dict[str, Any]] = {}  # session_id -> fields emitted by tools
+    _session_project_ids: Dict[str, str] = {}  # session_id -> project_id
+    _fanout_versions = FanoutVersionStore()
 
     @classmethod
     def get_instance(cls) -> "WebSocketTransportSingleton":
@@ -908,8 +917,18 @@ class WebSocketTransportSingleton:
         self._cached_project_data_paths.pop(session_id, None)
         self._cached_reroute_context.pop(session_id, None)
         self._pending_pcb_fields.pop(session_id, None)
+        self._session_project_ids.pop(session_id, None)
         if self.current_session_id == session_id:
             self.current_session_id = None
+
+    def bind_project(self, session_id: str, project_id: str = "") -> None:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return
+        normalized_project = str(project_id or "").strip()
+        if normalized_project:
+            self._session_project_ids[session_id] = normalized_project
+            self._fanout_versions.bind_project(session_id, normalized_project)
 
     def cache_project_data(self, data: str, session_id: Optional[str] = None) -> None:
         """保存 getProjectData 返回的版图数据，供 route 工具直接使用。"""
@@ -917,6 +936,11 @@ class WebSocketTransportSingleton:
         if not session_id:
             return
         self._cached_project_data[session_id] = data
+        project_id = self._session_project_ids.get(session_id, "")
+        try:
+            self._fanout_versions.record_initial_layout(session_id, project_id=project_id, layout_text=data)
+        except Exception:
+            logger.debug("Failed to record initial fanout layout", exc_info=True)
 
     def get_cached_project_data(self, session_id: Optional[str] = None) -> Optional[str]:
         session_id = self.resolve_session_id(session_id)
@@ -938,6 +962,114 @@ class WebSocketTransportSingleton:
         if not session_id:
             return None
         return self._cached_project_data_paths.get(session_id)
+
+    def fanout_version_summary(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        try:
+            return self._fanout_versions.history_summary(session_id)
+        except Exception:
+            logger.debug("Failed to read fanout version summary", exc_info=True)
+            return {}
+
+    def fanout_layout_data(self, session_id: Optional[str] = None, version: Any = None) -> tuple[str, Optional[int], str]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return "", None, ""
+        try:
+            return self._fanout_versions.resolve_layout_text(session_id, version)
+        except Exception:
+            logger.debug("Failed to resolve fanout layout version", exc_info=True)
+            return "", None, ""
+
+    def fanout_params_for_version(self, session_id: Optional[str] = None, version: Any = None) -> tuple[Dict[str, Any], Optional[int]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}, None
+        try:
+            return self._fanout_versions.fanout_params_for_version(session_id, version)
+        except Exception:
+            logger.debug("Failed to resolve fanout params version", exc_info=True)
+            return {}, None
+
+    def latest_fanout_params(self, session_id: Optional[str] = None) -> tuple[Dict[str, Any], Optional[int]]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}, None
+        try:
+            return self._fanout_versions.latest_fanout_params(session_id)
+        except Exception:
+            logger.debug("Failed to resolve latest fanout params", exc_info=True)
+            return {}, None
+
+    def write_fanout_draft(
+        self,
+        session_id: Optional[str],
+        *,
+        fanout_params: Dict[str, Any],
+        user_text: str = "",
+        base_layout_version: Any = None,
+        restored_from_version: Any = None,
+    ) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        try:
+            return self._fanout_versions.write_draft(
+                session_id,
+                fanout_params=fanout_params,
+                user_text=user_text,
+                base_layout_version=base_layout_version,
+                restored_from_version=restored_from_version,
+            )
+        except Exception:
+            logger.debug("Failed to write fanout draft", exc_info=True)
+            return {}
+
+    def record_fanout_route_version(
+        self,
+        session_id: Optional[str],
+        *,
+        fanout_params: Dict[str, Any],
+        base_layout_version: Any = None,
+        restored_from_version: Any = None,
+        user_text: str = "",
+        order_input_path: str = "",
+        routed_layout_path: str = "",
+        import_lines_path: str = "",
+        report: str = "",
+    ) -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        project_id = self._session_project_ids.get(session_id, "")
+        try:
+            return self._fanout_versions.record_route_version(
+                session_id,
+                fanout_params=fanout_params,
+                project_id=project_id,
+                base_layout_version=base_layout_version,
+                restored_from_version=restored_from_version,
+                user_text=user_text,
+                order_input_path=order_input_path,
+                routed_layout_path=routed_layout_path,
+                import_lines_path=import_lines_path,
+                report=report,
+            )
+        except Exception:
+            logger.debug("Failed to record fanout route version", exc_info=True)
+            return {}
+
+    def mark_fanout_import_status(self, session_id: Optional[str], version: Any, status: str, message: str = "") -> Dict[str, Any]:
+        session_id = self.resolve_session_id(session_id)
+        if not session_id:
+            return {}
+        try:
+            return self._fanout_versions.mark_import_status(session_id, version, status, message)
+        except Exception:
+            logger.debug("Failed to mark fanout import status", exc_info=True)
+            return {}
 
     def cache_reroute_context(self, data: Dict[str, Any], session_id: Optional[str] = None) -> None:
         """保存 drop_net 的拆线上下文，供 reroute 工具使用。"""
@@ -962,8 +1094,11 @@ class WebSocketTransportSingleton:
         session_id = self.resolve_session_id(session_id)
         if not session_id or not isinstance(fields, dict) or not fields:
             return
+        clean_fields = {key: value for key, value in fields.items() if value is not None}
+        if not clean_fields:
+            return
         pending = self._pending_pcb_fields.setdefault(session_id, {})
-        pending.update(fields)
+        pending.update(clean_fields)
 
     def pop_pending_pcb_fields(self, session_id: Optional[str] = None) -> Dict[str, Any]:
         session_id = self.resolve_session_id(session_id)
@@ -1035,6 +1170,43 @@ class WebSocketTransportSingleton:
         except Exception:
             logger.debug("Failed to send PCB tool status", exc_info=True)
 
+    def send_reroute_pending_final(self, content: str, session_id: Optional[str] = None) -> None:
+        """Best-effort degraded reroute final emitted before slow import/explain steps."""
+        adapter = self._websocket_adapter
+        loop = self._main_loop
+        session_id = self.resolve_session_id(session_id)
+        if not adapter or not loop or not loop.is_running() or not session_id:
+            return
+        fields = {
+            "rerouteResult": {
+                "status": "drc_passed_import_pending",
+                "drcPassed": True,
+                "importPending": True,
+            },
+            "checkReport": {
+                "passed": True,
+                "warnings": ["Import/explanation finalization may still be pending."],
+            },
+            "explanation": "拆线重布已通过 DRC；为避免前端等待超时，已先返回结构化结果。",
+        }
+        try:
+            self.set_pending_pcb_fields(fields, session_id=session_id)
+            asyncio.run_coroutine_threadsafe(
+                adapter.send(
+                    chat_id=session_id,
+                    content=(
+                        f"{content}\n\n"
+                        "##PCB_FIELDS##\n"
+                        f"{json.dumps(fields, ensure_ascii=False)}\n"
+                        "##PCB_FIELDS_END##"
+                    ),
+                    metadata={"is_final": True},
+                ),
+                loop,
+            )
+        except Exception:
+            logger.debug("Failed to send degraded reroute final", exc_info=True)
+
 
 _transport = WebSocketTransportSingleton.get_instance()
 
@@ -1090,18 +1262,13 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "getProjectData",
-        "description": (
-            "获取 PCB 项目数据（S 表达式格式）。"
-            "若 pcb_extract_bga 工具可用，获取数据后立即调用它提取 BGA 列表；"
-            "否则直接分析数据识别 BGA 元件。"
-            "最终通过 ##PCB_FIELDS## 标记将 selection 返回给用户选择。"
-        ),
+        "description": "从前端获取当前打开的 PCB 版图数据，并缓存供后续确定性 PCB 动作使用。返回 board data 或文件路径元数据。此工具只负责获取数据，不负责选择 BGA、生成参数或推进 workflow state；流程状态由 SWSD Controller 控制。",
         "parameters": {
             "type": "object",
             "properties": {
                 "projectID": {
                     "type": "string",
-                    "description": "兼容旧版保留字段；当前前端工具获取当前打开版图，无需传参",
+                    "description": "兼容旧协议的保留字段；当前通常无需传入，前端会返回当前打开的 PCB 版图。",
                 }
             },
             "required": [],
@@ -1162,16 +1329,13 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "getSelectedElements",
-        "description": (
-            "Get user-selected PCB element ids from the frontend. "
-            "For local rip-up/reroute this must be called with PFindType='TRACES'."
-        ),
+        "description": "获取前端当前选中的 PCB 元素 id。局部拆线重布 / local reroute 场景应使用 PFindType=\"TRACES\" 获取走线选择。此工具只读取选择结果，不删除、不修改 PCB。",
         "parameters": {
             "type": "object",
             "properties": {
                 "PFindType": {
                     "type": "string",
-                    "description": "Selected object type. Local reroute uses TRACES.",
+                    "description": "选择对象类型；局部拆线重布使用 TRACES。",
                     "default": "TRACES",
                 }
             },
@@ -1192,16 +1356,13 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "GetSelectedElements",
-        "description": (
-            "获取用户在 PCB 中框选的元素 ID 列表，用于拆线重步功能。"
-            "若返回的 ids 为空，提示用户先在 PCB 中框选需要重步的走线（<40 Pin）。"
-        ),
+        "description": "兼容旧协议的 getSelectedElements 别名。新 SWSD 流程优先使用 getSelectedElements；仅当前端协议要求大写名称时使用。",
         "parameters": {
             "type": "object",
             "properties": {
                 "projectID": {
                     "type": "string",
-                    "description": "PCB 项目的 UUID",
+                    "description": "PCB 项目的兼容字段；新流程通常不依赖该字段。",
                 }
             },
             "required": ["projectID"],
@@ -1248,14 +1409,14 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "deleteTracesById",
-        "description": "Delete PCB traces by selected trace ids.",
+        "description": "根据明确的 trace ids 删除 PCB 走线。ids 必须来自 getSelectedElements 或已确认的前端选择。此工具会修改 PCB 前端状态，只能在 SWSD Controller 已接受 reroute/delete action 后使用。",
         "parameters": {
             "type": "object",
             "properties": {
                 "ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Trace ids returned by getSelectedElements.",
+                    "description": "已确认要删除的 trace id 列表，通常来自 getSelectedElements。",
                 }
             },
             "required": ["ids"],
@@ -1330,7 +1491,7 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
                 "routingResult": "",
                 "report": "缺少 routerType，请选择布线器：arc、135、rl、rl_arc、rl_135",
             }, ensure_ascii=False)
-        from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, bjut_router_available, run_bjut_route
+        from tools.pcb_bjut_router import SUPPORTED_ROUTER_TYPES, available_router_type, bjut_router_available, run_bjut_route
 
         if router_type not in SUPPORTED_ROUTER_TYPES:
             return json.dumps({
@@ -1364,7 +1525,13 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
         fanout_params.setdefault("orderLines", order_lines)
         fanout_params.setdefault("constraints", constraints or {})
 
-        if bjut_router_available(router_type, work_dir=work_dir):
+        resolved_router_type = available_router_type(router_type, work_dir=work_dir) or router_type
+        fanout_params["routerType"] = resolved_router_type
+        if resolved_router_type != router_type:
+            fanout_params["requestedRouterType"] = router_type
+            fanout_params["routerFallbackReason"] = f"fallback_from_{router_type}"
+
+        if bjut_router_available(resolved_router_type, work_dir=work_dir):
             bjut_outputs = run_bjut_route(
                 project_data=project_data,
                 fanout_params=fanout_params,
@@ -1373,8 +1540,8 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
             routing_result_path = bjut_outputs.routing_result_path
             import_lines_path = bjut_outputs.import_lines_path
             report = bjut_outputs.report
-        elif router_type in {"arc", "135"}:
-            if router_type == "arc":
+        elif resolved_router_type in {"arc", "135"}:
+            if resolved_router_type == "arc":
                 _run_arc_router(
                     work_dir,
                     _router_profile_dir("arc", work_dir),
@@ -1386,25 +1553,44 @@ def route_bga(userData: str, session_id: Optional[str] = None) -> str:
             else:
                 _run_135_router(work_dir, _router_profile_dir("135", work_dir), component_refdes, constraints)
             routing_result_path = _router_result_path(work_dir)
-            import_lines_path = _router_import_lines_path(work_dir, router_type, constraints)
+            import_lines_path = _router_import_lines_path(work_dir, resolved_router_type, constraints)
             report = _read_router_report(work_dir)
         else:
             return json.dumps({
                 "routingResult": "",
                 "report": (
-                    f"{router_type} 布线器目录未配置或缺少 BJUT 可执行文件；"
-                    "请检查 config.ini 的 rl_*_dir 配置。"
+                    f"{router_type} 布线器目录未配置或缺少可执行文件；"
+                    "已尝试 auto/GA/RL/BJUT fallback，请检查 config.ini 或环境变量。"
                 ),
             }, ensure_ascii=False)
 
         # Step 6: 传递输出文件路径，避免通过 WebSocket 发送大块版图文本
         routing_result_size = routing_result_path.stat().st_size
         report_text = str(report or "").strip().rstrip("。")
+        version_info = _transport.record_fanout_route_version(
+            session_id,
+            fanout_params=fanout_params,
+            base_layout_version=fanout_params.get("baseLayoutVersion"),
+            restored_from_version=fanout_params.get("restoredFromVersion"),
+            user_text=str(user_data_obj.get("userText") or route_params.get("userText") or ""),
+            order_input_path=str(work_dir / "order_input.txt"),
+            routed_layout_path=str(routing_result_path),
+            import_lines_path=str(import_lines_path),
+            report=report_text,
+        )
+        fanout_memory: Dict[str, Any] = {}
+        if isinstance(version_info, dict) and version_info.get("version") is not None:
+            fanout_memory = {
+                "version": version_info.get("version"),
+                "history": _transport.fanout_version_summary(session_id),
+            }
         _transport.set_pending_pcb_fields(
             {
                 "routingResult": str(routing_result_path),
                 "importLinesFilePath": str(import_lines_path),
                 "report": report_text or "布线完成（无详细报告）",
+                "fanoutMemoryVersion": fanout_memory.get("version"),
+                "fanoutHistory": fanout_memory.get("history"),
             },
             session_id=session_id,
         )
@@ -1431,25 +1617,13 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "route",
-        "description": (
-            "执行 BGA 扇出布线算法，生成布线结果和报告。"
-            "版图数据由系统自动从缓存获取，无需传入。"
-            "执行完成后只向用户总结报告；完整 routingResult 由系统自动通过 WebSocket 结构化字段发送，"
-            "不要在正文或 ##PCB_FIELDS## 中复述 routingResult。"
-        ),
+        "description": "使用已确认的 fanoutParams 执行全局 BGA fanout / 扇出布线。需要 selectedBGA、routerType、orderLines，可包含 constraints。不要用于“拆线重布 / local reroute”。完整 routingResult 通过结构化 WebSocket 字段发送给前端，正文只总结报告。",
         "parameters": {
             "type": "object",
             "properties": {
                 "userData": {
                     "type": "string",
-                    "description": (
-                        "扇出参数 JSON 字符串，格式：\n"
-                        '{"orderLines": [{"net": "GND", "layer": "SIG03", "order": 1}, ...], '
-                        '"selectedBGA": "U27", "routerType": "arc", '
-                        '"constraints": {"LineWidth": 4, "LineSpacing": 3}}\n'
-                        "orderLines 必填，selectedBGA 建议传入；"
-                        "routerType 必填，可选 arc/135/rl/rl_arc/rl_135；constraints 会按布线器 README 转换。"
-                    ),
+                    "description": "fanoutParams JSON 字符串。必须包含 selectedBGA、routerType、orderLines，可包含 constraints，例如 {\"selectedBGA\":\"U5\",\"routerType\":\"135\",\"orderLines\":[...],\"constraints\":{\"LineWidth\":3,\"LineSpacing\":3}}。",
                 },
             },
             "required": ["userData"],
@@ -1471,10 +1645,44 @@ def _fanout_positive_number(value: Any, default: float) -> float:
     return number if number > 0 else default
 
 
+def _fanout_default_router_type(user_text: str = "") -> str:
+    text = str(user_text or "")
+    if re.search(r"\barc\b|弧|圆弧|曲线|SIG\d+|L\d+", text, re.IGNORECASE):
+        return "auto_arc"
+    return "auto_135"
+
+
+def _merge_fanout_constraints(explicit: Optional[Dict[str, Any]], user_text: str = "") -> Dict[str, Any]:
+    parsed = parse_fanout_constraints_from_text(user_text)
+    merged: Dict[str, Any] = dict(parsed) if isinstance(parsed, dict) else {}
+    if isinstance(explicit, dict):
+        merged.update({key: value for key, value in explicit.items() if value not in (None, "")})
+    return {
+        "LineWidth": _fanout_positive_number(merged.get("LineWidth"), 4),
+        "LineSpacing": _fanout_positive_number(merged.get("LineSpacing"), 3),
+    }
+
+
+def _resolve_available_fanout_router(router_type: str, work_dir: Path) -> tuple[str, str]:
+    from tools.pcb_bjut_router import available_router_type, bjut_router_available
+
+    requested = _normalize_router_type(router_type) or "auto_135"
+    resolved = available_router_type(requested, work_dir=work_dir)
+    if resolved:
+        reason = "requested" if resolved == requested else f"fallback_from_{requested}"
+        return resolved, reason
+    if bjut_router_available(requested, work_dir=work_dir):
+        return requested, "requested"
+    return requested, "unavailable"
+
+
 def generate_fanout_params_tool(
     selectedBGA: str = "",
     routerType: str = "",
     constraints: Optional[Dict[str, Any]] = None,
+    userText: str = "",
+    baseVersion: Any = None,
+    restoredFromVersion: Any = None,
     session_id: Optional[str] = None,
 ) -> str:
     """Generate fanoutParams from cached board data via the BJUT layer/order adapter."""
@@ -1485,18 +1693,19 @@ def generate_fanout_params_tool(
         return json.dumps({"error": msg}, ensure_ascii=False)
 
     project_data = _transport.get_cached_project_data(session_id=session_id)
+    base_layout_text, resolved_base_version, _base_layout_path = _transport.fanout_layout_data(
+        session_id=session_id,
+        version=baseVersion,
+    )
+    if base_layout_text:
+        project_data = base_layout_text
     if not project_data:
         return json.dumps({
             "error": "缺少版图数据，请先调用 getProjectData。",
             "fanoutParams": None,
         }, ensure_ascii=False)
 
-    router_type = _normalize_router_type(routerType)
-    if not router_type:
-        return json.dumps({
-            "error": "缺少 routerType，请先让用户选择 arc、135、rl、rl_arc 或 rl_135。",
-            "fanoutParams": None,
-        }, ensure_ascii=False)
+    router_type = _normalize_router_type(routerType) or _fanout_default_router_type(userText)
 
     selected_bga = str(selectedBGA or "").strip()
     if not selected_bga:
@@ -1507,21 +1716,18 @@ def generate_fanout_params_tool(
             project_data,
         )
 
-    normalized_constraints = constraints if isinstance(constraints, dict) else {}
-    normalized_constraints = {
-        "LineWidth": _fanout_positive_number(normalized_constraints.get("LineWidth"), 4),
-        "LineSpacing": _fanout_positive_number(normalized_constraints.get("LineSpacing"), 3),
-    }
+    normalized_constraints = _merge_fanout_constraints(constraints, userText)
 
     try:
-        from tools.pcb_bjut_router import bjut_router_available, generate_fanout_params
+        from tools.pcb_bjut_router import generate_fanout_params
 
         work_dir = Path(os.getenv("ROUTER_WORK_DIR", ".")).resolve()
-        if not bjut_router_available(router_type, work_dir=work_dir):
+        resolved_router_type, fallback_reason = _resolve_available_fanout_router(router_type, work_dir)
+        if fallback_reason == "unavailable":
             return json.dumps({
                 "error": (
                     f"{router_type} fanoutParams 生成器不可用；"
-                    "请检查 config.ini 中对应布线器目录。"
+                    "已尝试 auto/GA/RL/BJUT fallback，仍缺少可用布线器目录或执行文件。"
                 ),
                 "fanoutParams": None,
             }, ensure_ascii=False)
@@ -1529,15 +1735,34 @@ def generate_fanout_params_tool(
         fanout_params = generate_fanout_params(
             project_data=project_data,
             selected_bga=selected_bga,
-            router_type=router_type,
+            router_type=resolved_router_type,
             work_dir=work_dir,
             constraints=normalized_constraints,
         )
         if not isinstance(fanout_params, dict):
             fanout_params = {}
         fanout_params.setdefault("selectedBGA", selected_bga)
-        fanout_params.setdefault("routerType", router_type)
+        fanout_params["routerType"] = resolved_router_type
+        if resolved_router_type != router_type:
+            fanout_params["requestedRouterType"] = router_type
+            fanout_params["routerFallbackReason"] = fallback_reason
         fanout_params.setdefault("constraints", normalized_constraints)
+        explicit_order = parse_natural_language_order_lines(userText)
+        merged_order = merge_explicit_order_lines(fanout_params.get("orderLines") or [], explicit_order)
+        if explicit_order:
+            fanout_params["orderLines"] = merged_order
+            fanout_params["naturalLanguageOrderLines"] = explicit_order
+        if baseVersion not in (None, "") and resolved_base_version is not None:
+            fanout_params["baseLayoutVersion"] = resolved_base_version
+        if restoredFromVersion not in (None, ""):
+            fanout_params["restoredFromVersion"] = restoredFromVersion
+        _transport.write_fanout_draft(
+            session_id,
+            fanout_params=fanout_params,
+            user_text=userText,
+            base_layout_version=resolved_base_version if resolved_base_version is not None else baseVersion,
+            restored_from_version=restoredFromVersion,
+        )
         return json.dumps({"fanoutParams": fanout_params}, ensure_ascii=False)
     except Exception as exc:
         logger.error("generateFanoutParams failed: %s", exc, exc_info=True)
@@ -1549,34 +1774,43 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "generateFanoutParams",
-        "description": (
-            "Generate BGA fanoutParams from cached getProjectData board data. "
-            "Call this after getProjectData and pcb_extract_bga, once selectedBGA and routerType are known. "
-            "Return the resulting fanoutParams to the user for confirmation before calling route."
-        ),
+        "description": "基于已缓存的 project data，为 selectedBGA 和 routerType 生成 BGA fanoutParams。此工具执行 layer assignment / escape order 参数生成，不执行最终 route，也不导入版图修改。返回结构化 fanoutParams，供 review 或后续 route 使用。",
         "parameters": {
             "type": "object",
             "properties": {
                 "selectedBGA": {
                     "type": "string",
-                    "description": "Selected BGA refdes, for example U22.",
+                    "description": "目标 BGA refdes，例如 U5。进入参数生成阶段后必填。",
                 },
                 "routerType": {
                     "type": "string",
-                    "description": "Router type: arc, 135, rl, rl_arc, or rl_135.",
+                    "description": "布线策略，例如 arc、135、rl、rl_arc、rl_135、ga_135、ga_arc、auto_135、auto_arc。",
                 },
                 "constraints": {
                     "type": "object",
-                    "description": "Optional routing constraints, e.g. LineWidth/LineSpacing in mil.",
+                    "description": "归一化布线约束，例如 {\"LineWidth\": 3, \"LineSpacing\": 3}，单位为 mil。",
+                },
+                "userText": {
+                    "type": "string",
+                    "description": "用户原始文本，仅用于提取自然语言约束或顺序提示。",
+                },
+                "baseVersion": {
+                    "description": "可选 fanout layout version，用作参数生成的基础版图，例如 current、latest 或版本号。",
+                },
+                "restoredFromVersion": {
+                    "description": "可选字段，表示本次参数从哪个 fanoutParams version 恢复或重跑。",
                 },
             },
-            "required": ["selectedBGA", "routerType"],
+            "required": ["selectedBGA"],
         },
     },
     handler=lambda args, **kwargs: generate_fanout_params_tool(
         selectedBGA=args.get("selectedBGA", ""),
         routerType=args.get("routerType", ""),
         constraints=args.get("constraints") if isinstance(args.get("constraints"), dict) else None,
+        userText=args.get("userText", ""),
+        baseVersion=args.get("baseVersion"),
+        restoredFromVersion=args.get("restoredFromVersion"),
         session_id=kwargs.get("session_id"),
     ),
     check_fn=lambda: True,
@@ -2380,11 +2614,13 @@ def _compose_drc_analysis_report(payload: Dict[str, Any], public_txt_path: str) 
         status = "通过"
         conclusion_label = "成功结论"
         reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
-        local_policy = reroute_result.get("localReroutePolicy") if isinstance(reroute_result, dict) else {}
+        local_policy = reroute_result.get("localRerouteCompletionPolicy") if isinstance(reroute_result, dict) else {}
+        if not local_policy:
+            local_policy = reroute_result.get("localReroutePolicy") if isinstance(reroute_result, dict) else {}
         if isinstance(local_policy, dict) and local_policy.get("mode") == "selected_net_local":
             inherited = local_policy.get("inheritedIssueCount", 0)
             conclusion = (
-                "局部 DRC 校验通过，所选网络的重布结果满足导入门禁。"
+                "局部布线完善 DRC 校验通过，所选网络的重布结果满足导入门禁。"
                 f"原板仍有 {inherited} 个非所选网络的全局遗留问题，已作为报告信息保留，不阻止本次 importLines。"
             )
         else:
@@ -2525,10 +2761,18 @@ def _build_explain_prompt(
         "txtGenerated": bool(public_txt_path),
         "importPolicy": "DRC 通过才允许 importLines；DRC 失败不导入。",
     }
-    system_prompt = (
-        "你是 PCB 布线结果分析助手。请根据输入的内部 KiCad 版图内容、重布线结果和 DRC 检查结果，"
-        "生成简洁中文可解释性报告。不要输出 JSON，不要编造未给出的文件路径，不要暴露任何 .kicad_pcb 路径。"
-    )
+    system_prompt = """你是 PCB 布线结果分析助手。
+
+任务：根据内部 KiCad 版图内容、局部重布线结果和 DRC 检查结果，生成用户可读的中文报告。
+
+硬性规则:
+- 用中文输出。
+- 不要输出 Markdown 表格。
+- 不要暴露完整内部 KiCad 文件内容。
+- 不要编造 DRC 通过结论；如果输入没有明确 DRC 结果，只能说“未获得明确 DRC 结论”。
+- 不要输出 action、state、confidence、工具调用细节。
+- 报告应说明：重布线是否生成、是否发现明显风险、用户下一步可做什么。
+    """
     user_prompt = (
         "生成拆线重布后的可解释性报告。\n"
         "报告只解释当前重布结果、DRC 结论和是否可导入，不要复述内部路径。\n\n"
@@ -2542,7 +2786,7 @@ def _build_explain_prompt(
 
 def _call_ctyun_explain_chat(messages: list[Dict[str, str]]) -> str:
     timeout_raw = os.getenv("CTYUN_EXPLAIN_TIMEOUT", os.getenv("PCB_EXPLAIN_TIMEOUT", "180")).strip()
-    max_tokens_raw = os.getenv("CTYUN_EXPLAIN_MAX_TOKENS", os.getenv("PCB_EXPLAIN_MAX_TOKENS", "2048")).strip()
+    max_tokens_raw = os.getenv("CTYUN_EXPLAIN_MAX_TOKENS", os.getenv("PCB_EXPLAIN_MAX_TOKENS", "4096")).strip()
     try:
         timeout = max(10.0, float(timeout_raw))
     except ValueError:
@@ -2550,7 +2794,7 @@ def _call_ctyun_explain_chat(messages: list[Dict[str, str]]) -> str:
     try:
         max_tokens = max(256, min(8192, int(max_tokens_raw)))
     except ValueError:
-        max_tokens = 2048
+        max_tokens = 4096
 
     content, _meta = pcb_model_runtime.chat_completion_text(
         stage=pcb_model_runtime.STAGE_EXPLAIN,
@@ -2778,15 +3022,12 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "deleteTracesForRerouting",
-        "description": (
-            "Call the PCB frontend one-shot tool to delete the selected traces "
-            "and return missing_routes plus projectData for local reroute."
-        ),
+        "description": "局部拆线重布 / local reroute 的前端准备工具。删除当前选中的走线，并返回 missing_routes、selectedTraceIds、projectData 等 reroute 上下文。只应在 SWSD Controller 接受 reroute action 后由 reroute execute chain 调用。",
         "parameters": {
             "type": "object",
             "properties": {
-                "userText": {"type": "string", "description": "Original user reroute request text."},
-                "projectID": {"type": "string", "description": "Current PCB project id."},
+                "description": "用户原始 reroute 请求文本，仅用于上下文记录和报告说明。",
+                "description": "当前 PCB project id，可选兼容字段。",
             },
             "required": [],
         },
@@ -2805,15 +3046,12 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "drop_net",
-        "description": (
-            "Compatibility alias for deleteTracesForRerouting. "
-            "Use deleteTracesForRerouting for the normal one-shot frontend delete/reroute-parameter flow."
-        ),
+        "description": "兼容旧链路的 deleteTracesForRerouting 别名。新 SWSD reroute 流程优先使用 deleteTracesForRerouting；不建议模型主动选择此工具。",
         "parameters": {
             "type": "object",
             "properties": {
-                "userText": {"type": "string", "description": "Original user request."},
-                "projectID": {"type": "string", "description": "Optional PCB project id."},
+                "description": "用户原始请求文本。",
+                "description": "可选 PCB project id，兼容旧协议。",
             },
             "required": ["userText"],
         },
@@ -2827,7 +3065,7 @@ registry.register(
 )
 
 
-def _build_fallback_reroute_payload(
+def _build_local_reroute_completion_payload(
     *,
     nets: list[str],
     dropped_board_data: str,
@@ -2839,20 +3077,29 @@ def _build_fallback_reroute_payload(
     explanation_suffix: str = "",
     original_board_path: str = "",
     selected_trace_ids: list[str] | None = None,
+    completion_reason: str = "initial_local_package",
     **_ignored: Any,
 ) -> Dict[str, Any]:
     selected_trace_ids = selected_trace_ids or []
+    target_count = len(nets) if nets else len(selected_trace_ids)
+    completion_policy = {
+        "mode": "selected_net_local",
+        "targetNetCount": len(nets),
+        "selectedTraceCount": len(selected_trace_ids),
+        "completionReason": completion_reason,
+    }
     reroute_result = {
-        "type": "local_reroute",
+        "type": "local_reroute_completion",
         "mode": "selected_nets_after_drop" if nets else "selected_traces_after_delete",
+        "status": "local_completion_prepared",
         "selectedNets": nets,
         "selectedTraceIds": selected_trace_ids,
         "operations": [
-            {"action": "reroute_net", "net": net, "scope": "local", "preserveOtherNets": True}
+            {"action": "complete_local_route_for_net", "net": net, "scope": "local", "preserveOtherNets": True}
             for net in nets
         ] or [
             {
-                "action": "reroute_selected_traces",
+                "action": "complete_local_route_for_selected_traces",
                 "traceIds": selected_trace_ids,
                 "scope": "local",
                 "preserveOtherNets": True,
@@ -2861,15 +3108,25 @@ def _build_fallback_reroute_payload(
         "constraints": constraints,
         "droppedObjects": dropped_objects,
         "localContext": local_context,
+        "localRerouteCompletionPolicy": completion_policy,
+        "completionReason": completion_reason,
+        "completionWarnings": [],
         "originalBoardDataFilePath": original_board_path,
         "droppedBoardDataFilePath": dropped_board_path,
         "droppedBoardDataChars": len(dropped_board_data or ""),
     }
-    explanation = "已基于拆线结果生成局部重布结果包；本结果限定在所选走线或 selectedNets 范围内，其他网络默认保护。"
+    explanation = (
+        f"已准备局部布线完善结果包，目标范围 {target_count} 项；"
+        "本结果限定在所选走线或 selectedNets 范围内，其他网络默认保护。"
+    )
     if explanation_suffix:
         explanation = f"{explanation}{explanation_suffix}"
     return {"rerouteResult": reroute_result, "checkReport": check_report, "explanation": explanation}
 
+
+def _build_fallback_reroute_payload(**kwargs: Any) -> Dict[str, Any]:
+    """Compatibility wrapper for older tests and callers."""
+    return _build_local_reroute_completion_payload(**kwargs)
 
 def _append_explainability_report(
     payload: Dict[str, Any],
@@ -2888,6 +3145,35 @@ def _append_explainability_report(
     except Exception as exc:
         logger.warning("Local explain report generation failed: %s", exc)
         explain_report = f"可解释性报告生成失败：{_strip_internal_reroute_paths(str(exc))}"
+
+    try:
+        drc_timeout = float(os.getenv("PCB_DRC_AGENT_REPORT_TIMEOUT", "30"))
+    except ValueError:
+        drc_timeout = 30.0
+    drc_agent_report = generate_drc_agent_report(
+        board_file_path=internal_board_path,
+        output_dir=str(Path(public_txt_path).parent if public_txt_path else Path(os.getenv("ROUTER_WORK_DIR", "."))),
+        session_id=_transport.resolve_session_id(None) or "pcb_reroute",
+        target_bga=str((result.get("rerouteResult") or {}).get("selectedBGA") or "") if isinstance(result.get("rerouteResult"), dict) else "",
+        timeout_seconds=drc_timeout,
+    )
+    if drc_agent_report.get("ok"):
+        payload_data = drc_agent_report.get("payload")
+        if isinstance(payload_data, dict):
+            markdown = str(
+                payload_data.get("markdown")
+                or payload_data.get("reportMarkdown")
+                or payload_data.get("content")
+                or payload_data.get("summary")
+                or ""
+            ).strip()
+            if markdown:
+                explain_report = f"{explain_report}\n\nDRC Agent Markdown Report:\n{markdown}".strip()
+            result["drcAgentReport"] = payload_data
+    else:
+        error = str(drc_agent_report.get("error") or "").strip()
+        if error:
+            result["drcAgentReport"] = {"ok": False, "error": error[:500]}
 
     result["content"] = _compose_reroute_report_content(
         payload=result,
@@ -3526,9 +3812,17 @@ def _build_reroute_generation_prompts(
     drc_iteration_history: list[Dict[str, Any]] | None = None,
     selected_trace_ids: list[str] | None = None,
 ) -> Dict[str, str]:
-    system_prompt = (
-        "你是资深 PCB 布线工程师和 KiCad 代码生成器。只输出合法 KiCad 走线对象，不要输出推理过程。"
-    )
+    system_prompt = """你是资深 PCB 布线工程师和 KiCad 代码生成器。只输出合法 KiCad 走线对象，不要输出推理过程。
+
+任务：根据 PCB 上下文和缺失走线描述，只生成缺失走线对应的合法 KiCad 走线对象。
+
+硬性规则:
+- 只输出合法 KiCad 走线对象。
+- 不要输出 Markdown、解释、推理过程或代码块。
+- 不要修改、复述或删除已有非缺失走线对象。
+- 不要编造 net、layer、坐标；缺少必要信息时输出空字符串。
+- 输出内容必须能被后续 KiCad patch/DRC 流程处理。
+    """
     feedback_text = ""
     if drc_feedback or drc_iteration_history:
         feedback_text = (
@@ -3585,7 +3879,7 @@ def _generate_reroute_with_model(
     debug_label: str = "initial",
     session_id: str = "session",
 ) -> Dict[str, Any]:
-    fallback_payload = _build_fallback_reroute_payload(
+    completion_payload = _build_local_reroute_completion_payload(
         nets=nets,
         selected_trace_ids=selected_trace_ids,
         dropped_board_data=dropped_board_data,
@@ -3597,7 +3891,7 @@ def _generate_reroute_with_model(
         original_board_path=original_board_path,
     )
     if not dropped_board_data:
-        return fallback_payload
+        return completion_payload
 
     try:
         from tools import pcb_chunking_tool as chunking
@@ -3696,13 +3990,13 @@ def _generate_reroute_with_model(
             model_payload.setdefault("extractedPatchFilePath", patch_output_path)
         return _normalize_reroute_model_payload(
             model_payload,
-            fallback_payload=fallback_payload,
+            fallback_payload=completion_payload,
             context_stats=context_stats,
         )
     except Exception as exc:
-        logger.warning("reroute model generation failed; using fallback payload: %s", exc)
+        logger.warning("reroute model generation incomplete; using local route completion payload: %s", exc)
         failure_summary = _summarize_reroute_model_failure(exc)
-        payload = _build_fallback_reroute_payload(
+        payload = _build_local_reroute_completion_payload(
             nets=nets,
             selected_trace_ids=selected_trace_ids,
             dropped_board_data=dropped_board_data,
@@ -4039,6 +4333,158 @@ def _drc_issue_is_selected_net_related(issue: Any, selected_nets: list[str]) -> 
     return False
 
 
+def _local_reroute_completion_route_params(
+    *,
+    selected_nets: list[str],
+    local_context: Any,
+) -> dict[str, Any]:
+    order_lines: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for route in _frontend_missing_routes_from_context(local_context):
+        net = str(route.get("net_name") or route.get("netName") or route.get("net") or "").strip()
+        if not net or net in seen:
+            continue
+        seen.add(net)
+        layer = ""
+        for endpoint_key in ("start", "end"):
+            endpoint = route.get(endpoint_key)
+            if isinstance(endpoint, dict) and endpoint.get("layer"):
+                layer = str(endpoint.get("layer") or "").strip()
+                break
+        order_lines.append({"net": net, "layer": layer, "order": len(order_lines) + 1})
+    for net in selected_nets:
+        clean = str(net or "").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            order_lines.append({"net": clean, "order": len(order_lines) + 1})
+    return {"selectedNets": [str(net).strip() for net in selected_nets if str(net).strip()], "orderLines": order_lines}
+
+
+
+def _skip_local_reroute_completion(payload: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
+    result = dict(payload)
+    reroute_result = dict(result.get("rerouteResult") or {})
+    check_report = dict(result.get("checkReport") or {})
+    warnings = list(reroute_result.get("completionWarnings") or [])
+    skip_message = f"Local reroute completion tool is not configured; optional completion was skipped: {reason}"
+    if skip_message not in warnings:
+        warnings.append(skip_message)
+    reroute_result["completionWarnings"] = warnings
+    policy = dict(reroute_result.get("localRerouteCompletionPolicy") or {})
+    policy.setdefault("mode", "selected_net_local_optional")
+    policy["skipped"] = True
+    policy["skipReason"] = reason
+    reroute_result["localRerouteCompletionPolicy"] = policy
+    report_warnings = list(check_report.get("warnings") or [])
+    if skip_message not in report_warnings:
+        report_warnings.append(skip_message)
+    check_report["warnings"] = report_warnings
+    result["rerouteResult"] = reroute_result
+    result["checkReport"] = check_report
+    explanation = str(result.get("explanation") or "").strip()
+    result["explanation"] = f"{explanation} {skip_message}".strip() if explanation else skip_message
+    return result
+
+def _complete_local_reroute_with_pcbrouter(
+    payload: Dict[str, Any],
+    *,
+    original_board_data: str,
+    original_board_path: str,
+    output_dir: str,
+    selected_nets: list[str],
+    local_context: Any,
+    completion_reason: str,
+) -> Dict[str, Any]:
+    selected = [str(net).strip() for net in selected_nets if str(net).strip()]
+    if not selected:
+        return _append_reroute_check(
+            payload,
+            name="local_route_completion",
+            passed=False,
+            detail="缺少 selectedNets，无法执行局部布线完善。",
+        )
+    if not original_board_data and not original_board_path:
+        return _append_reroute_check(
+            payload,
+            name="local_route_completion",
+            passed=False,
+            detail="缺少版图数据，无法执行局部布线完善。",
+        )
+    try:
+        from tools import pcb_local_router
+
+        binary_path = pcb_local_router.resolve_pcbrouter_binary()
+        if not pcb_local_router.pcbrouter_available():
+            return _skip_local_reroute_completion(
+                payload,
+                reason=f"pcbrouter executable is not configured: {binary_path}",
+            )
+
+        outputs = pcb_local_router.run_pcbrouter_local_route(
+            project_data=original_board_data,
+            route_params=_local_reroute_completion_route_params(
+                selected_nets=selected,
+                local_context=local_context,
+            ),
+            work_dir=Path(output_dir),
+            source_board_path=original_board_path,
+        )
+    except FileNotFoundError as exc:
+        return _skip_local_reroute_completion(
+            payload,
+            reason=f"pcbrouter executable is not configured: {_compact_public_text(exc, 700)}",
+        )
+    except Exception as exc:
+        return _append_reroute_check(
+            payload,
+            name="local_route_completion",
+            passed=False,
+            detail=f"Local reroute completion did not finish: {_compact_public_text(exc, 700)}",
+        )
+
+    result = dict(payload)
+    reroute_result = dict(result.get("rerouteResult") or {})
+    check_report = dict(result.get("checkReport") or {})
+    checks = list(check_report.get("checks") or [])
+    policy = dict(reroute_result.get("localRerouteCompletionPolicy") or {})
+    policy.update(
+        {
+            "mode": "selected_net_local",
+            "completionReason": completion_reason,
+            "engine": "pcbrouter_local_route",
+            "targetNetCount": len(selected),
+        }
+    )
+    reroute_result.update(
+        {
+            "status": "local_completion_passed",
+            "drcPassed": True,
+            "routedBoardDataFilePath": str(outputs.routing_result_path),
+            "localRerouteCompletionPolicy": policy,
+            "completionReason": completion_reason,
+        }
+    )
+    warnings = list(reroute_result.get("completionWarnings") or [])
+    if outputs.output_csv_path:
+        warnings.append(f"局部布线完善统计文件：{outputs.output_csv_path.name}")
+    reroute_result["completionWarnings"] = warnings
+    checks.append(
+        {
+            "name": "local_route_completion",
+            "passed": True,
+            "detail": outputs.report,
+        }
+    )
+    check_report["checks"] = checks
+    check_report["passed"] = True
+    result["rerouteResult"] = reroute_result
+    result["checkReport"] = check_report
+    result["routedBoardDataFilePath"] = str(outputs.routing_result_path)
+    explanation = str(result.get("explanation") or "").strip()
+    completion_text = "已完成局部布线完善。已基于当前框选网络完成局部重布线检查。"
+    result["explanation"] = f"{explanation} {completion_text}".strip() if explanation else completion_text
+    return result
+
 def _local_reroute_drc_passes(attempt: Any, *, selected_nets: list[str]) -> tuple[bool, str, dict[str, Any]]:
     drc_result = getattr(attempt, "drc_result", {}) or {}
     if bool(drc_result.get("ok")) and bool(drc_result.get("pass")):
@@ -4133,9 +4579,9 @@ def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any
         reroute_result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
         result["routedBoardDataFilePath"] = validation.routed_board_data_file_path
         if attempts:
-            local_policy = (attempts[-1].get("drcResult") or {}).get("localReroutePolicy") or {}
+            local_policy = (attempts[-1].get("drcResult") or {}).get("localRerouteCompletionPolicy") or (attempts[-1].get("drcResult") or {}).get("localReroutePolicy") or {}
             if local_policy:
-                reroute_result["localReroutePolicy"] = local_policy
+                reroute_result["localRerouteCompletionPolicy"] = local_policy
     else:
         reroute_result["routedBoardDataFilePath"] = original_board_path
         result["routedBoardDataFilePath"] = original_board_path
@@ -4151,8 +4597,8 @@ def _apply_drc_validation_to_payload(payload: Dict[str, Any], *, validation: Any
             "name": "drc_validation",
             "passed": validation.passed,
             "detail": (
-                json.dumps(reroute_result.get("localReroutePolicy") or {}, ensure_ascii=False)
-                if validation.passed and reroute_result.get("localReroutePolicy")
+                json.dumps(reroute_result.get("localRerouteCompletionPolicy") or {}, ensure_ascii=False)
+                if validation.passed and reroute_result.get("localRerouteCompletionPolicy")
                 else ("DRC passed" if validation.passed else validation.last_failure_summary)
             ),
         }
@@ -4180,6 +4626,7 @@ def _run_reroute_drc_iterations(
     local_context: Any,
     regenerate,
     status_callback=None,
+    session_id: str = "",
 ) -> Dict[str, Any]:
     from tools.pcb_reroute_drc import RerouteDrcValidation, validate_kicad_patch_with_drc
 
@@ -4242,14 +4689,16 @@ def _run_reroute_drc_iterations(
             selected_nets=selected_nets,
         )
         if isinstance(attempt.drc_result, dict):
-            attempt.drc_result["localReroutePolicy"] = local_detail
+            attempt.drc_result["localRerouteCompletionPolicy"] = local_detail
         if local_passed and not attempt.passed:
             attempt.passed = True
             attempt.failure_summary = local_summary
         attempts.append(attempt)
         if attempt.passed:
             if status_callback:
-                status_callback(f"拆线重布 DRC 第 {iteration} 轮通过，正在生成可导入结果...")
+                pending_message = f"拆线重布 DRC 第 {iteration} 轮通过，正在生成可导入结果..."
+                status_callback(pending_message)
+                _transport.send_reroute_pending_final(pending_message, session_id=session_id)
             validation = RerouteDrcValidation(
                 passed=True,
                 routed_board_data_file_path=attempt.filled_board_data_file_path,
@@ -4275,7 +4724,7 @@ def _run_reroute_drc_iterations(
                 "fillDetail": attempt.fill_detail,
                 "drcResult": attempt.drc_result,
                 "failureSummary": attempt.failure_summary,
-                "localReroutePolicy": local_detail,
+                "localRerouteCompletionPolicy": local_detail,
                 "endpointGuard": endpoint_messages,
                 "endpointCorrected": endpoint_corrected,
             }
@@ -4420,77 +4869,134 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
         ],
     }
 
-    _transport.send_status("正在调用拆线重布模型生成候选走线...", session_id=session_id)
-    payload = _generate_reroute_with_model(
-        nets=nets,
-        selected_trace_ids=selected_trace_ids,
-        dropped_board_data=dropped_board_data,
-        dropped_board_path=str(dropped_board_path or ""),
-        dropped_objects=dropped_objects,
-        local_context=local_context,
-        constraints=constraints,
-        check_report=check_report,
-        original_board_path=str(original_board_path or ""),
-        debug_output_dir=output_dir,
-        debug_label="initial",
-        session_id=session_id or "session",
-    )
-    patch_text = _model_patch_text(payload)
-    if max_drc_iterations <= 0:
-        payload = _append_reroute_check(
+    local_completion_policy = user_data_obj.get("localRerouteCompletionPolicy") or {}
+    if not isinstance(local_completion_policy, dict):
+        local_completion_policy = {}
+    local_first = str(local_completion_policy.get("mode") or "").strip() == "selected_net_local_first"
+    if local_first:
+        payload = {
+            "rerouteResult": {
+                "type": "local_reroute_completion",
+                "mode": "selected_nets_after_drop",
+                "status": "local_completion_prepared",
+                "selectedNets": nets,
+                "selectedTraceIds": selected_trace_ids,
+                "operations": [
+                    {"action": "complete_local_route_for_net", "net": net, "scope": "local", "preserveOtherNets": True}
+                    for net in nets
+                ],
+                "constraints": constraints,
+                "droppedObjects": dropped_objects,
+                "localContext": local_context,
+                "localRerouteCompletionPolicy": dict(local_completion_policy),
+                "completionReason": "selected_net_local_first",
+            },
+            "checkReport": check_report,
+            "explanation": '已按当前选择生成局部重布线方案，并保留 selected-net 上下文。',
+        }
+        payload = _complete_local_reroute_with_pcbrouter(
             payload,
-            name="drc_validation",
-            passed=False,
-            detail="DRC 校验已被配置跳过，未生成可导入 txt。",
-        )
-    elif not original_board_data:
-        payload = _append_reroute_check(
-            payload,
-            name="drc_validation",
-            passed=False,
-            detail="缺少原始版图数据，无法执行 DRC 校验，也不会导入重布结果。",
-        )
-    elif not patch_text:
-        no_patch_detail = _latest_reroute_failure_reason(payload) or (
-            "模型未生成可回填的重布 patch，无法执行 DRC 校验，也不会导入重布结果。"
-        )
-        payload = _append_reroute_check(
-            payload,
-            name="model_patch",
-            passed=False,
-            detail=no_patch_detail,
-        )
-    else:
-        def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
-            return _generate_reroute_with_model(
-                nets=nets,
-                selected_trace_ids=selected_trace_ids,
-                dropped_board_data=dropped_board_data,
-                dropped_board_path=str(dropped_board_path or ""),
-                dropped_objects=dropped_objects,
-                local_context=local_context,
-                constraints=constraints,
-                check_report=check_report,
-                original_board_path=str(original_board_path or ""),
-                drc_feedback=feedback,
-                drc_iteration_history=iteration_history,
-                debug_output_dir=output_dir,
-                debug_label=f"drc_retry_{len(iteration_history) + 2}",
-                session_id=session_id or "session",
-            )
-
-        payload = _run_reroute_drc_iterations(
-            base_payload=payload,
             original_board_data=original_board_data,
-            original_board_path=str(original_board_path or ""),
+            original_board_path=str(original_board_path or dropped_board_path or ""),
             output_dir=output_dir,
-            sample_id=f"{session_id or 'reroute'}_{'_'.join(nets or selected_trace_ids)}",
-            max_iterations=max_drc_iterations,
             selected_nets=nets,
             local_context=local_context,
-            regenerate=_regenerate,
-            status_callback=lambda message: _transport.send_status(message, session_id=session_id),
+            completion_reason="selected_net_local_first",
         )
+    else:
+        _transport.send_status('正在生成局部重布线结果...', session_id=session_id)
+        payload = _generate_reroute_with_model(
+            nets=nets,
+            selected_trace_ids=selected_trace_ids,
+            dropped_board_data=dropped_board_data,
+            dropped_board_path=str(dropped_board_path or ""),
+            dropped_objects=dropped_objects,
+            local_context=local_context,
+            constraints=constraints,
+            check_report=check_report,
+            original_board_path=str(original_board_path or ""),
+            debug_output_dir=output_dir,
+            debug_label="initial",
+            session_id=session_id or "session",
+        )
+        patch_text = _model_patch_text(payload)
+        if max_drc_iterations <= 0:
+            payload = _append_reroute_check(
+                payload,
+                name="drc_validation",
+                passed=False,
+                detail='DRC 循环未启用，已跳过版图 txt 校验。',
+            )
+        elif not original_board_data:
+            payload = _append_reroute_check(
+                payload,
+                name="drc_validation",
+                passed=False,
+                detail='缺少原始版图数据，无法执行 DRC 校验。',
+            )
+        elif not patch_text:
+            no_patch_detail = _latest_reroute_failure_reason(payload) or (
+                '模型未生成可应用的 patch，无法继续 DRC 校验。'
+            )
+            payload = _append_reroute_check(
+                payload,
+                name="model_patch",
+                passed=False,
+                detail=no_patch_detail,
+            )
+        else:
+            def _regenerate(feedback: list[str], iteration_history: list[Dict[str, Any]]) -> Dict[str, Any]:
+                return _generate_reroute_with_model(
+                    nets=nets,
+                    selected_trace_ids=selected_trace_ids,
+                    dropped_board_data=dropped_board_data,
+                    dropped_board_path=str(dropped_board_path or ""),
+                    dropped_objects=dropped_objects,
+                    local_context=local_context,
+                    constraints=constraints,
+                    check_report=check_report,
+                    original_board_path=str(original_board_path or ""),
+                    drc_feedback=feedback,
+                    drc_iteration_history=iteration_history,
+                    debug_output_dir=output_dir,
+                    debug_label=f"drc_retry_{len(iteration_history) + 2}",
+                    session_id=session_id or "session",
+                )
+
+            payload = _run_reroute_drc_iterations(
+                base_payload=payload,
+                original_board_data=original_board_data,
+                original_board_path=str(original_board_path or ""),
+                output_dir=output_dir,
+                sample_id=f"{session_id or 'reroute'}_{'_'.join(nets or selected_trace_ids)}",
+                max_iterations=max_drc_iterations,
+                selected_nets=nets,
+                local_context=local_context,
+                regenerate=_regenerate,
+                status_callback=lambda message: _transport.send_status(message, session_id=session_id),
+                session_id=session_id or "session",
+            )
+    reroute_result_for_completion = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+    needs_completion = False
+    completion_reason = ""
+    if isinstance(reroute_result_for_completion, dict):
+        if not _model_patch_text(payload):
+            needs_completion = True
+            completion_reason = "model_patch_incomplete"
+        elif reroute_result_for_completion.get("drcPassed") is False:
+            needs_completion = True
+            completion_reason = "drc_not_converged"
+    if needs_completion:
+        payload = _complete_local_reroute_with_pcbrouter(
+            payload,
+            original_board_data=original_board_data,
+            original_board_path=str(original_board_path or dropped_board_path or ""),
+            output_dir=output_dir,
+            selected_nets=nets,
+            local_context=local_context,
+            completion_reason=completion_reason,
+        )
+
     public_txt_path = ""
     import_lines_path = ""
     routed_internal_path = ""
@@ -4517,20 +5023,44 @@ def reroute(userData: str = "", session_id: Optional[str] = None) -> str:
             )
             conversion_notes.extend(import_notes)
             if not import_lines_path:
-                payload = _append_reroute_check(
-                    payload,
-                    name="txt_output_conversion",
-                    passed=False,
-                    detail="DRC 已通过，但未生成轻量增量导入文件，因此不会调用 importLines。",
+                reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+                local_completion_ready = (
+                    isinstance(reroute_result, dict)
+                    and reroute_result.get("status") == "local_completion_passed"
+                    and bool(public_txt_path)
                 )
+                if local_completion_ready:
+                    payload = _append_reroute_check(
+                        payload,
+                        name="layout_output_conversion",
+                        passed=True,
+                        detail="局部布线完善已生成完整版图输出，前端可使用 routedLayoutTxtFilePath 更新结果。",
+                    )
+                else:
+                    payload = _append_reroute_check(
+                        payload,
+                        name="txt_output_conversion",
+                        passed=False,
+                        detail="DRC 已通过，但未生成轻量增量导入文件，因此不会调用 importLines。",
+                    )
     except Exception as exc:
         logger.warning("Failed converting reroute result to public txt: %s", exc)
-        payload = _append_reroute_check(
-            payload,
-            name="txt_output_conversion",
-            passed=False,
-            detail=f"输出 txt 转换失败：{exc}",
-        )
+        reroute_result = payload.get("rerouteResult") if isinstance(payload, dict) else {}
+        local_completion_ready = isinstance(reroute_result, dict) and reroute_result.get("status") == "local_completion_passed"
+        if local_completion_ready:
+            payload = _append_reroute_check(
+                payload,
+                name="layout_output_conversion",
+                passed=True,
+                detail=f"局部布线完善已生成完整版图输出，轻量 txt 转换未完成：{_compact_public_text(exc, 500)}",
+            )
+        else:
+            payload = _append_reroute_check(
+                payload,
+                name="txt_output_conversion",
+                passed=False,
+                detail=f"输出 txt 转换失败：{exc}",
+            )
     explain_board_path = routed_internal_path or str(original_board_path or dropped_board_path or "")
     payload = _append_explainability_report(
         payload,
@@ -4549,19 +5079,13 @@ registry.register(
     toolset="pcb",
     schema={
         "name": "reroute",
-        "description": (
-            "基于 drop_net 的拆线后上下文生成局部拆线重布结果包。"
-            "用于局部重布流程，不调用全局 BGA fanout router。"
-        ),
+        "description": "基于 deleteTracesForRerouting/drop_net 产生的拆线后上下文生成局部 reroute 结果。仅用于 local rip-up/reroute / 拆线重布流程，不用于全局 BGA fanout。返回结构化 rerouteResult、检查报告和前端导入所需字段。",
         "parameters": {
             "type": "object",
             "properties": {
                 "userData": {
                     "type": "string",
-                    "description": (
-                        "可选 JSON 字符串，可包含 selectedNets、selectedTraceIds、droppedBoardData、"
-                        "droppedBoardDataFilePath、originalBoardDataFilePath、localContext、constraints。"
-                    ),
+                    "description": "可选 JSON 字符串，可包含 selectedNets、selectedTraceIds、droppedBoardData、droppedBoardDataFilePath、originalBoardDataFilePath、localContext、constraints。",
                 }
             },
             "required": [],

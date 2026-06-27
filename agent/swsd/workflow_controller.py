@@ -9,8 +9,11 @@ from typing import Any, Dict, Optional
 
 from agent.swsd.action_candidates import ActionCandidate, IntentCandidateSet
 from agent.swsd.control_signals import matches_cancel_signal, matches_confirm_signal, matches_reject_signal, matches_rollback_signal
+from agent.swsd.jump_intent_loop import JumpIntentLoopInput, WorkflowJumpPlan, run_jump_intent_loop
+from agent.swsd.jump_intent_loop.pseudo_expert_h import FIXED_UNCLEAR_REPLY, clean_confirmation_result, rule_hint_for_confirmation
+from agent.swsd.jump_intent_loop.tool_planning_chat_jump_model import ToolPlanningChatJumpModel
 from agent.swsd.pcb_intent_agent_loop import IntentAgentLoopInput, IntentAgentLoopResult, run_pcb_intent_agent_loops
-from agent.swsd.registry import get_workflow
+from agent.swsd.registry import get_workflow, list_workflows
 from agent.swsd.restore_renderer import render_restore_summary
 from tools import pcb_model_runtime
 
@@ -39,6 +42,7 @@ class SWSDTurnDecision:
     intent: str
     immediate_reply: str | None = None
     bootstrap_get_project: bool = False
+    tool_call: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,9 @@ class WebSocketWorkflowController:
 
     def handle_turn(self, event: SWSDTurnEvent) -> SWSDTurnDecision:
         """Run SWSD-owned candidate generation, hint resolution, and arbitration."""
+        pending_decision = self._handle_pending_jump_confirmation(event)
+        if pending_decision is not None:
+            return pending_decision
         plan = self.plan_turn(event)
         dispatched = self.dispatch_plan(event, plan)
         if dispatched.decision is not None:
@@ -138,6 +145,13 @@ class WebSocketWorkflowController:
         """
         if plan.phase == "chat" and plan.reason not in {"slash_command", "empty"}:
             return self._handle_chat_plan(event, plan)
+        if plan.workflow_id == self.reroute_flow_id and plan.action in {"confirm_import", "reject_import"}:
+            from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
+
+            result = RerouteExecuteChain(self).handle(event, plan)
+            return WorkflowPlanResult(plan=plan, decision=result.decision)
+        if plan.phase in {"jump", "fallback"}:
+            return self._handle_jump_plan(event, plan)
         if plan.phase == "execute":
             return self._handle_execute_plan(event, plan)
         return WorkflowPlanResult(plan=plan)
@@ -150,18 +164,340 @@ class WebSocketWorkflowController:
             result = FanoutExecuteChain(self).handle(event, plan)
             return WorkflowPlanResult(plan=plan, decision=result.decision)
         if chain == "reroute":
-            return WorkflowPlanResult(
-                plan=plan,
-                decision=self._decision_from_action(event, plan.workflow_id, plan.workflow_state, plan.action, plan.reason),
-            )
+            from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
+
+            result = RerouteExecuteChain(self).handle(event, plan)
+            return WorkflowPlanResult(plan=plan, decision=result.decision)
         return WorkflowPlanResult(plan=plan)
 
     def _execute_chain_for_plan(self, plan: WorkflowActionPlan) -> str:
-        if plan.action == "pcb_entry" or plan.workflow_id == self.escape_flow_id:
-            return "fanout"
-        if plan.action in {"reroute_entry", "reroute_again"} or plan.workflow_id == self.reroute_flow_id:
+        if plan.action in {"reroute_entry", "reroute_again", "confirm_reroute", "confirm_import", "reject_import"}:
             return "reroute"
+        if plan.action in {"pcb_entry", "layer_assigned"}:
+            return "fanout"
+        if plan.workflow_id == self.reroute_flow_id:
+            return "reroute"
+        if plan.workflow_id == self.escape_flow_id:
+            return "fanout"
         return ""
+    def _handle_jump_plan(self, event: SWSDTurnEvent, plan: WorkflowActionPlan) -> WorkflowPlanResult:
+        loop_input = self._build_jump_loop_input(event, plan)
+        result = run_jump_intent_loop(
+            loop_input,
+            model=getattr(self.adapter, "_swsd_jump_model", None),
+        )
+        if not result.accepted or result.plan is None:
+            return WorkflowPlanResult(
+                plan=plan,
+                decision=SWSDTurnDecision(
+                    mode=self.route_mode_pcb,
+                    reason=result.reason or "jump_clarification",
+                    intent="unclear",
+                    immediate_reply=result.clarification,
+                ),
+            )
+        pending = self._store_pending_jump(event, result.plan, loop_input, result)
+        reply = self._build_jump_confirmation_reply(result.plan, loop_input)
+        return WorkflowPlanResult(
+            plan=plan,
+            decision=SWSDTurnDecision(
+                mode=self.route_mode_pcb,
+                reason="jump_confirmation_pending",
+                intent="jump_confirm_pending",
+                immediate_reply=reply,
+                bootstrap_get_project=False,
+            ),
+        )
+
+    def _handle_pending_jump_confirmation(self, event: SWSDTurnEvent) -> SWSDTurnDecision | None:
+        pending = self._pending_jump_record(event.session_id)
+        if not pending:
+            return None
+        plan = self._jump_plan_from_mapping(pending.get("plan"))
+        if plan is None:
+            self._clear_pending_jump(event.session_id)
+            return None
+        model = getattr(self.adapter, "_swsd_jump_model", None) or ToolPlanningChatJumpModel()
+        try:
+            confirmation = model.judge_confirmation(
+                user_text=event.raw_user_text or "",
+                pending_plan=plan,
+                rule_hint=rule_hint_for_confirmation(event.raw_user_text or ""),
+            )
+        except Exception:
+            confirmation = clean_confirmation_result({"decision": "unclear", "clarification": FIXED_UNCLEAR_REPLY})
+        if confirmation.decision == "confirm":
+            self._clear_pending_jump(event.session_id)
+            return self._commit_jump_plan(event, plan, pending)
+        if confirmation.decision == "reject":
+            original = str(pending.get("original_user_input") or "")
+            rejection_context = (
+                f"上一轮 jump 判断不符合用户意图。上一轮目标: {plan.workflow_id}/{plan.target_state}, "
+                f"action={plan.action}, reason={plan.reason}. 用户澄清: {event.raw_user_text or ''}"
+            )
+            self._clear_pending_jump(event.session_id)
+            workflow_id, workflow_state = self.active_workflow_state(event.session_id)
+            retry_event = SWSDTurnEvent(
+                session_id=event.session_id,
+                project_id=event.project_id,
+                raw_user_text=(event.raw_user_text or original),
+                body=event.body,
+                turn_options={**event.turn_options, "jump_rejection_context": rejection_context},
+                inbound_fields=event.inbound_fields,
+                body_fanout_params=event.body_fanout_params,
+                content_fanout_params=event.content_fanout_params,
+                is_slash_command=event.is_slash_command,
+            )
+            retry_plan = WorkflowActionPlan(
+                workflow_id=workflow_id or plan.workflow_id,
+                workflow_state=workflow_state or plan.from_state,
+                allowed_actions=tuple(self._allowed_actions(workflow_id or plan.workflow_id, workflow_state or plan.from_state, retry_event)),
+                action="clarify",
+                phase="jump",
+                reason="jump_rejected_retry",
+                accepted=True,
+                entities=plan.entities,
+            )
+            return self._handle_jump_plan(retry_event, retry_plan).decision
+        return SWSDTurnDecision(
+            mode=self.route_mode_pcb,
+            reason="jump_confirmation_unclear",
+            intent="unclear",
+            immediate_reply=confirmation.clarification or FIXED_UNCLEAR_REPLY,
+        )
+
+    def _commit_jump_plan(self, event: SWSDTurnEvent, jump_plan: WorkflowJumpPlan, pending: Dict[str, Any]) -> SWSDTurnDecision:
+        session_id = event.session_id
+        payload = self._payload_for_workflow(jump_plan.workflow_id, session_id, {
+            "jumpCommitted": jump_plan.as_dict(),
+            "jumpHistory": self._jump_history(session_id, jump_plan),
+        })
+        self.adapter._set_session_mode(session_id, self.route_mode_pcb)
+        legacy_flow = self.bridge.legacy_flow_for_workflow_state(jump_plan.workflow_id, jump_plan.target_state) if hasattr(self.bridge, "legacy_flow_for_workflow_state") else self.bridge.flow_idle
+        self.adapter._set_flow_state(session_id, legacy_flow)
+        update = getattr(self.adapter, "_swsd_update", None)
+        if callable(update):
+            update(
+                session_id,
+                jump_plan.workflow_id,
+                jump_plan.target_state,
+                payload,
+                event_type="user_jump",
+                intent=jump_plan.action,
+                action_type="jump_commit",
+                checkpoint_label=f"jump {jump_plan.action}",
+            )
+        self._apply_jump_entities_to_session(session_id, jump_plan.entities)
+        committed_event = SWSDTurnEvent(
+            session_id=session_id,
+            project_id=event.project_id,
+            raw_user_text=str(pending.get("original_user_input") or event.raw_user_text or ""),
+            body=event.body,
+            turn_options={**event.turn_options, "jump_committed": True, "jump_plan": jump_plan.as_dict()},
+            inbound_fields={**event.inbound_fields, **jump_plan.entities},
+            body_fanout_params=event.body_fanout_params,
+            content_fanout_params=event.content_fanout_params,
+            is_slash_command=False,
+        )
+        dispatch_plan = WorkflowActionPlan(
+            workflow_id=jump_plan.workflow_id,
+            workflow_state=jump_plan.target_state,
+            allowed_actions=tuple(self._allowed_actions(jump_plan.workflow_id, jump_plan.target_state, committed_event)),
+            action=self._commit_action_for_jump(jump_plan),
+            phase=self._commit_phase_for_jump(jump_plan),
+            reason="jump_committed",
+            accepted=True,
+            entities=jump_plan.entities,
+        )
+        dispatched = self.dispatch_plan(committed_event, dispatch_plan)
+        if dispatched.decision is not None:
+            return dispatched.decision
+        return SWSDTurnDecision(
+            mode=self.route_mode_pcb,
+            reason="jump_committed",
+            intent=jump_plan.action,
+            immediate_reply="已确认跳转，请继续当前流程。",
+        )
+
+    def _build_jump_loop_input(self, event: SWSDTurnEvent, plan: WorkflowActionPlan) -> JumpIntentLoopInput:
+        workflow_id = plan.workflow_id or self.escape_flow_id
+        workflow_state = plan.workflow_state or "idle"
+        return JumpIntentLoopInput(
+            user_text=event.raw_user_text or "",
+            workflow_id=workflow_id,
+            workflow_state=workflow_state,
+            state_graph=self._state_graph_payload(workflow_id, workflow_state, event.session_id),
+            state_payload_summary=self._state_payload_summary(event.session_id, workflow_id),
+            entities=plan.entities,
+            candidate_action=plan.action,
+            rejection_context=str(event.turn_options.get("jump_rejection_context") or ""),
+            session_id=event.session_id,
+            project_id=event.project_id,
+        )
+
+    def _build_jump_confirmation_reply(self, jump_plan: WorkflowJumpPlan, loop_input: JumpIntentLoopInput) -> str:
+        model = getattr(self.adapter, "_swsd_jump_model", None) or ToolPlanningChatJumpModel()
+        try:
+            return model.build_confirmation_reply(jump_plan, loop_input)
+        except Exception:
+            return f"我理解你想跳到 {jump_plan.target_state} 继续处理。确认后我会执行这个跳转；如果不是这个意思，请直接说明要改哪一步。"
+
+    def _store_pending_jump(self, event: SWSDTurnEvent, jump_plan: WorkflowJumpPlan, loop_input: JumpIntentLoopInput, result: Any) -> Dict[str, Any]:
+        record = {
+            "plan": jump_plan.as_dict(),
+            "original_user_input": event.raw_user_text or "",
+            "rag_docs": [result.prior.path] if getattr(result, "prior", None) else [],
+            "rag_score": getattr(result.prior, "score", 0.0) if getattr(result, "prior", None) else 0.0,
+            "status": "awaiting_confirmation",
+            "state_graph": loop_input.state_graph,
+        }
+        workflow_id = jump_plan.workflow_id or loop_input.workflow_id
+        payload = self._payload_for_workflow(workflow_id, event.session_id, {"pendingJump": record})
+        update = getattr(self.adapter, "_swsd_update", None)
+        if callable(update):
+            update(
+                event.session_id,
+                workflow_id,
+                loop_input.workflow_state,
+                payload,
+                event_type="user_jump",
+                intent="jump_confirm_pending",
+                action_type="jump_pending",
+                checkpoint_label="jump pending confirmation",
+            )
+        return record
+
+    def _pending_jump_record(self, session_id: str) -> Dict[str, Any] | None:
+        for workflow_id in (self.reroute_flow_id, self.escape_flow_id):
+            state = self.adapter._swsd_state.load(session_id, workflow_id) if getattr(self.adapter, "_swsd_enabled", False) else None
+            payload = state.get("state_payload") if isinstance(state, dict) and isinstance(state.get("state_payload"), dict) else {}
+            pending = payload.get("pendingJump")
+            if isinstance(pending, dict) and pending.get("status") == "awaiting_confirmation":
+                return dict(pending)
+        return None
+
+    def _clear_pending_jump(self, session_id: str) -> None:
+        for workflow_id in (self.reroute_flow_id, self.escape_flow_id):
+            state = self.adapter._swsd_state.load(session_id, workflow_id) if getattr(self.adapter, "_swsd_enabled", False) else None
+            if not isinstance(state, dict):
+                continue
+            payload = dict(state.get("state_payload") or {})
+            if "pendingJump" not in payload:
+                continue
+            payload.pop("pendingJump", None)
+            self.adapter._swsd_state.update(session_id, workflow_id, current_state=str(state.get("current_state") or "idle"), payload=payload, merge=False)
+
+    def _jump_plan_from_mapping(self, data: Any) -> WorkflowJumpPlan | None:
+        if not isinstance(data, dict):
+            return None
+        try:
+            return WorkflowJumpPlan(
+                workflow_id=str(data.get("workflow_id") or ""),
+                from_state=str(data.get("from_state") or ""),
+                action=str(data.get("action") or ""),
+                target_state=str(data.get("target_state") or ""),
+                confidence=float(data.get("confidence") or 0.0),
+                entities=dict(data.get("entities") or {}),
+                reason=str(data.get("reason") or ""),
+                requires_clarification=bool(data.get("requires_clarification")),
+                clarification=str(data.get("clarification") or ""),
+                retrieved_prior=dict(data.get("retrieved_prior") or {}),
+            )
+        except Exception:
+            return None
+
+    def _state_graph_payload(self, active_workflow: str, active_state: str, session_id: str) -> Dict[str, Any]:
+        workflows: Dict[str, Any] = {}
+        jump_action_types = {"user_jump", "rollback", "cancel"}
+        for workflow_id, workflow in list_workflows().items():
+            workflows[workflow_id] = {
+                "states": list(workflow.states.keys()),
+                "jump_transitions": [
+                    {
+                        "from": transition.from_state,
+                        "to": transition.to_state,
+                        "intent": transition.intent,
+                        "action_type": transition.action_type.value,
+                    }
+                    for transition in workflow.transitions
+                    if transition.action_type.value in jump_action_types
+                ],
+            }
+        return {
+            "active": {
+                "workflow_id": active_workflow,
+                "state": active_state,
+                "state_payload_summary": self._state_payload_summary(session_id, active_workflow),
+            },
+            "workflows": workflows,
+        }
+
+    def _state_payload_summary(self, session_id: str, workflow_id: str) -> Dict[str, Any]:
+        state = self.adapter._swsd_state.load(session_id, workflow_id) if getattr(self.adapter, "_swsd_enabled", False) else None
+        payload = state.get("state_payload") if isinstance(state, dict) and isinstance(state.get("state_payload"), dict) else {}
+        summary: Dict[str, Any] = {}
+        for key in ("selectedBGA", "requestedBGA", "routerType", "projectData", "fanoutParams", "rerouteFiles", "currentLayoutVersion", "activeParamsVersion"):
+            if key in payload:
+                summary[key] = payload[key]
+        return summary
+
+    def _payload_for_workflow(self, workflow_id: str, session_id: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+        if workflow_id == self.reroute_flow_id and hasattr(self.bridge, "reroute_payload"):
+            return self.bridge.reroute_payload(session_id, extra)
+        if hasattr(self.bridge, "escape_payload"):
+            return self.bridge.escape_payload(session_id, extra)
+        return dict(extra or {})
+
+    def _jump_history(self, session_id: str, jump_plan: WorkflowJumpPlan) -> list[Dict[str, Any]]:
+        state = self.adapter._swsd_state.load(session_id, jump_plan.workflow_id) if getattr(self.adapter, "_swsd_enabled", False) else None
+        payload = state.get("state_payload") if isinstance(state, dict) and isinstance(state.get("state_payload"), dict) else {}
+        history = list(payload.get("jumpHistory") or []) if isinstance(payload.get("jumpHistory"), list) else []
+        history.append({
+            "from": f"{jump_plan.workflow_id}/{jump_plan.from_state}",
+            "to": f"{jump_plan.workflow_id}/{jump_plan.target_state}",
+            "action": jump_plan.action,
+            "reason": jump_plan.reason,
+            "confirmed": True,
+        })
+        return history[-20:]
+
+    def _apply_jump_entities_to_session(self, session_id: str, entities: Dict[str, Any]) -> None:
+        selected = str(entities.get("selectedBGA") or entities.get("targetBGA") or "").strip()
+        targets = entities.get("targetBGAs") if isinstance(entities.get("targetBGAs"), list) else []
+        if not selected and targets:
+            selected = str(targets[0] or "").strip()
+        if selected:
+            self.adapter._session_selected_targets[session_id] = selected.upper()
+            self.adapter._session_requested_bga_targets[session_id] = selected.upper()
+        router_type = str(entities.get("routerType") or "").strip()
+        if router_type:
+            self.adapter._session_router_types[session_id] = router_type
+        constraints = entities.get("constraints") if isinstance(entities.get("constraints"), dict) else {}
+        if constraints:
+            draft = dict(self.adapter._session_fanout_params.get(session_id) or {})
+            merged = dict(draft.get("constraints") or {})
+            merged.update(constraints)
+            draft["constraints"] = merged
+            self.adapter._session_fanout_params[session_id] = draft
+
+    @staticmethod
+    def _commit_action_for_jump(jump_plan: WorkflowJumpPlan) -> str:
+        if jump_plan.action in {"rerun_fanout", "modify_params", "modify_router_choice"}:
+            return "rerun_fanout"
+        if jump_plan.action == "change_target":
+            return "change_target"
+        if jump_plan.action == "reroute_entry":
+            return "reroute_entry"
+        if jump_plan.action == "pcb_entry":
+            return "pcb_entry"
+        return jump_plan.action
+
+    @staticmethod
+    def _commit_phase_for_jump(jump_plan: WorkflowJumpPlan) -> str:
+        if jump_plan.action in {"rerun_fanout", "modify_params", "modify_router_choice", "change_target", "reroute_entry", "pcb_entry", "confirm_route", "confirm_import", "reject_import"}:
+            return "execute"
+        return "jump"
+
     def _handle_chat_plan(self, event: SWSDTurnEvent, plan: WorkflowActionPlan) -> WorkflowPlanResult:
         reply = self._sanitize_chat_reply(self._run_chat_agent(event, plan))
         if not reply:
@@ -227,10 +563,24 @@ class WebSocketWorkflowController:
             },
         }
         return (
-            "You are handling a SWSD chat branch. Answer the user in Chinese unless the user asks otherwise. "
-            "Do not call PCB or EDA tools, do not change workflow state, and do not claim that an action was executed. "
-            "If chat_scope is workflow_inner_chat, keep the current workflow context in mind and explain without exiting it.\n\n"
-            "SWSD_CONTEXT:\n"
+            """你是 PCB SWSD 工作流内的中文问答助手。
+
+任务：回答用户问题，但不要执行 PCB 工具，不要迁移 workflow state。
+
+硬性规则:
+- 用自然中文回复用户。
+- 不要调用工具。
+- 不要生成 fanoutParams、rerouteResult、routingResult。
+- 不要声称已经修改 PCB、删除走线、完成布线或导入结果。
+- 如果 chat_scope=workflow_inner_chat，可以结合 workflow_id、workflow_state、entities、explicit_fields 解释当前流程。
+- 如果 chat_scope=plain_chat，只回答普通问题，不假设用户已经进入 PCB 工作流。
+- 不要暴露内部字段：WorkflowActionPlan、votes、candidateActions、DecisionPolicy、debug。
+- 如果问题需要执行 PCB 操作，说明需要用户明确发起对应操作，而不是自行执行。
+
+当前上下文会以 JSON 提供，字段名保持英文。
+
+SWSD_CONTEXT:
+"""
             + json.dumps(context, ensure_ascii=False, default=str)
         )
 
@@ -335,13 +685,15 @@ class WebSocketWorkflowController:
             action = "clarify"
         entities = self._entities_from_loop_result(loop_result)
         phase = self._phase_for_action(action, accepted=loop_result.accepted)
+        workflow_id, workflow_state = self._workflow_target_for_action(action, loop_input.workflow_id, loop_input.workflow_state, phase)
         reason = loop_result.stage or policy.reason or ("candidate_accepted" if loop_result.accepted else "intent_loop_feedback")
         if policy.requires_confirmation and not policy.action and not loop_result.feedback_reply:
             phase = "fallback"
             reason = policy.reason or "decision_requires_confirmation"
+            workflow_id, workflow_state = self._workflow_target_for_action(action, loop_input.workflow_id, loop_input.workflow_state, phase)
         return WorkflowActionPlan(
-            workflow_id=loop_input.workflow_id,
-            workflow_state=loop_input.workflow_state,
+            workflow_id=workflow_id,
+            workflow_state=workflow_state,
             allowed_actions=loop_input.allowed_actions,
             action=action,
             phase=phase,
@@ -357,8 +709,23 @@ class WebSocketWorkflowController:
                 "policy_action": policy.action,
                 "policy_reason": policy.reason,
                 "policy_requires_confirmation": policy.requires_confirmation,
+                **(loop_result.debug or {}),
             },
         )
+
+    def _workflow_target_for_action(self, action: str, workflow_id: str, workflow_state: str, phase: str) -> tuple[str, str]:
+        """Map an accepted action to the controller-owned workflow target.
+
+        Intent models only choose actions. The controller owns workflow/state
+        routing so model output cannot directly mutate the state machine.
+        """
+        if action in {"reroute_entry", "reroute_again", "confirm_reroute", "confirm_import", "reject_import"}:
+            if action in {"reroute_entry", "reroute_again"}:
+                return self.reroute_flow_id, "idle"
+            return self.reroute_flow_id, workflow_state if workflow_id == self.reroute_flow_id else "idle"
+        if action in {"pcb_entry", "layer_assigned"}:
+            return self.escape_flow_id, workflow_state if workflow_id == self.escape_flow_id else "idle"
+        return workflow_id, workflow_state
 
     @staticmethod
     def _phase_for_action(action: str, *, accepted: bool) -> str:
@@ -413,11 +780,14 @@ class WebSocketWorkflowController:
         if workflow is not None:
             actions.extend(transition.intent for transition in workflow.transitions if transition.from_state == workflow_state)
         if workflow_id == self.escape_flow_id:
-            if workflow_state == "idle":
-                actions.extend(["pcb_entry", "reroute_entry"])
-            actions.extend(["pcb_entry", "select_target", "change_target", "modify_params", "rerun_fanout", "rollback_checkpoint", "restore_params_version", "restore_layout_checkpoint", "confirm_route", "cancel_flow"])
+            if workflow_state in {"idle", "select_bga"}:
+                actions.extend(["pcb_entry", "select_target", "reroute_entry"])
+            else:
+                # fanout 内部态不再放行 pcb_entry，避免重新 fanout/改参数被误判为全新入口。
+                actions.extend(["change_target", "modify_params", "modify_constraints", "modify_order_lines", "rerun_fanout"])
+            actions.extend(["rollback_checkpoint", "restore_params_version", "restore_layout_checkpoint", "confirm_route", "cancel_flow"])
         elif workflow_id == self.reroute_flow_id:
-            actions.extend(["reroute_entry", "reroute_again", "rollback_checkpoint", "confirm_import", "reject_import", "cancel_flow"])
+            actions.extend(["reroute_entry", "reroute_again", "confirm_reroute", "rollback_checkpoint", "confirm_import", "reject_import", "cancel_flow"])
         else:
             actions.extend(["pcb_entry", "reroute_entry", "cancel_flow"])
         return list(dict.fromkeys(action for action in actions if action))
@@ -464,10 +834,13 @@ class WebSocketWorkflowController:
             add("restore_params_version", 0.95, reason="restore fanout params request")
         if re.search(r"\u6062\u590d.*(?:\u7248\u56fe|layout)", text, flags=re.IGNORECASE):
             add("restore_layout_checkpoint", 0.95, reason="restore layout request")
-        if re.search(r"(?:\u91cd\u65b0\u751f\u6210\u53c2\u6570|\u91cd\u65b0\s*fanout|\u518d\u8dd1\u4e00\u8f6e\s*fanout|rerun\s*fanout|\u91cd\u65b0\u5e03\u7ebf)", text, flags=re.IGNORECASE):
-            add("rerun_fanout", 0.9, reason="fanout rerun request")
+        if re.search(r"(?:\u91cd\u65b0\u751f\u6210\u53c2\u6570|\u91cd\u65b0\s*fanout|\u518d\u8dd1\u4e00\u8f6e\s*fanout|rerun\s*fanout|\u91cd\u65b0\u5e03\u7ebf|\u91cd\u65b0\u6765|\u91cd\u8dd1)", text, flags=re.IGNORECASE):
+            add("rerun_fanout", 0.96 if workflow_state in {"param_review", "review", "routing", "import"} else 0.9, reason="fanout rerun request")
         if not direct_execute and self._is_confirm_text(text):
-            add("confirm_route" if workflow_id == self.escape_flow_id else "confirm_import", 0.82, reason="confirm signal", source="control_signal")
+            if workflow_id == self.reroute_flow_id and workflow_state == "confirm":
+                add("confirm_reroute", 0.9, reason="confirm reroute context", source="control_signal")
+            else:
+                add("confirm_route" if workflow_id == self.escape_flow_id else "confirm_import", 0.82, reason="confirm signal", source="control_signal")
         if not direct_execute and self._is_reject_text(text):
             add("reject_import" if workflow_id == self.reroute_flow_id else "reject_route", 0.82, reason="reject signal", source="control_signal")
 
@@ -476,10 +849,9 @@ class WebSocketWorkflowController:
             add("change_target" if workflow_state not in {"idle", "select_bga"} else "select_target", 0.92, entities={"selectedBGA": selected}, reason="target label resolved")
         router_type = adapter._extract_complete_router_choice(event.session_id, text)
         if router_type:
-            add("modify_params" if workflow_state in {"review", "import", "escape_order", "layer_assign_escape_order"} else "layer_assigned", 0.9, entities={"routerType": router_type}, reason="router choice resolved")
+            add("modify_params" if workflow_state in {"param_review", "review", "import", "escape_order", "layer_assign_escape_order"} else "layer_assigned", 0.9, entities={"routerType": router_type}, reason="router choice resolved")
         elif adapter._extract_route_algorithm(text) or adapter._extract_fanout_module(text):
-            add("modify_params" if workflow_state in {"review", "import", "escape_order", "layer_assign_escape_order"} else "layer_assigned", 0.7, reason="partial router choice")
-
+            add("modify_params" if workflow_state in {"param_review", "review", "import", "escape_order", "layer_assign_escape_order"} else "layer_assigned", 0.7, reason="partial router choice")
         try:
             from tools.pcb_nl_fanout import parse_fanout_constraints_from_text, parse_fanout_target_from_text, parse_natural_language_order_lines
         except Exception:
@@ -487,15 +859,16 @@ class WebSocketWorkflowController:
             parse_fanout_target_from_text = None
             parse_natural_language_order_lines = None
         if parse_fanout_constraints_from_text is not None and parse_fanout_constraints_from_text(text):
-            add("modify_params", 0.88, reason="fanout constraint change")
+            add("modify_params", 0.95 if workflow_state in {"param_review", "review", "routing", "import"} else 0.88, reason="fanout constraint change")
         if parse_natural_language_order_lines is not None and parse_natural_language_order_lines(text, adapter._session_fanout_params.get(event.session_id, {}).get("orderLines") or []):
             add("modify_order_lines", 0.86, reason="fanout order line change")
         target = adapter._extract_targeted_global_fanout_refdes(text)
         if not target and parse_fanout_target_from_text is not None:
             target = parse_fanout_target_from_text(text)
-        if target or adapter._is_forced_global_fanout_command(text) or direct_execute:
+        allow_fanout_entry = workflow_state in {"idle", "select_bga"}
+        if allow_fanout_entry and (target or adapter._is_forced_global_fanout_command(text) or direct_execute):
             add("pcb_entry", 0.99 if direct_execute else 0.94, entities={"target": target} if target else {}, reason="fanout entry request")
-        elif flow_state == self.bridge.flow_idle and re.search(r"BGA|fanout|\u9003\u9038|\u6247\u51fa|\u5e03\u7ebf", text, flags=re.IGNORECASE) and re.search(r"\u5e2e\u6211|\u8bf7|\u505a|\u6267\u884c|\u5f00\u59cb|\u751f\u6210|\u83b7\u53d6|\u5bf9", text, flags=re.IGNORECASE):
+        elif allow_fanout_entry and flow_state == self.bridge.flow_idle and re.search(r"BGA|fanout|\u9003\u9038|\u6247\u51fa|\u5e03\u7ebf", text, flags=re.IGNORECASE) and re.search(r"\u5e2e\u6211|\u8bf7|\u505a|\u6267\u884c|\u5f00\u59cb|\u751f\u6210|\u83b7\u53d6|\u5bf9", text, flags=re.IGNORECASE):
             add("pcb_entry", 0.82, reason="pcb fanout execution request")
         if not candidates:
             add("chat", 0.8, reason="no workflow action candidate", source="default")
@@ -527,11 +900,19 @@ class WebSocketWorkflowController:
         if jump is not None:
             return SWSDTurnDecision(**jump)
 
-        if action in {"reroute_entry", "reroute_again"}:
-            adapter._reset_flow(session_id)
-            adapter._set_flow_state(session_id, self.flow_reroute)
-            adapter._set_session_mode(session_id, self.route_mode_pcb)
-            return SWSDTurnDecision(mode=self.route_mode_pcb, reason="pcb_reroute_selected", intent=self.intent_pcb_reroute_selected, bootstrap_get_project=False)
+        if action in {"reroute_entry", "reroute_again", "confirm_reroute"}:
+            from agent.swsd.reroute_chain.reroute_execute_chain import RerouteExecuteChain
+
+            plan = WorkflowActionPlan(
+                workflow_id=workflow_id,
+                workflow_state=workflow_state,
+                allowed_actions=tuple(self._allowed_actions(workflow_id, workflow_state, event)),
+                action=action,
+                phase="execute",
+                reason=policy_reason or action,
+                accepted=True,
+            )
+            return RerouteExecuteChain(self).handle(event, plan).decision
         if action == "pcb_entry":
             target = adapter._extract_targeted_global_fanout_refdes(text)
             if not target:
@@ -674,7 +1055,7 @@ class WebSocketWorkflowController:
             self.adapter._swsd_update(
                 session_id,
                 self.escape_flow_id,
-                "review",
+                "param_review",
                 self.bridge.escape_payload(
                     session_id,
                     {
@@ -839,7 +1220,7 @@ class WebSocketWorkflowController:
 
         fanout_rerun = re.search(r"(?:\u91cd\u65b0\u751f\u6210\u53c2\u6570|\u91cd\u65b0\s*fanout|\u518d\u8dd1\u4e00\u8f6e\s*fanout|rerun\s*fanout|\u91cd\u65b0\u5e03\u7ebf)", text, flags=re.IGNORECASE)
         explicit_reroute = re.search(r"(?:\u62c6\u7ebf\u91cd\u5e03|\u5220\u9664.*(?:\u8d70\u7ebf|\u7ebf|trace|traces|\u6846\u9009)|\breroute\b|\bripup\b|\brip-up\b)", text, flags=re.IGNORECASE)
-        if workflow_state in {"layer_assign", "escape_order", "layer_assign_escape_order", "routing", "review", "import"} and fanout_rerun and not explicit_reroute:
+        if workflow_state in {"layer_assign", "escape_order", "layer_assign_escape_order", "param_review", "routing", "review", "import"} and fanout_rerun and not explicit_reroute:
             draft = self.adapter._refresh_fanout_params_draft(session_id, user_text=text)
             for key in ("orderLines", "naturalLanguageOrderLines", "routingResult", "report"):
                 draft.pop(key, None)
@@ -866,7 +1247,7 @@ class WebSocketWorkflowController:
                 "intent": self.intent_pcb_followup,
             }
 
-        if workflow_state in {"layer_assign", "escape_order", "layer_assign_escape_order", "routing", "review", "import"} and self._is_rollback_text(text):
+        if workflow_state in {"layer_assign", "escape_order", "layer_assign_escape_order", "param_review", "routing", "review", "import"} and self._is_rollback_text(text):
             if self.jump_to_checkpoint(session_id, self.escape_flow_id):
                 return {
                     "mode": self.route_mode_pcb,
@@ -877,7 +1258,7 @@ class WebSocketWorkflowController:
                     "reason": "escape_rollback",
                     "intent": self.intent_pcb_followup,
                 }
-        if workflow_state not in {"layer_assign", "escape_order", "layer_assign_escape_order", "routing", "review", "import"}:
+        if workflow_state not in {"layer_assign", "escape_order", "layer_assign_escape_order", "param_review", "routing", "review", "import"}:
             return None
 
         selected_label = self.adapter._resolve_selected_label(session_id, text)
@@ -944,7 +1325,7 @@ class WebSocketWorkflowController:
                 if not has_complete_router
                 else self.bridge.flow_wait_confirm
             )
-            next_workflow_state = "review" if has_complete_router else "layer_assign_escape_order"
+            next_workflow_state = "param_review" if has_complete_router else "layer_assign_escape_order"
             self.adapter._set_session_mode(session_id, self.route_mode_pcb)
             self.adapter._set_flow_state(session_id, next_flow_state)
             self.adapter._swsd_update(
@@ -1042,7 +1423,7 @@ class WebSocketWorkflowController:
                 "intent": self.intent_pcb_followup,
             }
 
-        if workflow_state in {"review", "import"} and self._is_confirm_text(text):
+        if workflow_state in {"param_review", "import"} and self._is_confirm_text(text):
             if not self.adapter._session_fanout_params.get(session_id):
                 return {
                     "mode": self.route_mode_pcb,

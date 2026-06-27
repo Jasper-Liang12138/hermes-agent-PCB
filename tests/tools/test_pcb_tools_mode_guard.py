@@ -1067,13 +1067,13 @@ def test_reroute_uses_cached_drop_context(monkeypatch):
     result = pcb_tools.reroute(session_id="sess-pcb-reroute")
     payload = json.loads(result)
 
-    assert payload["rerouteResult"]["type"] == "local_reroute"
+    assert payload["rerouteResult"]["type"] == "local_reroute_completion"
     assert payload["rerouteResult"]["selectedNets"] == ["net13", "net17"]
-    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_net"
+    assert payload["rerouteResult"]["operations"][0]["action"] == "complete_local_route_for_net"
     assert payload["checkReport"]["passed"] is False
     assert "routedLayoutTxtFilePath" not in payload
     assert model_failure in payload["explanation"]
-    assert "局部重布" in payload["explanation"]
+    assert "局部布线完善" in payload["explanation"]
     assert "DRC 分析" in payload["content"]
     assert "DRC 状态: 未执行" in payload["content"]
     assert model_failure in payload["content"]
@@ -1112,11 +1112,77 @@ def test_reroute_uses_cached_selected_trace_ids(monkeypatch):
 
     assert payload["rerouteResult"]["mode"] == "selected_traces_after_delete"
     assert payload["rerouteResult"]["selectedTraceIds"] == ["2386476278", "3424247826"]
-    assert payload["rerouteResult"]["operations"][0]["action"] == "reroute_selected_traces"
+    assert payload["rerouteResult"]["operations"][0]["action"] == "complete_local_route_for_selected_traces"
     assert payload["checkReport"]["passed"] is False
     assert "routedLayoutTxtFilePath" not in payload
     assert model_failure in payload["explanation"]
 
+
+def test_reroute_model_incomplete_uses_local_route_completion(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "fake_pcbrouter.py"
+    fake_binary.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "board, flag, csv_path = sys.argv[1:]\n"
+        "assert flag == '-bga_local_route'\n"
+        "Path('output_routed').mkdir(exist_ok=True)\n"
+        "Path('output_routed/routed.kicad_pcb').write_text(\n"
+        "    Path(board).read_text(encoding='utf-8') + '\\n; local route completion\\n',\n"
+        "    encoding='utf-8',\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PCBROUTER_BIN", str(fake_binary))
+
+    transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+    transport.current_session_id = "sess-pcb-reroute-local-completion"
+    transport.set_session_mode("sess-pcb-reroute-local-completion", "pcb")
+    original_path = tmp_path / "original.kicad_pcb"
+    original_path.write_text(
+        "(kicad_pcb\n"
+        "  (layers (0 \"F.Cu\" signal \"Top\"))\n"
+        "  (net 13 net13)\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    transport.cache_reroute_context(
+        {
+            "selectedNets": ["net13"],
+            "droppedBoardData": original_path.read_text(encoding="utf-8"),
+            "originalBoardDataFilePath": str(original_path),
+            "localContext": {
+                "missingRoutes": [
+                    {"net_name": "net13", "start": {"layer": "Top"}, "end": {"layer": "Top"}}
+                ]
+            },
+        },
+        session_id="sess-pcb-reroute-local-completion",
+    )
+
+    def _fake_generate(**kwargs):
+        payload = pcb_tools._build_local_reroute_completion_payload(**kwargs)
+        payload["rerouteResult"]["modelGenerationFailure"] = "model did not return patch"
+        return payload
+
+    monkeypatch.setattr(pcb_tools, "_generate_reroute_with_model", _fake_generate)
+
+    class FakeConvert:
+        OUTLINE_ONLY_ORIGIN_X = 0.0
+        OUTLINE_ONLY_ORIGIN_Y = 0.0
+        DBU_MM = 0.000254
+
+    monkeypatch.setattr(pcb_tools, "_load_convert_module", lambda: FakeConvert)
+
+    result = pcb_tools.reroute(session_id="sess-pcb-reroute-local-completion")
+    payload = json.loads(result)
+
+    assert payload["rerouteResult"]["status"] == "local_completion_passed"
+    assert payload["rerouteResult"]["drcPassed"] is True
+    assert payload["rerouteResult"]["localRerouteCompletionPolicy"]["mode"] == "selected_net_local"
+    assert payload["checkReport"]["passed"] is True
+    assert any(check["name"] == "local_route_completion" and check["passed"] for check in payload["checkReport"]["checks"])
+    assert "局部布线完善" in payload["explanation"]
+    assert "fallback" not in json.dumps(payload, ensure_ascii=False).lower()
 
 def test_extract_kicad_patch_from_non_json_model_text():
     text = """
@@ -1249,7 +1315,7 @@ def test_reroute_without_model_patch_reports_no_txt_reason(monkeypatch):
     assert "routedLayoutTxtFilePath" not in payload
     assert model_failure in payload["explanation"]
     pending = pcb_tools._transport.pop_pending_pcb_fields("sess-pcb-reroute-no-patch")
-    assert pending["rerouteResult"]["type"] == "local_reroute"
+    assert pending["rerouteResult"]["type"] == "local_reroute_completion"
     assert pending["checkReport"]["passed"] is False
     assert pending["rerouteResult"]["modelGenerationFailure"] == model_failure
     assert model_failure in pending["explanation"]
@@ -2007,3 +2073,40 @@ def test_reroute_drc_failure_does_not_export_public_txt(monkeypatch, tmp_path):
     assert "txt 输出: 未生成" in payload["content"]
     assert "importLines: 不允许" in payload["content"]
     assert "本地布线质量分类模型报告" in payload["content"]
+
+
+
+def test_reroute_local_completion_missing_pcbrouter_is_optional_skip(monkeypatch, tmp_path):
+    from tools import pcb_local_router
+
+    monkeypatch.setattr(pcb_local_router, "resolve_pcbrouter_binary", lambda: tmp_path / "missing" / "pcbrouter.exe")
+    monkeypatch.setattr(pcb_local_router, "pcbrouter_available", lambda: False)
+
+    payload = {
+        "rerouteResult": {
+            "status": "local_completion_prepared",
+            "localRerouteCompletionPolicy": {"mode": "selected_net_local_first"},
+        },
+        "checkReport": {
+            "passed": False,
+            "checks": [{"name": "selection", "passed": True}],
+        },
+        "explanation": "prepared",
+    }
+    completed = pcb_tools._complete_local_reroute_with_pcbrouter(
+        payload,
+        original_board_data="(kicad_pcb (net 13 net13))",
+        original_board_path="",
+        output_dir=str(tmp_path),
+        selected_nets=["net13"],
+        local_context={"missingRoutes": [{"net_name": "net13"}]},
+        completion_reason="unit_test",
+    )
+
+    assert completed["rerouteResult"]["localRerouteCompletionPolicy"]["skipped"] is True
+    assert completed["rerouteResult"]["localRerouteCompletionPolicy"]["skipReason"].startswith("pcbrouter executable is not configured")
+    assert any("optional completion was skipped" in item for item in completed["rerouteResult"]["completionWarnings"])
+    assert not any(
+        check.get("name") == "local_route_completion" and check.get("passed") is False
+        for check in completed["checkReport"].get("checks", [])
+    )

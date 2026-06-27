@@ -1,4 +1,4 @@
-"""Shared slash command helpers for skills and built-in prompt-style modes.
+﻿"""Shared slash command helpers for skills and built-in prompt-style modes.
 
 Shared between CLI (cli.py) and gateway (gateway/run.py) so both surfaces
 can invoke skills via /skill-name commands and prompt-only built-ins like
@@ -19,6 +19,24 @@ _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+
+
+def _candidate_skill_roots() -> list[Path]:
+    from agent.skill_utils import get_all_skills_dirs
+
+    repo_skills_root = Path(__file__).resolve().parents[1] / "skills"
+    roots: list[Path] = [repo_skills_root]
+    roots.extend(get_all_skills_dirs())
+    return roots
+
+
+def _skill_view_target_for_dir(skill_dir: Path) -> str:
+    for root in _candidate_skill_roots():
+        try:
+            return str(skill_dir.resolve().relative_to(root.resolve())).replace(chr(92), "/")
+        except Exception:
+            continue
+    return skill_dir.name.replace(chr(92), "/")
 
 
 def build_plan_path(
@@ -51,14 +69,13 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
 
+        normalized = raw_identifier.replace(chr(92), "/").lstrip("/")
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
             try:
-                normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
+                normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve())).replace(chr(92), "/")
             except Exception:
-                normalized = raw_identifier
-        else:
-            normalized = raw_identifier.lstrip("/")
+                normalized = raw_identifier.replace(chr(92), "/")
 
         loaded_skill = json.loads(skill_view(normalized, task_id=task_id))
     except Exception:
@@ -70,9 +87,27 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     skill_name = str(loaded_skill.get("name") or normalized)
     skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None
+    candidate_rel_paths = []
     if skill_path:
+        candidate_rel_paths.append(Path(skill_path).parent)
+    candidate_rel_paths.append(Path(normalized))
+    candidate_rel_paths.append(Path(normalized).parent / skill_name)
+    for rel_path in candidate_rel_paths:
+        for skills_root in _candidate_skill_roots():
+            try:
+                candidate = (skills_root / rel_path).resolve()
+            except Exception:
+                continue
+            if (candidate / "SKILL.md").exists():
+                skill_dir = candidate
+                break
+        if skill_dir is not None:
+            break
+    if skill_dir is None and skill_path:
         try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
+            candidate = (SKILLS_DIR / Path(skill_path).parent).resolve()
+            if (candidate / "SKILL.md").exists():
+                skill_dir = candidate
         except Exception:
             skill_dir = None
 
@@ -173,11 +208,7 @@ def _build_skill_message(
                         supporting.append(rel)
 
     if supporting and skill_dir:
-        try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
-        except ValueError:
-            # Skill is from an external dir — use the skill name instead
-            skill_view_target = skill_dir.name
+        skill_view_target = _skill_view_target_for_dir(skill_dir)
         parts.append("")
         parts.append("[This skill has supporting files you can load with the skill_view tool:]")
         for sf in supporting:
@@ -366,3 +397,4 @@ def build_preloaded_skills_prompt(
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing
+

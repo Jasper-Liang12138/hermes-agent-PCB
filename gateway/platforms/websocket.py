@@ -1068,14 +1068,32 @@ class WebSocketAdapter(BasePlatformAdapter):
             )
             return
 
+        if decision.tool_call:
+            tool_call = dict(decision.tool_call)
+            call_id = str(tool_call.get("id") or f"swsd_{uuid.uuid4().hex[:8]}")
+            tool_name = str(tool_call.get("name") or "").strip()
+            arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+            timeout = float(tool_call.get("timeout") or 360.0)
+            if tool_name == "reroute":
+                await self._run_swsd_backend_reroute_tool(session_id, project_id, arguments)
+                return
+            if tool_name:
+                await self.send_tool_call(
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    timeout=timeout,
+                )
+                return
+
         if is_slash_command:
             auto_skill = None
             self._set_session_mode(session_id, _ROUTE_MODE_CHAT, lock_seconds=0.0)
             user_text = raw_user_text
         elif decision.mode == _ROUTE_MODE_PCB:
             if self._is_direct_reroute_decision(decision.reason):
-                if await self._run_direct_reroute_delete_step(session_id):
-                    return
+                raise RuntimeError("legacy websocket reroute decision path is disabled; use SWSD reroute execute chain")
             if decision.reason == "router_type_step":
                 if await self._run_direct_fanout_param_step(session_id, str(user_text or "")):
                     return
@@ -1494,7 +1512,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._swsd_update(
             session_id,
             _SWSD_ESCAPE_FLOW,
-            "escape_order",
+            "param_review",
             self._swsd_escape_payload(
                 session_id,
                 {
@@ -1807,7 +1825,7 @@ class WebSocketAdapter(BasePlatformAdapter):
         self._swsd_update(
             session_id,
             _SWSD_ESCAPE_FLOW,
-            "review",
+            "param_review",
             self._swsd_escape_payload(session_id, {"source": "frontend_fanout_params"}),
             event_type="checkpoint",
             intent="fanout_params_confirmed",
@@ -2658,53 +2676,38 @@ class WebSocketAdapter(BasePlatformAdapter):
         return reason in {"pcb_reroute_selected", "reroute_reentry"}
 
     async def _run_direct_reroute_delete_step(self, session_id: str) -> bool:
-        self._set_session_mode(session_id, _ROUTE_MODE_PCB)
-        self._set_flow_state(session_id, _FLOW_REROUTE)
-        swsd_ok = self._swsd_update(
-            session_id,
-            _SWSD_REROUTE_FLOW,
-            "rip_up",
-            self._swsd_reroute_payload(session_id, {"directReroute": True}),
-            event_type="workflow_action",
-            intent="reroute_entry",
-            action_type="tool_call",
-            checkpoint_label="direct reroute delete traces",
-        )
-        if not swsd_ok:
-            fields = minimal_reroute_final({
-                "rerouteResult": {"status": "recoverable_error", "recoverable": True, "reason": "swsd_state_write_failed"},
-                "checkReport": {"passed": False, "errors": ["SWSD state write failed; reroute tool was not executed."]},
-                "explanation": "SWSD state write failed. This reroute was stopped to avoid workflow drift; please retry.",
-            })
-            await self.send(
-                chat_id=session_id,
-                content=self._fallback_visible_content_for_fields("SWSD state write failed.", fields),
-                metadata={"is_final": True, "pcb_fields": fields},
-            )
-            return True
-        call_id = f"swsd_reroute_delete_{uuid.uuid4().hex[:8]}"
+        """Legacy WebSocket-owned reroute entry is intentionally disabled.
+
+        实时主路径必须是：WebSocket Adapter 只解析协议 -> SWSD Controller
+        -> reroute execute chain。不要在 WebSocket 层重新主控 delete/reroute/report。
+        """
+        raise RuntimeError("legacy websocket reroute path is disabled; use SWSD reroute execute chain")
+
+    async def _run_swsd_backend_reroute_tool(self, session_id: str, project_id: str, arguments: Dict[str, Any]) -> None:
+        """Run backend reroute tool for SWSD; WebSocket only bridges the result."""
         try:
-            await self.send_tool_call(
-                session_id=session_id,
-                call_id=call_id,
-                tool_name="deleteTracesForRerouting",
-                arguments={},
-                timeout=360.0,
+            from tools import pcb_tools
+
+            transport = pcb_tools.WebSocketTransportSingleton.get_instance()
+            transport.current_session_id = session_id
+            transport.set_session_mode(session_id, _ROUTE_MODE_PCB)
+            if project_id:
+                transport.bind_project(session_id, project_id)
+            reroute_json = await asyncio.to_thread(
+                pcb_tools.reroute,
+                json.dumps(arguments or {}, ensure_ascii=False),
+                session_id,
             )
-            return True
+            await self._swsd_runtime_bridge.handle_reroute_tool_result(
+                {"type": "tool-results", "sessionId": session_id, "projectid": project_id, "body": {"sessionId": session_id, "projectid": project_id}},
+                reroute_json,
+            )
         except Exception as exc:
-            logger.warning("Direct SWSD reroute delete step failed: session=%s error=%s", session_id, exc)
-            fields = minimal_reroute_final({
-                "rerouteResult": {"status": "needs_selection", "recoverable": True, "reason": str(exc)},
-                "checkReport": {"passed": False, "errors": [str(exc)]},
-                "explanation": "未能获取框选走线，请重新框选需要拆线重布的走线后再试。",
-            })
-            await self.send(
-                chat_id=session_id,
-                content=self._fallback_visible_content_for_fields("未能获取框选走线。", fields),
-                metadata={"is_final": True, "pcb_fields": fields},
+            await self._swsd_runtime_bridge.handle_reroute_tool_result(
+                {"type": "tool-results", "sessionId": session_id, "projectid": project_id, "body": {"sessionId": session_id, "projectid": project_id}},
+                {"explanation": f"拆线重布生成失败：{exc}", "checkReport": {"passed": False, "errors": [str(exc)]}},
             )
-            return True
+
     def _resolve_tool_result(self, data: Dict[str, Any]):
         """收到 tool-results 时，解析 call_id，resolve 对应的 Future。
 
@@ -2750,12 +2753,20 @@ class WebSocketAdapter(BasePlatformAdapter):
         else:
             logger.warning("No pending tool call for id: %s", call_id)
 
-        if tool_name == "deleteTracesForRerouting":
+        if tool_name in {"deleteTracesForRerouting", "importLines", "getProjectData"}:
             loop = self._gateway_loop or asyncio.get_event_loop()
-            loop.create_task(self._complete_reroute_after_delete_tool_result(data, result))
+            loop.create_task(self._complete_swsd_tool_result(data, tool_name, result))
 
-    async def _complete_reroute_after_delete_tool_result(self, data: Dict[str, Any], result: Any) -> None:
-        await self._swsd_runtime_bridge.handle_reroute_delete_result(data, result)
+    async def _complete_swsd_tool_result(self, data: Dict[str, Any], tool_name: str, result: Any) -> None:
+        if tool_name == "deleteTracesForRerouting":
+            await self._swsd_runtime_bridge.handle_reroute_delete_result(data, result)
+        elif tool_name == "importLines":
+            await self._swsd_runtime_bridge.handle_reroute_import_result(data, result)
+        elif tool_name == "getProjectData":
+            session_id = str((data.get("body") or {}).get("sessionId") or data.get("sessionId") or "")
+            active_workflow, active_state = self._active_workflow_state(session_id)
+            if active_workflow == _SWSD_REROUTE_FLOW and active_state == "import":
+                await self._swsd_runtime_bridge.handle_reroute_project_data_refresh_result(data, result)
     def _maybe_read_file_result(self, call_id: str, result: Any) -> Any:
         """
         若 BOARD_DATA_USE_FILE_PATH=1 且本次调用是 getProjectData，
@@ -4306,9 +4317,10 @@ class WebSocketAdapter(BasePlatformAdapter):
                 "select_bga": 1,
                 "layer_assign": 2,
                 "escape_order": 3,
-                "routing": 4,
-                "review": 5,
-                "import": 6,
+                "param_review": 4,
+                "routing": 5,
+                "review": 6,
+                "import": 7,
             },
             _SWSD_REROUTE_FLOW: {
                 "idle": 0,
@@ -4566,7 +4578,7 @@ class WebSocketAdapter(BasePlatformAdapter):
             allow_state_recovery = self._allows_inbound_body_state_recovery(
                 session_id,
                 target_workflow_id=_SWSD_ESCAPE_FLOW,
-                target_state="review",
+                target_state="param_review",
             )
             self._remember_fanout_params_from_frontend(session_id, fanout_params, update_state=allow_state_recovery)
             if allow_state_recovery:
@@ -4575,7 +4587,7 @@ class WebSocketAdapter(BasePlatformAdapter):
                 self._swsd_update(
                     session_id,
                     _SWSD_ESCAPE_FLOW,
-                    "review",
+                    "param_review",
                     self._swsd_escape_payload(session_id, {"recoveredFromBody": True}),
                     event_type="experience_recovery",
                     intent="recover_fanout_params",
@@ -6049,3 +6061,4 @@ class WebSocketAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "websocket", "chat_id": chat_id}
+

@@ -39,7 +39,7 @@ def test_decision_policy_accepts_only_legal_high_confidence_candidate():
     )
 
     assert decision.action == "modify_params"
-    assert decision.reason == "candidate_accepted"
+    assert decision.reason == "candidate_evidence"
     assert decision.rejected_candidates[0].action == "reroute_again"
 
 
