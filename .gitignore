@@ -42,3 +42,7 @@ Thumbs.db
 # Model weights and inference outputs
 explain_model/model/*.pt
 explain_model/explain_code/inference_runs/
+
+# Local learning notes
+docs/agent_design_notes.md
+docs/langgraph_research_figure_prompt.md

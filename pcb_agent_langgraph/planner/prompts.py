@@ -82,7 +82,7 @@ def planner_system_prompt() -> str:
         "If project data is completed but layer assignment is not completed, call layer_assign. "
         "If layer assignment is completed but escape order is not completed, call escape_order. "
         "If escape order is completed but fanout route is not completed, call fanout_route. "
-        "If fanout route is completed and import file exists, stop with action route_review and no tool_calls until user confirms import. "
+        "If fanout route is completed and import file exists, call importLines directly; the frontend importLines approval UI is the only import confirmation. "
         "After fanout importLines succeeds, stop with result_review/report; never call drc_check or explainability_report for fanout. "
         "For reroute, after deleteTracesForRerouting completes, call compress_reroute_context before reroute; after user confirms, call reroute first, then drc_check/explainability_report, retry reroute with DRC feedback up to 3 attempts before help_planner. "
         "Example: {\"intent\":\"global_fanout\",\"workflow\":\"pcb_escape_flow\",\"action\":\"get_project\","

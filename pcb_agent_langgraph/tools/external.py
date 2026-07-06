@@ -263,6 +263,10 @@ class ExternalProgramTool:
         work_dir = self._work_dir(context) / "help_planner"
         pcbrouter_bin = _resolve_path(self.config.root, self.config.router.pcbrouter_bin)
         source_board_path = _source_board_path(context)
+        input_error = _help_planner_input_error(project_data, source_board_path)
+        if input_error:
+            diagnostics = _help_planner_diagnostics(work_dir, pcbrouter_bin, source_board_path)
+            return {"status": "failed", "tool": self.name, "reason": input_error, "routeParams": route_params, **diagnostics}
         try:
             module = _load_module("_pcb_agent_langgraph_local_router", self.config.root / "tools" / "pcb_local_router.py")
             old_bin = os.environ.get("PCBROUTER_BIN")
@@ -568,6 +572,21 @@ def _command_summary(completed: dict[str, Any]) -> dict[str, Any]:
         "stderr": str(completed.get("stderr") or "")[:1600],
     }
 
+
+# ====== 功能：校验 help_planner 是否拿到了真实 KiCad 输入，而不是 export.txt 路径。
+def _help_planner_input_error(project_data: str, source_board_path: str) -> str:
+    source = Path(str(source_board_path or "")) if source_board_path else None
+    if source and source.is_file() and source.suffix.lower() == ".kicad_pcb":
+        return ""
+    text = str(project_data or "").strip()
+    maybe_path = Path(text) if text and len(text) < 260 else None
+    if maybe_path and maybe_path.suffix.lower() == ".kicad_pcb" and maybe_path.is_file():
+        return ""
+    if maybe_path and maybe_path.suffix.lower() == ".txt":
+        return f"help_planner requires KiCad .kicad_pcb input; got PCB Builder/export txt path: {maybe_path}"
+    if re.search(r"(?is)^\s*\(\s*kicad_pcb\b", text):
+        return ""
+    return "help_planner requires KiCad .kicad_pcb input; current projectData is not KiCad board text"
 
 # ====== 功能：汇总 help_planner 失败时最关键的本地诊断路径。 ======
 def _help_planner_diagnostics(work_dir: Path, pcbrouter_bin: Path, source_board_path: str) -> dict[str, Any]:
@@ -945,6 +964,7 @@ def _build_report(drc_result: Any) -> str:
     if passed:
         return "DRC passed. No hard-rule violations were reported."
     return f"DRC status={status}; errors={json.dumps(errors, ensure_ascii=False)}"
+
 
 
 

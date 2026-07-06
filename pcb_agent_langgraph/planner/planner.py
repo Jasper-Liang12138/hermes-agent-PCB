@@ -199,13 +199,9 @@ class PCBPlanner:
                 return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "wait_fanout_params_confirm", "tool_calls": [], "response": "当前正在等待 fanout 参数确认。请在参数面板确认/修改后提交，或回复“确认”开始布线。", "entities": entities}
             if not cache.get("fanout_routeResult"):
                 return self._with_calls("global_fanout", "pcb_escape_flow", "route", [{"name": "fanout_route", "arguments": _fanout_args(entities), "timeout": 1800.0}])
-            import_file = self._extract_import_file(cache.get("fanout_routeResult"))
-            if import_file and not cache.get("importLinesResult") and workflow_state != "review":
-                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "route_review", "tool_calls": [], "response": "逃逸布线已生成，请确认是否导入到 PCB 版图。", "entities": entities}
-            if import_file and not cache.get("importLinesResult") and workflow_state == "review" and _is_reject_import_text(text):
+            if cache.get("importLinesRejected"):
                 return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "cancel_import", "tool_calls": [], "response": "已取消导入，fanout 结果保留在文件中。", "entities": entities}
-            if import_file and not cache.get("importLinesResult") and workflow_state == "review" and not _is_confirm_text(text):
-                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "wait_route_import_confirm", "tool_calls": [], "response": "当前正在等待导入确认。请回复“确认导入”执行导入，或回复“取消导入”。", "entities": entities}
+            import_file = self._extract_import_file(cache.get("fanout_routeResult"))
             if import_file and not cache.get("importLinesResult"):
                 return self._with_calls("global_fanout", "pcb_escape_flow", "import", [{"name": "importLines", "arguments": {"filePath": import_file, "successPins": [], "failedPins": []}, "timeout": 360.0}])
             if cache.get("importLinesResult"):
@@ -242,8 +238,7 @@ class PCBPlanner:
             calls, action = self._repair_model_calls(intent, workflow, entities, state)
         else:
             action = data.get("action") or "plan"
-        calls, action = _guard_model_confirmation_stops(calls, action, workflow, state)
-        return {
+        plan = {
             "intent": intent,
             "workflow": workflow,
             "action": action,
@@ -252,6 +247,7 @@ class PCBPlanner:
             "reason": data.get("reason") or "",
             "entities": entities,
         }
+        return validate_next_step(state, plan, self)
 
     # ====== 功能：当模型只返回实体参数时，根据 LangGraph 状态补出下一步工具调用。 ======
     def _repair_model_calls(self, intent: str, workflow: str, entities: dict[str, Any], state: PCBState) -> tuple[list[ToolCall], str]:
@@ -273,9 +269,11 @@ class PCBPlanner:
                 return [self._tool_call({"name": "escape_order", "arguments": args, "timeout": 360.0})], "escape_order"
             if not cache.get("fanout_routeResult"):
                 return [], "fanout_params_review"
+            if cache.get("importLinesRejected"):
+                return [], "cancel_import"
             import_file = self._extract_import_file(cache.get("fanout_routeResult"))
             if import_file and not cache.get("importLinesResult"):
-                return [], "route_review"
+                return [self._tool_call({"name": "importLines", "arguments": {"filePath": import_file, "successPins": [], "failedPins": []}, "timeout": 360.0})], "import"
             return [], "finish"
 
         if intent == "reroute" or workflow == "pcb_reroute_flow":
@@ -508,7 +506,7 @@ def _state_prompt(state: PCBState) -> str:
         },
         "fanoutEntities": cache.get("fanoutEntities") or cache.get("fanoutParams") or {},
         "next_step_rules": [
-            "global_fanout 顺序：getProjectData -> pcb_extra_bga/selection -> router选择(135或arc) -> layer_assign -> escape_order -> fanoutParams确认 -> fanout_route -> 导入确认(不生成报告) -> importLines -> result_review(生成本轮work_dir报告)；fanout 不调用 DRC/Explainability",
+            "global_fanout 顺序：getProjectData -> pcb_extra_bga/selection -> router选择(135或arc) -> layer_assign -> escape_order -> fanoutParams确认 -> fanout_route -> importLines(由前端工具审批确认/拒绝) -> result_review(导入成功后生成本轮work_dir报告)；fanout 不调用 DRC/Explainability",
             "reroute 顺序：deleteTracesForRerouting -> compress_reroute_context -> 用户确认 -> reroute -> drc_check/explainability_report -> DRC失败则带反馈重试reroute最多3轮 -> help_planner兜底 -> report确认 -> importLines",
             "用户指定 U5/U22 等器件时直接作为 selectedBGA，不要再要求选择 BGA",
             "用户指定线宽线距时写入 entities.constraints.LineWidth 和 LineSpacing，并传给工具 arguments.constraints",
@@ -531,31 +529,75 @@ def _state_prompt(state: PCBState) -> str:
 
 
 
-# ====== 功能：防止真实模型直接越过 v0.6 交互确认停点。 ======
-def _guard_model_confirmation_stops(calls: list[ToolCall], action: str, workflow: str, state: PCBState) -> tuple[list[ToolCall], str]:
-    cache = state.get("intermediate_cache", {}) or {}
-    workflow_state = state.get("workflow_state", "idle")
-    names = {call.get("name") for call in calls}
-    if workflow == "pcb_escape_flow":
-        if "fanout_route" in names and workflow_state != "param_review":
-            return [], "fanout_params_review"
-        if "fanout_route" in names and workflow_state == "param_review" and not cache.get("fanoutParamsConfirmed") and not _is_confirm_text(str(state.get("user_input") or "")):
-            return [], "wait_fanout_params_confirm"
-        if "importLines" in names and workflow_state != "review":
-            return [], "route_review"
-        if "importLines" in names and workflow_state == "review" and not _is_confirm_text(str(state.get("user_input") or "")):
-            return [], "wait_route_import_confirm"
-    if workflow == "pcb_reroute_flow":
-        if ({"reroute", "help_planner"} & names) and cache.get("rerouteContext") and not cache.get("rerouteResult") and workflow_state != "confirm":
-            return [], "reroute_context_ready"
-        if ({"reroute", "help_planner"} & names) and cache.get("rerouteContext") and not cache.get("rerouteResult") and workflow_state == "confirm" and not _is_confirm_text(str(state.get("user_input") or "")):
-            return [], "wait_reroute_confirm"
-        if "importLines" in names and workflow_state != "report":
-            return [], "reroute_report"
-        if "importLines" in names and workflow_state == "report" and not _is_confirm_text(str(state.get("user_input") or "")):
-            return [], "wait_reroute_import_confirm"
-    return calls, action
+# ====== 功能：把模型 planner 输出约束到当前 LangGraph 状态允许的合法下一步。 ======
+def validate_next_step(state: PCBState, plan: PlannerOutput, planner: PCBPlanner) -> PlannerOutput:
+    workflow = str(plan.get("workflow") or "")
+    if workflow not in {"pcb_escape_flow", "pcb_reroute_flow"}:
+        return plan
 
+    legal = planner._rule_plan(_state_with_model_entities(state, plan))
+    if not _plan_step_matches(plan, legal):
+        rewritten = dict(legal)
+        rewritten["planner_source"] = plan.get("planner_source", "model")
+        rewritten["model_action"] = plan.get("action")
+        rewritten["model_tool_calls"] = plan.get("tool_calls") or []
+        rewritten["reason"] = _append_reason(plan.get("reason"), "model step was outside legal LangGraph transition; rewritten by validate_next_step")
+        if plan.get("entities"):
+            rewritten["entities"] = plan.get("entities")
+            safe_entities = (_state_with_model_entities(state, plan).get("intermediate_cache", {}) or {}).get("fanoutEntities") or {}
+            rewritten["tool_calls"] = [_normalize_validated_call(call, safe_entities) for call in rewritten.get("tool_calls", [])]
+        return rewritten
+
+    checked = dict(plan)
+    safe_entities = (_state_with_model_entities(state, plan).get("intermediate_cache", {}) or {}).get("fanoutEntities") or {}
+    checked["tool_calls"] = [_normalize_validated_call(call, safe_entities) for call in checked.get("tool_calls", [])]
+    checked["validation"] = "legal"
+    return checked
+
+
+# ====== 功能：让规则状态机在校验模型计划时看到模型抽取到的实体。 ======
+def _state_with_model_entities(state: PCBState, plan: PlannerOutput) -> PCBState:
+    copied = dict(state)
+    cache = dict(copied.get("intermediate_cache", {}) or {})
+    # 合法转移只信任历史 cache 和用户明文抽取到的 BGA/router；模型猜测的 BGA/router 不能跳过 v0.6 交互停点。
+    text_entities = extract_fanout_entities(copied.get("user_input", ""))
+    model_entities = dict(plan.get("entities") or {})
+    model_constraints = model_entities.get("constraints") if isinstance(model_entities.get("constraints"), dict) else {}
+    entities = _merge_entities(cache.get("fanoutEntities"), text_entities)
+    if model_constraints:
+        entities = _merge_entities(entities, {"constraints": model_constraints})
+    if entities:
+        cache["fanoutEntities"] = entities
+    copied["intermediate_cache"] = cache
+    return copied
+
+
+# ====== 功能：判断模型建议和规则合法下一步是否等价。 ======
+def _plan_step_matches(plan: PlannerOutput, legal: PlannerOutput) -> bool:
+    plan_names = [str(call.get("name") or "") for call in plan.get("tool_calls", [])]
+    legal_names = [str(call.get("name") or "") for call in legal.get("tool_calls", [])]
+    if plan_names or legal_names:
+        return plan_names == legal_names
+    return str(plan.get("action") or "") == str(legal.get("action") or "")
+
+
+# ====== 功能：校验后给 fanout 工具调用补齐模型抽取的实体参数。 ======
+def _normalize_validated_call(call: ToolCall, entities: dict[str, Any]) -> ToolCall:
+    if not entities or call.get("name") not in {"layer_assign", "escape_order", "fanout_route"}:
+        return call
+    merged = dict(call)
+    args = dict(call.get("arguments") or {})
+    for key, value in _fanout_args(entities).items():
+        if value not in (None, "", [], {}) and key not in args:
+            args[key] = value
+    merged["arguments"] = args
+    return merged
+
+
+# ====== 功能：追加 planner 诊断原因。 ======
+def _append_reason(existing: Any, note: str) -> str:
+    text = str(existing or "").strip()
+    return f"{text}; {note}" if text else note
 
 
 

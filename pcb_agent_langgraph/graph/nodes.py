@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 from typing import Any
@@ -31,6 +31,17 @@ class GraphNodes:
     # ====== 功能：根据当前状态生成下一步执行计划。 ======
     async def plan(self, state: PCBState) -> dict[str, Any]:
         plan = self.planner.plan(state)
+        cache = state.get("intermediate_cache", {}) or {}
+        tool_names = [str(call.get("name")) for call in plan.get("tool_calls", []) if isinstance(call, dict)]
+        print(
+            "planner_decision "
+            f"source={plan.get('planner_source')} action={plan.get('action')} workflow={plan.get('workflow')} "
+            f"tools={tool_names} validation={plan.get('validation', '')} model_action={plan.get('model_action', '')} "
+            f"rerouteUnavailable={bool(cache.get('rerouteUnavailable'))} "
+            f"rerouteAttemptCount={cache.get('rerouteAttemptCount', 0)} "
+            f"drcResult={_result_brief(cache.get('drcResult'))} "
+            f"reason={plan.get('reason', '')}"
+        )
         return {
             "current_stage": "planning",
             "loop_count": int(state.get("loop_count", 0)) + 1,
@@ -120,6 +131,9 @@ class GraphNodes:
         elif action == "cancel_import":
             message = planner_output.get("response") or "已取消导入，fanout 结果保留在文件中。"
             workflow_state = "review"
+        elif task_type == "global_fanout" and cache.get("importLinesRejected"):
+            message = "已取消导入，fanout 结果保留在文件中。"
+            workflow_state = "result_review"
         elif failed and not final_drc_passed:
             message = _failure_message(task_type, failed[-1])
             workflow_state = "error"
@@ -247,12 +261,21 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
         if isinstance(result, dict) and isinstance(result.get("fanoutParams"), dict):
             cache["fanoutParams"] = result.get("fanoutParams")
     elif tool_name == "importLines":
-        cache["importLinesResult"] = result
+        if _import_lines_rejected(result):
+            cache["importLinesRejected"] = True
+            cache["importLinesRejectedReason"] = str(result)
+            cache.pop("importLinesResult", None)
+        else:
+            cache.pop("importLinesRejected", None)
+            cache.pop("importLinesRejectedReason", None)
+            cache["importLinesResult"] = result
     elif tool_name == "pcb_extra_bga":
         cache["bgaCandidates"] = (result or {}).get("components", []) if isinstance(result, dict) else []
     elif tool_name == "compress_reroute_context":
         cache["rerouteContext"] = result
     elif tool_name in {"fanout_route", "reroute"}:
+        if tool_name == "reroute":
+            print(f"reroute_result status={_result_status(result)} reason={_result_reason(result)} attempt={_result_attempt(result)} selectedNets={cache.get('selectedNets')} workDir={_result_work_dir(result)}")
         if tool_name == "reroute" and isinstance(result, dict) and str(result.get("status", "")).lower() == "unavailable":
             cache["rerouteUnavailable"] = True
             cache["rerouteUnavailableReason"] = result.get("reason") or "reroute unavailable"
@@ -296,12 +319,50 @@ def _nets_from_routes(routes: list[Any]) -> list[str]:
             nets.append(net)
     return nets
 
+# ====== 功能：生成日志用的工具结果简短状态。 ======
+def _result_brief(result: Any) -> str:
+    if not isinstance(result, dict):
+        return type(result).__name__ if result is not None else "none"
+    return str(result.get("status") or result.get("passed") or "dict")[:80]
+
+
+def _result_status(result: Any) -> str:
+    return str(result.get("status") if isinstance(result, dict) else type(result).__name__)
+
+
+def _result_reason(result: Any) -> str:
+    return str(result.get("reason") if isinstance(result, dict) else "")[:240]
+
+
+def _result_attempt(result: Any) -> Any:
+    return result.get("attempt") if isinstance(result, dict) else ""
+
+
+def _result_work_dir(result: Any) -> str:
+    if not isinstance(result, dict):
+        return ""
+    return str(result.get("workDir") or result.get("work_dir") or result.get("outputPath") or "")[:240]
+
+
 # ====== 功能：判断工具结果是否表示失败。 ======
 def _result_failed(result: Any) -> bool:
+    if _import_lines_rejected(result):
+        return True
     return isinstance(result, dict) and (
         str(result.get("status", "")).lower() in {"failed", "error"}
         or result.get("passed") is False
     )
+
+
+# ====== 功能：识别前端工具审批拒绝 importLines 的返回值。 ======
+def _import_lines_rejected(result: Any) -> bool:
+    if isinstance(result, str):
+        text = result.lower()
+        return any(token in text for token in ("refused", "rejected", "cancel", "denied", "拒绝", "取消", "不导入"))
+    if isinstance(result, dict):
+        text = str(result.get("status") or result.get("result") or result.get("message") or result.get("reason") or "").lower()
+        return any(token in text for token in ("refused", "rejected", "cancel", "denied", "拒绝", "取消", "不导入"))
+    return False
 
 
 # ====== 功能：生成工具失败时的用户可读提示。 ======
@@ -309,7 +370,38 @@ def _failure_message(task_type: str, record: dict[str, Any]) -> str:
     call = record.get("call", {})
     result = record.get("result")
     reason = record.get("error") or ((result or {}).get("reason") if isinstance(result, dict) else "")
-    return f"{task_type} 流程在工具 {call.get('name')} 处未完成：{reason or '工具返回失败'}"
+    message = f"{task_type} 流程在工具 {call.get('name')} 处未完成：{reason or '工具返回失败'}"
+    if isinstance(result, dict):
+        details = _failure_detail_lines(result)
+        if details:
+            message += "\n" + "\n".join(details)
+    return message
+
+
+# ====== 功能：提取工具失败时最关键的诊断字段，避免前端只显示 command failed。 ======
+def _failure_detail_lines(result: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in ("command", "workDir", "input_path", "output_path", "tool_path", "pcbrouterBin", "sourceBoardPath", "inputBoardPath", "inputCsvPath"):
+        value = result.get(key)
+        if value not in (None, "", [], {}):
+            lines.append(f"{key}: {_short_failure_value(value)}")
+    for key in ("stdout", "stderr", "stderrSummary"):
+        value = str(result.get(key) or "").strip()
+        if value:
+            lines.append(f"{key}: {_short_failure_value(value, 800)}")
+    fanout_params = result.get("fanoutParams") if isinstance(result.get("fanoutParams"), dict) else {}
+    for key in ("selectedBGA", "routerType"):
+        value = fanout_params.get(key)
+        if value not in (None, "", [], {}):
+            lines.append(f"{key}: {value}")
+    return lines
+
+
+# ====== 功能：缩短失败诊断字段，保证消息可读。 ======
+def _short_failure_value(value: Any, limit: int = 500) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
 # ====== 功能：把 DRC/解释失败压缩成下一轮 reroute 模型反馈。 ======
 def _reroute_feedback_summary(cache: dict[str, Any]) -> dict[str, Any]:
     drc = cache.get("drcResult") if isinstance(cache.get("drcResult"), dict) else {}
@@ -323,4 +415,3 @@ def _reroute_feedback_summary(cache: dict[str, Any]) -> dict[str, Any]:
         "explainStatus": explain.get("status"),
         "explainReason": explain.get("reason") or str(explain.get("report") or "")[:1200],
     }
-
