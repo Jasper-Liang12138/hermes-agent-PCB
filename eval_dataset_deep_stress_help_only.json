@@ -1,0 +1,45 @@
+[
+  {
+    "id": "reroute-drc-retry-help",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "拆线重布，如果 DRC 失败就继续修。",
+    "simulate_drc_failures": 3,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report",
+      "drc_check",
+      "explainability_report",
+      "drc_check",
+      "explainability_report",
+      "help_planner",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_min_tool_counts": [
+      {
+        "name": "drc_check",
+        "count": 4
+      },
+      {
+        "name": "help_planner",
+        "count": 1
+      }
+    ]
+  }
+]

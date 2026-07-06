@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.pyc
+
+# build files
+build/
+*.o
+*.exe
+*.dll
+
+# vscode
+.vscode/
+
+# system files
+.DS_Store
+Thumbs.db
+
+# log
+*.log

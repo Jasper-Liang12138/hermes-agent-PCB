@@ -1,0 +1,74 @@
+﻿[
+  {
+    "id": "full-qa-drc-report",
+    "projectid": "stress-project-001",
+    "task_type": "qa",
+    "turns": ["解释一下为什么当前 DRC 不通过，需要生成分析思路。"],
+    "expected_tool_order": ["drc_check", "explainability_report"],
+    "expected_final_contains": "我会检查当前 DRC"
+  },
+  {
+    "id": "full-fanout-e2e",
+    "projectid": "stress-project-001",
+    "task_type": "global_fanout",
+    "turns": ["帮我对 U1 重新逃逸 Fanout。"],
+    "expected_tool_order": ["getProjectData", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check"],
+    "expected_final_contains": "Fanout、导入和 DRC 检查已完成"
+  },
+  {
+    "id": "full-reroute-e2e",
+    "projectid": "stress-project-001",
+    "task_type": "reroute",
+    "turns": ["把 DDR 那几根线拆线重布一下。"],
+    "expected_tool_order": ["deleteTracesForRerouting", "reroute", "importLines", "drc_check", "explainability_report"],
+    "expected_final_contains": "局部拆线重布、导入、DRC 和分析报告已完成"
+  },
+  {
+    "id": "multi-fanout-chat-rerun",
+    "projectid": "stress-project-002",
+    "task_type": "global_fanout",
+    "turns": [
+      "帮我 Fanout。",
+      "刚才做了哪些步骤，解释一下当前状态。",
+      "不满意，重新 Fanout。"
+    ],
+    "expected_tool_order": ["getProjectData", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check"],
+    "expected_final_contains": "Fanout、导入和 DRC 检查已完成"
+  },
+  {
+    "id": "multi-fanout-two-reruns",
+    "projectid": "stress-project-003",
+    "task_type": "global_fanout",
+    "turns": [
+      "帮我做 BGA 逃逸。",
+      "线宽改一下，重新来一次 Fanout。",
+      "再重来一次 Fanout。"
+    ],
+    "expected_tool_order": ["getProjectData", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check"],
+    "expected_final_contains": "Fanout、导入和 DRC 检查已完成"
+  },
+  {
+    "id": "multi-reroute-chat-rerun",
+    "projectid": "stress-project-004",
+    "task_type": "reroute",
+    "turns": [
+      "把选中的 DDR 线拆线重布。",
+      "解释一下刚才 reroute 做了什么。",
+      "不满意，重新拆线重布。"
+    ],
+    "expected_tool_order": ["deleteTracesForRerouting", "reroute", "importLines", "drc_check", "explainability_report", "deleteTracesForRerouting", "reroute", "importLines", "drc_check", "explainability_report"],
+    "expected_final_contains": "局部拆线重布、导入、DRC 和分析报告已完成"
+  },
+  {
+    "id": "workflow-cancel-then-fanout",
+    "projectid": "stress-project-005",
+    "task_type": "global_fanout",
+    "turns": [
+      "帮我 Fanout。",
+      "取消当前流程。",
+      "重新帮我 Fanout。"
+    ],
+    "expected_tool_order": ["getProjectData", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check", "layer_assign", "escape_order", "fanout_route", "importLines", "drc_check"],
+    "expected_final_contains": "Fanout、导入和 DRC 检查已完成"
+  }
+]

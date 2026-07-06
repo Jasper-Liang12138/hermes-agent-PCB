@@ -1,0 +1,3 @@
+```kicad
+(segment (start 1 1) (end 2 2) (width 0.2) (layer Top) (net 1))
+```

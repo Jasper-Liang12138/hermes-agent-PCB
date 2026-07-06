@@ -1,0 +1,44 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# Local runtime and generated work directories
+runtime/
+eval_runs/
+router_work/
+bga_extract_work/
+drc_work/
+
+# Local configuration and secrets
+config.live.ini
+*.local.ini
+.env
+.env.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
+
+# Model weights and inference outputs
+explain_model/model/*.pt
+explain_model/explain_code/inference_runs/

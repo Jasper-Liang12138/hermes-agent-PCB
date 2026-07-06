@@ -1,0 +1,16 @@
+﻿[
+  {
+    "id": "fanout-sim-e2e",
+    "projectid": "sim-project-001",
+    "task_type": "global_fanout",
+    "prompt": "帮我重新逃逸 Fanout。",
+    "board_data": "COMPONENT U1 BGA pins=256 NET DDR_DQ0 DDR_DQ1 DDR_CLK"
+  },
+  {
+    "id": "reroute-sim-e2e",
+    "projectid": "sim-project-001",
+    "task_type": "reroute",
+    "prompt": "把 DDR 那几根线拆线重布一下。",
+    "selected_nets": ["DDR_DQ0", "DDR_DQ1"]
+  }
+]

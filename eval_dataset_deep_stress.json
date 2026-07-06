@@ -1,0 +1,722 @@
+[
+  {
+    "id": "fanout-u5-skip-bga-135",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "对 U5 进行 135 逃逸布线，线宽 4，线距 3。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "getProjectData",
+        "path": "selectedBGA",
+        "equals": "U5"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_135"
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 4
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 3
+      }
+    ]
+  },
+  {
+    "id": "fanout-u22-rule-default",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "请对 U22 做 rule 逃逸布线。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "selectedBGA",
+        "equals": "U22"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_135"
+      }
+    ]
+  },
+  {
+    "id": "fanout-arc-width-spacing",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "使用 arc 布线器给 U1 逃逸，线宽 5 线距 4。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_arc"
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 5
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 4
+      }
+    ]
+  },
+  {
+    "id": "fanout-135-natural-language",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "帮我把 U3 扇出，走 135 度，宽度 6 spacing 2。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "selectedBGA",
+        "equals": "U3"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_135"
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 6
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 2
+      }
+    ]
+  },
+  {
+    "id": "fanout-bga-generic",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "帮我做 BGA 逃逸 fanout。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": []
+  },
+  {
+    "id": "fanout-report-markdown",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "完成一次 fanout 后给我 DRC 和可解释性报告。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": []
+  },
+  {
+    "id": "reroute-basic-ddr",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "把 DDR_DQ0 和 DDR_DQ1 拆线重布。",
+    "simulate_drc_failures": 0,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ]
+  },
+  {
+    "id": "reroute-selected-lines",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "对当前选中的线进行局部 reroute。",
+    "simulate_drc_failures": 0,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ]
+  },
+  {
+    "id": "reroute-ripup-english",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "Rip-up selected nets and reroute them locally.",
+    "simulate_drc_failures": 0,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ]
+  },
+  {
+    "id": "reroute-drc-retry-help",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "拆线重布，如果 DRC 失败就继续修。",
+    "simulate_drc_failures": 3,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report",
+      "drc_check",
+      "explainability_report",
+      "drc_check",
+      "explainability_report",
+      "help_planner",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_min_tool_counts": [
+      {
+        "name": "drc_check",
+        "count": 4
+      },
+      {
+        "name": "help_planner",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "id": "multi-fanout-chat-continue",
+    "projectid": "stress-project-multi-001",
+    "task_type": "global_fanout",
+    "turns": [
+      "对 U5 做 135 fanout，线宽 4 线距 3。",
+      "刚才做了哪些步骤？",
+      "继续完成。"
+    ],
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_tool_counts": [
+      {
+        "name": "fanout_route",
+        "count": 1
+      }
+    ],
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ]
+  },
+  {
+    "id": "multi-fanout-rerun-width",
+    "projectid": "stress-project-multi-002",
+    "task_type": "global_fanout",
+    "turns": [
+      "对 U5 做 fanout，线宽 4 线距 3。",
+      "不满意，线宽改成 6 线距 5，重新 fanout。"
+    ],
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_min_tool_counts": [
+      {
+        "name": "fanout_route",
+        "count": 2
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 6
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 5
+      }
+    ],
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ]
+  },
+  {
+    "id": "multi-fanout-switch-router",
+    "projectid": "stress-project-multi-003",
+    "task_type": "global_fanout",
+    "turns": [
+      "对 U8 用 135 fanout。",
+      "换成 arc，重新 fanout。"
+    ],
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_min_tool_counts": [
+      {
+        "name": "fanout_route",
+        "count": 2
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_arc"
+      }
+    ],
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ]
+  },
+  {
+    "id": "multi-reroute-chat-continue",
+    "projectid": "stress-project-multi-004",
+    "task_type": "reroute",
+    "turns": [
+      "把 DDR 相关线拆线重布。",
+      "解释一下现在状态。",
+      "继续。"
+    ],
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_tool_counts": [
+      {
+        "name": "reroute",
+        "count": 1
+      }
+    ],
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ]
+  },
+  {
+    "id": "multi-reroute-rerun",
+    "projectid": "stress-project-multi-005",
+    "task_type": "reroute",
+    "turns": [
+      "拆线重布选中 nets。",
+      "不满意，重新拆线重布。"
+    ],
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report",
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_min_tool_counts": [
+      {
+        "name": "reroute",
+        "count": 2
+      }
+    ],
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ]
+  },
+  {
+    "id": "fanout-u10-chinese-spacing",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "U10 逃逸，线宽7，安全间距4，用135。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "selectedBGA",
+        "equals": "U10"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_135"
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 7
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 4
+      }
+    ]
+  },
+  {
+    "id": "fanout-u11-arc-chinese",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "给 U11 做弧形走线 fanout。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "selectedBGA",
+        "equals": "U11"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_arc"
+      }
+    ]
+  },
+  {
+    "id": "fanout-u12-rule-width",
+    "projectid": "stress-project-fanout",
+    "task_type": "global_fanout",
+    "prompt": "U12 rule 逃逸，trace width 8，clearance 5。",
+    "expected_tool_order": [
+      "getProjectData",
+      "layer_assign",
+      "escape_order",
+      "fanout_route",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Fanout Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ],
+    "expected_tool_args": [
+      {
+        "name": "fanout_route",
+        "path": "selectedBGA",
+        "equals": "U12"
+      },
+      {
+        "name": "fanout_route",
+        "path": "routerType",
+        "equals": "rule_135"
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineWidth",
+        "equals": 8
+      },
+      {
+        "name": "fanout_route",
+        "path": "constraints.LineSpacing",
+        "equals": 5
+      }
+    ]
+  },
+  {
+    "id": "reroute-local-area",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "局部重布这几根有问题的线。",
+    "simulate_drc_failures": 0,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ]
+  },
+  {
+    "id": "reroute-drc-one-retry",
+    "projectid": "stress-project-reroute",
+    "task_type": "reroute",
+    "prompt": "拆线重布并检查 DRC。",
+    "simulate_drc_failures": 1,
+    "expected_tool_order": [
+      "deleteTracesForRerouting",
+      "compress_reroute_context",
+      "reroute",
+      "importLines",
+      "drc_check",
+      "explainability_report"
+    ],
+    "expected_final_contains": "PCB Reroute Report",
+    "expected_markdown_contains": [
+      "## DRC",
+      "## Explainability"
+    ],
+    "expected_state_values": [
+      {
+        "path": "report_payload.drcPassed",
+        "equals": true
+      }
+    ]
+  }
+]

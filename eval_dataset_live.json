@@ -1,0 +1,20 @@
+﻿[
+  {
+    "id": "qa-drc-explain-live",
+    "projectid": "local-live-project",
+    "task_type": "qa",
+    "prompt": "解释一下为什么当前 DRC 不通过，需要给我检查思路。"
+  },
+  {
+    "id": "fanout-live-no-eda",
+    "projectid": "local-live-project",
+    "task_type": "global_fanout",
+    "prompt": "帮我重新逃逸 Fanout。"
+  },
+  {
+    "id": "reroute-live-no-eda",
+    "projectid": "local-live-project",
+    "task_type": "reroute",
+    "prompt": "把 DDR 那几根线拆线重布一下。"
+  }
+]

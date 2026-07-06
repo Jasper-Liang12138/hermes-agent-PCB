@@ -1,0 +1,15 @@
+[project]
+name = "pcb-agent-langgraph"
+version = "0.1.0"
+description = "LangGraph based PCB agent replacing Hermes SWSD workflow control."
+requires-python = ">=3.10"
+dependencies = [
+  "langgraph>=0.2.60",
+  "langchain-core>=0.3.0",
+  "websockets>=12.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+

@@ -1,0 +1,8 @@
+﻿[
+  {
+    "id": "qa-drc-explain-smoke",
+    "projectid": "local-smoke-project",
+    "task_type": "qa",
+    "prompt": "解释一下为什么当前 DRC 不通过，需要给我检查思路。"
+  }
+]
