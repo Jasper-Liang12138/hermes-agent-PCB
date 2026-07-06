@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import importlib.util
@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -208,10 +209,10 @@ class ExternalProgramTool:
     async def _run_reroute(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0)
         if not self.config.model.base_url or not self.config.model.model:
-            return {"status": "unavailable", "tool": self.name, "reason": "reroute model is not configured"}
+            return {"status": "unavailable", "tool": self.name, "reason": "reroute model is not configured", "failureStage": "model_config", "failureType": "model_unavailable"}
         project_data = _project_data_text(context)
         if not project_data:
-            return {"status": "failed", "tool": self.name, "reason": "missing board data for reroute"}
+            return {"status": "failed", "tool": self.name, "reason": "missing board data for reroute", "failureStage": "input", "failureType": "missing_board_data"}
         attempt = int(arguments.get("attempt") or 0) or int(context.get("rerouteAttemptCount") or 0) + 1
         work_dir = self._work_dir(context) / "reroute" / f"attempt_{attempt}"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -231,7 +232,7 @@ class ExternalProgramTool:
             model = PCBModel(self.config.model)
             model_result = await asyncio.to_thread(model.complete, messages)
         except Exception as exc:
-            return {"status": "unavailable", "tool": self.name, "reason": f"reroute model call failed: {exc}", "attempt": attempt}
+            return {"status": "unavailable", "tool": self.name, "reason": f"reroute model call failed: {exc}", "attempt": attempt, "failureStage": "model_call", "failureType": "model_unavailable", "selectedNets": prompt_payload.get("selectedNets") or [], "rawSummary": str(exc), "tracebackSummary": _traceback_summary(exc), "workDir": str(work_dir)}
         parsed = _loads_json_object(model_result.content) or {"content": model_result.content}
         routed_text = _first_text(parsed.get("routedText"), parsed.get("content"), parsed.get("report"), model_result.content)
         output_path = work_dir / "reroute_output.txt"
@@ -249,6 +250,8 @@ class ExternalProgramTool:
             "modelRaw": parsed,
             "workDir": str(work_dir),
             "elapsedMs": model_result.elapsed_ms,
+            "selectedNets": prompt_payload.get("selectedNets") or [],
+            "rawSummary": str(model_result.content or "")[:1200],
         }
 
     # ====== 功能：调用兜底局部规则布线器 help_planner。 ======
@@ -300,7 +303,9 @@ class ExternalProgramTool:
             }
         except Exception as exc:
             diagnostics = _help_planner_diagnostics(work_dir, pcbrouter_bin, source_board_path)
-            return {"status": "failed", "tool": self.name, "reason": str(exc), "routeParams": route_params, **diagnostics}
+            tb = _traceback_summary(exc)
+            print(f"help_planner_exception traceback_summary={tb}")
+            return {"status": "failed", "tool": self.name, "reason": str(exc), "tracebackSummary": tb, "routeParams": route_params, **diagnostics}
 
 
     # ====== 功能：根据 router 类型选择真实 layer_assign 命令。 ======
@@ -573,6 +578,12 @@ def _command_summary(completed: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ====== 功能：压缩异常 traceback，保留文件名、行号和异常类型给前端诊断。
+def _traceback_summary(exc: BaseException) -> str:
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(lines)[-4000:]
+
 # ====== 功能：校验 help_planner 是否拿到了真实 KiCad 输入，而不是 export.txt 路径。
 def _help_planner_input_error(project_data: str, source_board_path: str) -> str:
     source = Path(str(source_board_path or "")) if source_board_path else None
@@ -584,7 +595,7 @@ def _help_planner_input_error(project_data: str, source_board_path: str) -> str:
         return ""
     if maybe_path and maybe_path.suffix.lower() == ".txt":
         return f"help_planner requires KiCad .kicad_pcb input; got PCB Builder/export txt path: {maybe_path}"
-    if re.search(r"(?is)^\s*\(\s*kicad_pcb\b", text):
+    if text.lstrip().lower().startswith("(kicad_pcb"):
         return ""
     return "help_planner requires KiCad .kicad_pcb input; current projectData is not KiCad board text"
 

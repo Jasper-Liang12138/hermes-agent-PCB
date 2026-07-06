@@ -179,14 +179,13 @@ def test_fanout_single_bga_candidate_returns_selection():
     assert plan["action"] == "select_bga"
     assert plan["selection"][0]["label"] == "U5"
 
-# ====== 功能：验证 reroute 上下文完成后先等待用户确认。 ======
-def test_reroute_after_context_waits_for_confirm_before_reroute():
+# ====== 功能：验证 reroute 上下文完成后直接进入主模型重布。 ======
+def test_reroute_after_context_calls_model_reroute_directly():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     state = {"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(use_model=False).plan(state)
-    assert plan["tool_calls"] == []
-    assert plan["action"] == "reroute_context_ready"
-
+    assert plan["action"] == "reroute"
+    assert plan["tool_calls"][0]["name"] == "reroute"
 # ====== 功能：验证唯一 BGA 自动进入参数生成后停在 fanoutParams 确认。 ======
 def test_fanout_single_bga_stops_for_fanout_params_review():
     cache = {
@@ -228,14 +227,12 @@ def test_fanout_route_result_calls_import_lines_directly():
     assert plan["tool_calls"][0]["name"] == "importLines"
     assert plan["tool_calls"][0]["arguments"]["filePath"] == "line.out"
 
-# ====== 功能：验证 reroute 上下文压缩后等待用户确认。 ======
-def test_reroute_context_waits_for_confirm():
+# ====== 功能：验证 reroute 上下文压缩后不再等待确认。 ======
+def test_reroute_context_calls_reroute_without_confirm():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["tool_calls"] == []
-    assert plan["action"] == "reroute_context_ready"
-
-
+    assert plan["action"] == "reroute"
+    assert plan["tool_calls"][0]["name"] == "reroute"
 # ====== 功能：验证普通消息不携带空 selection。 ======
 def test_agent_message_omits_none_selection():
     message = agent_message("s1", "p1", "正文", selection=None)
@@ -311,8 +308,8 @@ def test_model_layer_assign_before_router_rewritten_to_router_prompt():
     assert plan["action"] == "router_type_prompt"
 
 
-# ====== 功能：验证已有 rerouteContext 时模型重复 compress 会被改写为确认停点。 ======
-def test_model_repeated_compress_context_rewritten_to_confirm_stop():
+# ====== 功能：验证已有 rerouteContext 时模型重复 compress 会被改写为主模型重布。 ======
+def test_model_repeated_compress_context_rewritten_to_reroute():
     from pcb_agent_langgraph.models.pcb_model import ModelResult
 
     class FakeModel:
@@ -322,25 +319,8 @@ def test_model_repeated_compress_context_rewritten_to_confirm_stop():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}}
     state = {"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(model=FakeModel(), use_model=True, require_model=True).plan(state)
-    assert plan["tool_calls"] == []
-    assert plan["action"] == "reroute_context_ready"
-
-
-# ====== 功能：验证未确认 reroute 时模型越级 reroute 会被改写为等待确认。 ======
-def test_model_reroute_before_confirm_rewritten_to_wait_confirm():
-    from pcb_agent_langgraph.models.pcb_model import ModelResult
-
-    class FakeModel:
-        def complete(self, messages, temperature=0.0):
-            return ModelResult(content='{"intent":"reroute","workflow":"pcb_reroute_flow","tool_calls":[{"name":"reroute","arguments":{}}]}', raw={}, elapsed_ms=1.0, usage={})
-
-    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}}
-    state = {"user_input": "先等等", "workflow_state": "confirm", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
-    plan = PCBPlanner(model=FakeModel(), use_model=True, require_model=True).plan(state)
-    assert plan["tool_calls"] == []
-    assert plan["action"] == "wait_reroute_confirm"
-
-
+    assert plan["action"] == "reroute"
+    assert plan["tool_calls"][0]["name"] == "reroute"
 # ====== 功能：验证 help_planner 不会把 export.txt 伪装成 KiCad 输入。 ======
 def test_help_planner_rejects_export_txt_input():
     config = load_config("missing-config.ini")
@@ -349,3 +329,40 @@ def test_help_planner_rejects_export_txt_input():
     result = asyncio.run(tool.ainvoke({}, context))
     assert result["status"] == "failed"
     assert "requires KiCad .kicad_pcb input" in result["reason"]
+
+# ====== 功能：验证 fanout 实体跨轮保存，U5 后续选择 135 不会丢失目标 BGA。 ======
+def test_fanout_entities_persist_across_router_turn():
+    cache = PCBLangGraphAgent._cache_for_turn({"projectData": "board.txt"}, "帮我进行逃逸布线，U5", "idle")
+    cache = PCBLangGraphAgent._cache_for_turn(cache, "135", "wait_router_type")
+    assert cache["fanoutEntities"]["selectedBGA"] == "U5"
+    assert cache["fanoutEntities"]["routerType"] == "rule_135"
+    plan = PCBPlanner(use_model=False).plan({"user_input": "135", "workflow_state": "wait_router_type", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": cache})
+    assert plan["tool_calls"][0]["name"] == "layer_assign"
+    assert plan["tool_calls"][0]["arguments"]["selectedBGA"] == "U5"
+
+
+# ====== 功能：验证线宽线距会进入 fanoutEntities 并传给工具参数。 ======
+def test_fanout_width_spacing_persist_to_layer_assign():
+    cache = PCBLangGraphAgent._cache_for_turn({"projectData": "board.txt"}, "逃逸布线，U5，135，线宽 5 线距 4", "idle")
+    plan = PCBPlanner(use_model=False).plan({"user_input": "逃逸布线，U5，135，线宽 5 线距 4", "workflow_state": "idle", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": cache})
+    args = plan["tool_calls"][0]["arguments"]
+    assert args["constraints"] == {"LineWidth": 5, "LineSpacing": 4}
+
+
+# ====== 功能：验证拒绝导入后再次 fanout 会清理旧拒绝状态。 ======
+def test_new_fanout_clears_import_rejection_state():
+    cache = {"importLinesRejected": True, "importLinesRejectedReason": "user rejected", "fanout_routeResult": {"status": "ok"}, "importLinesResult": {"status": "ok"}}
+    cache = PCBLangGraphAgent._cache_for_turn(cache, "重新逃逸布线，U5", "result_review")
+    assert "importLinesRejected" not in cache
+    assert "importLinesRejectedReason" not in cache
+    assert "fanout_routeResult" not in cache
+    assert "importLinesResult" not in cache
+
+
+# ====== 功能：验证主 reroute unavailable 直接报告，不进入 help_planner。 ======
+def test_reroute_unavailable_does_not_call_help_planner():
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteUnavailable": True, "rerouteUnavailableReason": "model 401"}
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["tool_calls"] == []
+    assert plan["action"] == "reroute_unavailable"
+    assert "model 401" in plan["response"]

@@ -33,10 +33,15 @@ class GraphNodes:
         plan = self.planner.plan(state)
         cache = state.get("intermediate_cache", {}) or {}
         tool_names = [str(call.get("name")) for call in plan.get("tool_calls", []) if isinstance(call, dict)]
+        fanout_entities = cache.get("fanoutEntities") or {}
+        constraints = fanout_entities.get("constraints") if isinstance(fanout_entities, dict) else {}
         print(
             "planner_decision "
             f"source={plan.get('planner_source')} action={plan.get('action')} workflow={plan.get('workflow')} "
             f"tools={tool_names} validation={plan.get('validation', '')} model_action={plan.get('model_action', '')} "
+            f"selectedBGA={(fanout_entities or {}).get('selectedBGA', '')} "
+            f"routerType={(fanout_entities or {}).get('routerType', '')} "
+            f"constraints={constraints or {}} "
             f"rerouteUnavailable={bool(cache.get('rerouteUnavailable'))} "
             f"rerouteAttemptCount={cache.get('rerouteAttemptCount', 0)} "
             f"drcResult={_result_brief(cache.get('drcResult'))} "
@@ -122,6 +127,9 @@ class GraphNodes:
         elif action in {"route_review", "wait_route_import_confirm"}:
             message = planner_output.get("response") or "逃逸布线已生成，是否导入到 PCB 版图？请回复“确认导入”或“取消导入”。"
             workflow_state = "review"
+        elif action == "reroute_unavailable":
+            message = planner_output.get("response") or "主模型 reroute 不可用。"
+            workflow_state = "error"
         elif action in {"reroute_context_ready", "wait_reroute_confirm"}:
             message = planner_output.get("response") or "已完成拆线重布上下文压缩，请确认是否开始局部重布。"
             workflow_state = "confirm"
@@ -135,7 +143,7 @@ class GraphNodes:
             message = "已取消导入，fanout 结果保留在文件中。"
             workflow_state = "result_review"
         elif failed and not final_drc_passed:
-            message = _failure_message(task_type, failed[-1])
+            message = _failure_message(task_type, failed[-1], cache)
             workflow_state = "error"
         elif task_type == "global_fanout":
             if cache.get("importLinesResult"):
@@ -167,6 +175,13 @@ class GraphNodes:
             markdown_report = str(report_payload.get("markdown") or "")
             if markdown_report:
                 message = markdown_report
+        if task_type == "reroute" and (failed or action == "reroute_unavailable" or cache.get("rerouteUnavailable")):
+            diagnostics = _reroute_diagnostics(cache, failed[-1] if failed else None, action)
+            report_payload = dict(report_payload or {})
+            report_payload["task"] = "reroute"
+            report_payload["rerouteDiagnostics"] = diagnostics
+            if not markdown_report:
+                message = _reroute_failure_text(diagnostics, fallback=message)
         return {
             "current_stage": "reflection",
             "workflow_state": workflow_state,
@@ -275,7 +290,7 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
         cache["rerouteContext"] = result
     elif tool_name in {"fanout_route", "reroute"}:
         if tool_name == "reroute":
-            print(f"reroute_result status={_result_status(result)} reason={_result_reason(result)} attempt={_result_attempt(result)} selectedNets={cache.get('selectedNets')} workDir={_result_work_dir(result)}")
+            print(f"reroute_result status={_result_status(result)} reason={_result_reason(result)} attempt={_result_attempt(result)} selectedNets={cache.get('selectedNets')} workDir={_result_work_dir(result)} raw_summary={_result_summary(result)}")
         if tool_name == "reroute" and isinstance(result, dict) and str(result.get("status", "")).lower() == "unavailable":
             cache["rerouteUnavailable"] = True
             cache["rerouteUnavailableReason"] = result.get("reason") or "reroute unavailable"
@@ -338,6 +353,16 @@ def _result_attempt(result: Any) -> Any:
     return result.get("attempt") if isinstance(result, dict) else ""
 
 
+def _result_summary(result: Any) -> str:
+    if not isinstance(result, dict):
+        return str(result)[:400]
+    summary = result.get("rawSummary") or result.get("tracebackSummary") or result.get("modelRaw") or result.get("report") or result.get("reason") or result
+    try:
+        text = json.dumps(summary, ensure_ascii=False, default=str)
+    except TypeError:
+        text = str(summary)
+    return " ".join(text.split())[:800]
+
 def _result_work_dir(result: Any) -> str:
     if not isinstance(result, dict):
         return ""
@@ -366,7 +391,9 @@ def _import_lines_rejected(result: Any) -> bool:
 
 
 # ====== 功能：生成工具失败时的用户可读提示。 ======
-def _failure_message(task_type: str, record: dict[str, Any]) -> str:
+def _failure_message(task_type: str, record: dict[str, Any], cache: dict[str, Any] | None = None) -> str:
+    if task_type == "reroute":
+        return _reroute_failure_text(_reroute_diagnostics(cache or {}, record, ""))
     call = record.get("call", {})
     result = record.get("result")
     reason = record.get("error") or ((result or {}).get("reason") if isinstance(result, dict) else "")
@@ -377,6 +404,116 @@ def _failure_message(task_type: str, record: dict[str, Any]) -> str:
             message += "\n" + "\n".join(details)
     return message
 
+# ====== 功能：整理 reroute 失败诊断，供前端 reportPayload 直接展示。 ======
+def _reroute_diagnostics(cache: dict[str, Any], record: dict[str, Any] | None, action: str = "") -> dict[str, Any]:
+    record = record or {}
+    call = record.get("call", {}) if isinstance(record, dict) else {}
+    result = record.get("result") if isinstance(record, dict) else None
+    result_dict = result if isinstance(result, dict) else {}
+    tool_name = str(call.get("name") or result_dict.get("tool") or ("reroute" if cache.get("rerouteUnavailable") else ""))
+    reason = str(record.get("error") or result_dict.get("reason") or cache.get("rerouteUnavailableReason") or "未知原因")
+    status = str(result_dict.get("status") or ("unavailable" if cache.get("rerouteUnavailable") else "failed"))
+    stage = _reroute_stage_label(tool_name, action)
+    failure_type = str(result_dict.get("failureType") or _reroute_failure_type(tool_name, status, reason))
+    selected_nets = result_dict.get("selectedNets") or cache.get("selectedNets") or []
+    missing_routes = cache.get("missingRoutes") or []
+    diagnostics = {
+        "stage": stage,
+        "tool": tool_name,
+        "status": status,
+        "failureType": failure_type,
+        "reason": reason,
+        "attempt": result_dict.get("attempt") or cache.get("rerouteAttemptCount") or 0,
+        "selectedNets": selected_nets,
+        "missingRouteCount": len(missing_routes) if isinstance(missing_routes, list) else 0,
+        "workDir": result_dict.get("workDir") or result_dict.get("work_dir") or "",
+        "nextAction": _reroute_next_action(failure_type, tool_name),
+    }
+    for key in ("tracebackSummary", "command", "stdout", "stderr", "stderrSummary", "pcbrouterBin", "sourceBoardPath", "inputBoardPath", "inputCsvPath", "tool_path", "eval_root", "python", "code_dir", "checkpoint", "input"):
+        value = result_dict.get(key)
+        if value not in (None, "", [], {}):
+            diagnostics[key] = _short_failure_value(value, 1200 if key == "tracebackSummary" else 800)
+    if cache.get("rerouteDrcFailureCount") is not None:
+        diagnostics["drcFailureCount"] = cache.get("rerouteDrcFailureCount")
+    if cache.get("rerouteDrcFeedbackHistory"):
+        diagnostics["drcFeedbackHistory"] = cache.get("rerouteDrcFeedbackHistory")
+    return diagnostics
+
+
+# ====== 功能：把 reroute 诊断转成用户可读 final 文本。 ======
+def _reroute_failure_text(diagnostics: dict[str, Any], fallback: str = "") -> str:
+    if not diagnostics:
+        return fallback or "拆线重布失败：未返回诊断信息。"
+    lines = [
+        f"拆线重布在【{diagnostics.get('stage') or '未知阶段'}】未完成。",
+        f"原因：{diagnostics.get('reason') or '未知原因'}",
+        f"失败类型：{diagnostics.get('failureType') or 'unknown'}",
+    ]
+    if diagnostics.get("attempt"):
+        lines.append(f"尝试轮次：{diagnostics.get('attempt')}")
+    if diagnostics.get("selectedNets"):
+        lines.append(f"目标网络：{diagnostics.get('selectedNets')}")
+    if diagnostics.get("workDir"):
+        lines.append(f"工作目录：{diagnostics.get('workDir')}")
+    if diagnostics.get("inputBoardPath"):
+        lines.append(f"输入板文件：{diagnostics.get('inputBoardPath')}")
+    if diagnostics.get("inputCsvPath"):
+        lines.append(f"输入 CSV：{diagnostics.get('inputCsvPath')}")
+    if diagnostics.get("stderr"):
+        lines.append(f"stderr：{diagnostics.get('stderr')}")
+    if diagnostics.get("tracebackSummary"):
+        lines.append(f"traceback：{diagnostics.get('tracebackSummary')}")
+    if diagnostics.get("nextAction"):
+        lines.append(f"建议下一步：{diagnostics.get('nextAction')}")
+    return "\n".join(lines)
+
+
+def _reroute_stage_label(tool_name: str, action: str = "") -> str:
+    mapping = {
+        "deleteTracesForRerouting": "前端拆线",
+        "compress_reroute_context": "上下文压缩",
+        "reroute": "主模型重布",
+        "drc_check": "DRC 检查",
+        "explainability_report": "可解释性检查",
+        "help_planner": "兜底规则布线",
+        "importLines": "导入重布结果",
+    }
+    if action == "reroute_unavailable":
+        return "主模型重布"
+    return mapping.get(tool_name, tool_name or "未知阶段")
+
+
+def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
+    reason_lower = reason.lower()
+    if status.lower() == "unavailable":
+        return "model_unavailable"
+    if tool_name == "reroute":
+        return "model_reroute_failed"
+    if tool_name == "compress_reroute_context":
+        return "context_compression_failed"
+    if tool_name == "drc_check":
+        return "drc_failed"
+    if tool_name == "explainability_report":
+        return "explainability_failed"
+    if tool_name == "help_planner" and ("kicad" in reason_lower or "export.txt" in reason_lower):
+        return "invalid_kicad_input"
+    if tool_name == "help_planner":
+        return "help_planner_failed"
+    return "tool_failed"
+
+
+def _reroute_next_action(failure_type: str, tool_name: str) -> str:
+    if failure_type == "model_unavailable":
+        return "检查 [reroute-model] 的 base_url/model/api_key，或查看模型服务返回的 traceback。"
+    if failure_type == "context_compression_failed":
+        return "确认 deleteTracesForRerouting 返回了 projectData/missing_routes，且项目数据是可解析的 KiCad/板级文本。"
+    if failure_type == "invalid_kicad_input":
+        return "help_planner 需要 .kicad_pcb 输入；请先确认 export.txt 到 KiCad 输入的转换链路。"
+    if failure_type == "drc_failed":
+        return "三轮内会携带 DRC 反馈继续调用主模型；满三轮后才进入 help_planner。"
+    if tool_name == "help_planner":
+        return "查看 workDir、inputBoardPath、inputCsvPath 和 pcbrouter stderr。"
+    return "查看 reportPayload.rerouteDiagnostics 中的路径、stderr 和 tracebackSummary。"
 
 # ====== 功能：提取工具失败时最关键的诊断字段，避免前端只显示 command failed。 ======
 def _failure_detail_lines(result: dict[str, Any]) -> list[str]:

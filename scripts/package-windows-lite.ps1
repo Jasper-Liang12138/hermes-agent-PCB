@@ -1,4 +1,4 @@
-<#
+﻿<#
 轻量封装 PCB_AGENT_LangGraph Windows exe。
 默认打包 LangGraph Agent、配置、工具脚本、routers、DRC vendor、可解释性模型代码/权重和 explain Python runtime。
 不会复制旧 Hermes/SWSD 的 memories、skills；只带可解释性模型必需的 python_runtime，避免交付包过度臃肿。
@@ -16,6 +16,8 @@ param(
     [switch]$SkipExplainRuntime,
     [string]$ExplainRuntime = ".\runtime\explain_python",
     [string]$SourceExplainRuntime = "",
+    [switch]$CreateExplainRuntime,
+    [string]$ExplainRuntimePython = "",
     [switch]$Clean,
     [switch]$InstallPyInstaller,
     [switch]$InstallRequirements
@@ -42,6 +44,52 @@ function Copy-IfExists([string]$Source, [string]$Destination) {
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
     Write-Host "[copy] $Source -> $Destination"
+}
+
+function Get-RuntimePython([string]$RuntimePath) {
+    $embeddedPython = Join-Path $RuntimePath "python.exe"
+    if (Test-Path -LiteralPath $embeddedPython) { return $embeddedPython }
+    $venvPython = Join-Path $RuntimePath "Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython) { return $venvPython }
+    return ""
+}
+
+function Ensure-ExplainRuntime([string]$RuntimePath, [string]$SourceRuntimePath) {
+    $resolvedRuntime = Resolve-ProjectPath $RuntimePath
+    if (Test-Path -LiteralPath $resolvedRuntime) {
+        Write-Host "[runtime] Using project explain runtime: $resolvedRuntime"
+        return $resolvedRuntime
+    }
+
+    if ($SourceRuntimePath) {
+        $resolvedSource = Resolve-ProjectPath $SourceRuntimePath
+        if (Test-Path -LiteralPath $resolvedSource) {
+            Write-Host "[runtime] Copying source explain runtime into project runtime."
+            Copy-IfExists $resolvedSource $resolvedRuntime
+            return $resolvedRuntime
+        }
+        Write-Warning "Source explain runtime does not exist: $resolvedSource"
+    }
+
+    if (-not $CreateExplainRuntime) {
+        return ""
+    }
+
+    $builder = Join-Path $projectRoot "scripts\build_explain_runtime.ps1"
+    if (-not (Test-Path -LiteralPath $builder)) {
+        throw "Explain runtime builder not found: $builder"
+    }
+    $runtimePython = $ExplainRuntimePython
+    if (-not $runtimePython) { $runtimePython = $pythonPath }
+    Write-Host "[runtime] Creating explain runtime at $resolvedRuntime"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $builder -TargetRuntime $RuntimePath -Python $runtimePython -CreateVenv -InstallRequirements
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create explain runtime."
+    }
+    if (-not (Test-Path -LiteralPath $resolvedRuntime)) {
+        throw "Explain runtime was not created: $resolvedRuntime"
+    }
+    return $resolvedRuntime
 }
 
 $pythonPath = Resolve-ProjectPath $Python
@@ -112,21 +160,24 @@ if (-not $SkipRouters) { Copy-IfExists (Join-Path $projectRoot "routers") (Join-
 if (-not $SkipDrcVendor) { Copy-IfExists (Join-Path $projectRoot "vendor") (Join-Path $outPath "vendor") }
 if (-not $SkipExplainModel) { Copy-IfExists (Join-Path $projectRoot "explain_model") (Join-Path $outPath "explain_model") }
 if (-not $SkipExplainRuntime) {
-    $runtimeSource = Resolve-ProjectPath $ExplainRuntime
-    if (-not (Test-Path -LiteralPath $runtimeSource) -and $SourceExplainRuntime) {
-        $runtimeSource = Resolve-ProjectPath $SourceExplainRuntime
-    }
-    if (Test-Path -LiteralPath $runtimeSource) {
+    $runtimeSource = Ensure-ExplainRuntime $ExplainRuntime $SourceExplainRuntime
+    if ($runtimeSource -and (Test-Path -LiteralPath $runtimeSource)) {
         Copy-IfExists $runtimeSource (Join-Path $outPath "runtime\explain_python")
         $packageConfig = Join-Path $outPath "config.ini"
         if (Test-Path -LiteralPath $packageConfig) {
             $configText = Get-Content -Raw -Path $packageConfig
-            $configText = [regex]::Replace($configText, "(?m)^python_executable\s*=.*$", "python_executable = .\runtime\explain_python\python.exe")
+            $packageRuntime = Join-Path $outPath "runtime\explain_python"
+            $runtimePython = Get-RuntimePython $packageRuntime
+            $configRuntime = ".\runtime\explain_python\python.exe"
+            if ($runtimePython -like "*\Scripts\python.exe") {
+                $configRuntime = ".\runtime\explain_python\Scripts\python.exe"
+            }
+            $configText = [regex]::Replace($configText, "(?m)^python_executable\s*=.*$", "python_executable = $configRuntime")
             Set-Content -Path $packageConfig -Value $configText -Encoding UTF8
-            Write-Host "[config] explain_model.python_executable -> .\runtime\explain_python\python.exe"
+            Write-Host "[config] explain_model.python_executable -> $configRuntime"
         }
     } else {
-        Write-Warning "Explain runtime not found. Checked project runtime: $ExplainRuntime. Pass -SourceExplainRuntime to copy an existing runtime."
+        Write-Warning "Explain runtime not found. Checked project runtime: $ExplainRuntime. Pass -SourceExplainRuntime or -CreateExplainRuntime."
     }
 }
 
@@ -155,14 +206,4 @@ Write-Host "Start: $(Join-Path $outPath 'start.bat')"
 Write-Host "Stop: $(Join-Path $outPath 'stop-agent-api.bat')"
 Write-Host "Config: $(Join-Path $outPath 'config.ini')"
 Write-Host "Explain runtime: $(Join-Path $outPath 'runtime\explain_python')"
-
-
-
-
-
-
-
-
-
-
 

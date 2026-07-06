@@ -48,6 +48,19 @@ class PCBLangGraphAgent:
         next_cache = dict(cache or {})
         entities = dict(next_cache.get("fanoutEntities") or {})
         user_entities = extract_fanout_entities(user_input)
+        router_type = _router_choice_from_text(user_input)
+
+        # fanout 相关实体必须跨轮保存。比如用户第一轮说“U5”，第二轮只回复“135”，
+        # 后续 layer_assign 仍然要知道目标 BGA；线宽线距同理。
+        fanout_signal = _is_fanout_signal(user_input, user_entities, router_type)
+        if fanout_signal:
+            entities = _merge_fanout_entities(entities, user_entities)
+            if router_type:
+                entities["routerType"] = router_type
+            if entities:
+                next_cache["fanoutEntities"] = entities
+            for key in ("fanout_routeResult", "importLinesResult", "importLinesRejected", "importLinesRejectedReason", "fanoutParamsConfirmed"):
+                next_cache.pop(key, None)
 
         # BGA 选择阶段，用户/前端只要回复 U5/Uxx，就写入目标器件并保留原有约束。
         if workflow_state == "select_bga" and user_entities.get("selectedBGA"):
@@ -56,7 +69,6 @@ class PCBLangGraphAgent:
             next_cache["fanoutEntities"] = entities
 
         # router 选择阶段只接受 135 或 arc 两个可见选项，内部统一为 rule_135/rule_arc。
-        router_type = _router_choice_from_text(user_input)
         if workflow_state == "wait_router_type" and router_type:
             entities["routerType"] = router_type
             next_cache["fanoutEntities"] = entities
@@ -79,7 +91,7 @@ class PCBLangGraphAgent:
             for key in ("layerAssignResult", "escapeOrderResult", "fanout_routeResult", "importLinesResult", "drcResult", "explainabilityReport"):
                 next_cache.pop(key, None)
             edited_entities = dict(next_cache.get("fanoutEntities") or {})
-            edited_entities.update({k: v for k, v in user_entities.items() if v not in (None, "", [], {})})
+            edited_entities = _merge_fanout_entities(edited_entities, user_entities)
             if router_type:
                 edited_entities["routerType"] = router_type
             next_cache["fanoutEntities"] = edited_entities
@@ -87,13 +99,36 @@ class PCBLangGraphAgent:
         # 用户要求重来时，仅清理对应流程的阶段性结果，保留项目数据和其他上下文。
         if any(token in user_input for token in ("重新", "重来", "再来", "不满意")) or any(token in text for token in ("rerun", "again")):
             if any(token in text for token in ("fanout",)) or any(token in user_input for token in ("逃逸", "扇出")):
-                for key in ("layerAssignResult", "escapeOrderResult", "fanout_routeResult", "importLinesResult", "drcResult", "explainabilityReport", "fanoutParamsConfirmed"):
+                for key in ("layerAssignResult", "escapeOrderResult", "fanout_routeResult", "importLinesResult", "importLinesRejected", "importLinesRejectedReason", "drcResult", "explainabilityReport", "fanoutParamsConfirmed"):
                     next_cache.pop(key, None)
             if any(token in text for token in ("reroute", "rip-up", "ripup")) or any(token in user_input for token in ("拆线", "重布")):
                 for key in ("deleteTracesResult", "rerouteContext", "rerouteResult", "lastRerouteResult", "rerouteAttemptCount", "rerouteDrcFailureCount", "rerouteDrcFeedbackHistory", "rerouteUnavailable", "rerouteUnavailableReason", "helpPlannerResult", "importLinesResult", "drcResult", "lastDrcResult", "explainabilityReport"):
                     next_cache.pop(key, None)
         return next_cache
+# ====== 功能：判断用户本轮是否在继续或重新发起 fanout。 ======
+def _is_fanout_signal(user_input: str, entities: dict[str, Any], router_type: str) -> bool:
+    text = str(user_input or "").lower()
+    if entities or router_type:
+        return True
+    return any(token in user_input for token in ("逃逸", "扇出", "线宽", "线距", "间距")) or any(
+        token in text for token in ("fanout", "escape", "width", "spacing")
+    )
 
+
+# ====== 功能：增量合并 fanout 实体，constraints 不整体覆盖。 ======
+def _merge_fanout_entities(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in (updates or {}).items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "constraints" and isinstance(value, dict):
+            constraints = dict(merged.get("constraints") or {})
+            constraints.update({k: v for k, v in value.items() if v not in (None, "", [], {})})
+            if constraints:
+                merged["constraints"] = constraints
+        else:
+            merged[key] = value
+    return merged
 
 # ====== 功能：识别用户在 router 选择停点回复的 135/arc 选项。 ======
 def _router_choice_from_text(text: Any) -> str:

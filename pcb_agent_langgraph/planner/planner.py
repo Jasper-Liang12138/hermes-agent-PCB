@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -153,12 +153,9 @@ class PCBPlanner:
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_entry", [{"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0}])
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "compress_context", [{"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0}])
-            if cache.get("rerouteContext") and not cache.get("rerouteResult") and workflow_state != "confirm":
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_context_ready", "tool_calls": [], "response": "已完成拆线重布上下文压缩，请确认是否开始局部重布。"}
-            if cache.get("rerouteContext") and not cache.get("rerouteResult") and workflow_state == "confirm" and not _is_confirm_text(text):
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "wait_reroute_confirm", "tool_calls": [], "response": "当前正在等待确认重布。请回复“确认”开始 reroute，或说明要调整的对象。"}
             if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute model unavailable"}, "timeout": 900.0}])
+                reason = cache.get("rerouteUnavailableReason") or "reroute model unavailable"
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_unavailable", "tool_calls": [], "response": f"主模型 reroute 不可用：{reason}"}
             if not cache.get("rerouteResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
             if _drc_failed(cache.get("drcResult")) and int(cache.get("rerouteDrcFailureCount", 0)) >= 3 and not cache.get("helpPlannerResult"):
@@ -281,10 +278,8 @@ class PCBPlanner:
                 return [self._tool_call({"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0})], "reroute_entry"
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return [self._tool_call({"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0})], "compress_context"
-            if cache.get("rerouteContext") and not cache.get("rerouteResult") and not cache.get("rerouteUnavailable"):
-                return [], "reroute_context_ready"
             if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
-                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute model unavailable"}, "timeout": 900.0})], "help_planner"
+                return [], "reroute_unavailable"
             if not cache.get("rerouteResult"):
                 return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute"
             if _drc_failed(cache.get("drcResult")) and int(cache.get("rerouteDrcFailureCount", 0)) >= 3 and not cache.get("helpPlannerResult"):
@@ -507,7 +502,7 @@ def _state_prompt(state: PCBState) -> str:
         "fanoutEntities": cache.get("fanoutEntities") or cache.get("fanoutParams") or {},
         "next_step_rules": [
             "global_fanout 顺序：getProjectData -> pcb_extra_bga/selection -> router选择(135或arc) -> layer_assign -> escape_order -> fanoutParams确认 -> fanout_route -> importLines(由前端工具审批确认/拒绝) -> result_review(导入成功后生成本轮work_dir报告)；fanout 不调用 DRC/Explainability",
-            "reroute 顺序：deleteTracesForRerouting -> compress_reroute_context -> 用户确认 -> reroute -> drc_check/explainability_report -> DRC失败则带反馈重试reroute最多3轮 -> help_planner兜底 -> report确认 -> importLines",
+            "reroute 顺序：deleteTracesForRerouting -> compress_reroute_context -> reroute -> drc_check/explainability_report -> DRC失败则带反馈重试reroute最多3轮 -> help_planner兜底 -> report确认 -> importLines；主reroute不可用时直接报告原因，不自动help_planner",
             "用户指定 U5/U22 等器件时直接作为 selectedBGA，不要再要求选择 BGA",
             "用户指定线宽线距时写入 entities.constraints.LineWidth 和 LineSpacing，并传给工具 arguments.constraints",
         ],
