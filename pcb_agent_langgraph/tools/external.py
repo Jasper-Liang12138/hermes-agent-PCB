@@ -233,7 +233,8 @@ class ExternalProgramTool:
             model_result = await asyncio.to_thread(model.complete, messages)
         except Exception as exc:
             return {"status": "unavailable", "tool": self.name, "reason": f"reroute model call failed: {exc}", "attempt": attempt, "failureStage": "model_call", "failureType": "model_unavailable", "selectedNets": prompt_payload.get("selectedNets") or [], "rawSummary": str(exc), "tracebackSummary": _traceback_summary(exc), "workDir": str(work_dir)}
-        parsed = _loads_json_object(model_result.content) or {"content": model_result.content}
+        parsed_json = _loads_json_object(model_result.content)
+        parsed = parsed_json or {"content": model_result.content}
         routed_text = _first_text(parsed.get("routedText"), parsed.get("content"), parsed.get("report"), model_result.content)
         output_path = work_dir / "reroute_output.txt"
         output_path.write_text(routed_text, encoding="utf-8")
@@ -250,6 +251,8 @@ class ExternalProgramTool:
             "modelRaw": parsed,
             "workDir": str(work_dir),
             "elapsedMs": model_result.elapsed_ms,
+            "modelOutputChars": len(str(model_result.content or "")),
+            "modelParsedJson": parsed_json is not None,
             "selectedNets": prompt_payload.get("selectedNets") or [],
             "rawSummary": str(model_result.content or "")[:1200],
         }
@@ -975,8 +978,6 @@ def _build_report(drc_result: Any) -> str:
     if passed:
         return "DRC passed. No hard-rule violations were reported."
     return f"DRC status={status}; errors={json.dumps(errors, ensure_ascii=False)}"
-
-
 
 
 

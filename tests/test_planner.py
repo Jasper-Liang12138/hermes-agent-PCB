@@ -233,6 +233,34 @@ def test_reroute_context_calls_reroute_without_confirm():
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert plan["action"] == "reroute"
     assert plan["tool_calls"][0]["name"] == "reroute"
+
+
+# ====== 功能：验证 reroute 成功写缓存时不会因日志摘要缺少 json 导入而中断。 ======
+def test_reroute_cache_update_summarizes_result_without_name_error():
+    from pcb_agent_langgraph.graph.nodes import _update_cache_from_tool
+
+    cache = {"selectedNets": ["PHY1_TX_CLK"]}
+    result = {"status": "ok", "attempt": 1, "report": {"message": "done"}, "workDir": "work/reroute/attempt_1"}
+    _update_cache_from_tool(cache, "reroute", result)
+    assert cache["rerouteResult"] == result
+    assert cache["rerouteAttemptCount"] == 1
+
+
+# ====== 功能：验证 reroute 进度消息携带模型调用证据，避免“已完成”过于含糊。 ======
+def test_reroute_progress_suffix_includes_model_evidence():
+    from pcb_agent_langgraph.graph.nodes import _tool_progress_suffix
+
+    suffix = _tool_progress_suffix(
+        {
+            "ok": True,
+            "elapsed_ms": 1300.0,
+            "result": {"status": "ok", "tool": "reroute", "elapsedMs": 900.0, "modelOutputChars": 42, "workDir": "work/reroute/attempt_1"},
+        }
+    )
+    assert "工具耗时 1.3s" in suffix
+    assert "模型耗时 0.9s" in suffix
+    assert "模型输出 42 字符" in suffix
+    assert "workDir=work/reroute/attempt_1" in suffix
 # ====== 功能：验证普通消息不携带空 selection。 ======
 def test_agent_message_omits_none_selection():
     message = agent_message("s1", "p1", "正文", selection=None)

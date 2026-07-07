@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from pcb_agent_langgraph.graph.state import PCBState, add_trace
@@ -101,7 +102,7 @@ class GraphNodes:
                     await self.progress_sender(session_id, f"{tool_name} 执行中...")
         record = await task
         if self.progress_sender and session_id and not is_frontend_tool:
-            suffix = "已完成，继续处理..." if record.get("ok") and not _result_failed(record.get("result")) else "返回失败，正在整理原因..."
+            suffix = _tool_progress_suffix(record)
             await self.progress_sender(session_id, f"{tool_name} {suffix}")
         return record
     # ====== 功能：根据工具结果生成当前轮回复和流程状态。 ======
@@ -367,6 +368,29 @@ def _result_work_dir(result: Any) -> str:
     if not isinstance(result, dict):
         return ""
     return str(result.get("workDir") or result.get("work_dir") or result.get("outputPath") or "")[:240]
+
+
+def _tool_progress_suffix(record: dict[str, Any]) -> str:
+    result = record.get("result")
+    if not record.get("ok") or _result_failed(result):
+        return "返回失败，正在整理原因..."
+    if isinstance(result, dict) and result.get("tool") == "reroute":
+        details = []
+        elapsed = record.get("elapsed_ms")
+        model_elapsed = result.get("elapsedMs")
+        output_chars = result.get("modelOutputChars")
+        work_dir = result.get("workDir")
+        if isinstance(elapsed, (int, float)):
+            details.append(f"工具耗时 {elapsed / 1000:.1f}s")
+        if isinstance(model_elapsed, (int, float)):
+            details.append(f"模型耗时 {model_elapsed / 1000:.1f}s")
+        if isinstance(output_chars, int):
+            details.append(f"模型输出 {output_chars} 字符")
+        if work_dir:
+            details.append(f"workDir={work_dir}")
+        if details:
+            return "已完成（" + "，".join(details) + "），继续处理..."
+    return "已完成，继续处理..."
 
 
 # ====== 功能：判断工具结果是否表示失败。 ======
