@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +18,20 @@ from pcb_agent_langgraph.models.pcb_model import PCBModel
 from pcb_agent_langgraph.planner.intent_entities import normalize_router_type
 from pcb_agent_langgraph.tools.reroute_context import board_text_from_payload, build_reroute_context, target_nets_from_context
 from pcb_agent_langgraph.utils.config import AppConfig
+
+
+class RerouteLoopTool:
+    # ====== 功能：预留可插拔 reroute loop 接口；当前流程仍由 planner 串联独立工具。
+    async def ainvoke(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        return {
+            "status": "failed",
+            "tool": "reroute_loop",
+            "reason": "reroute_loop plugin is not configured; use default reroute -> drc_check -> help_planner flow",
+            "modelAttempts": [],
+            "drcHistory": [],
+            "fallbackUsed": False,
+        }
 
 
 # ====== 功能：返回第一个非空字符串参数。 ======
@@ -42,6 +58,8 @@ class ExternalProgramTool:
             return await self._escape_order_result(arguments, context)
         if self.name == "fanout_route":
             return await self._run_fanout_route(arguments, context)
+        if self.name == "prepare_reroute_inputs":
+            return await self._prepare_reroute_inputs(arguments, context)
         if self.name == "reroute":
             return await self._run_reroute(arguments, context)
         if self.name == "compress_reroute_context":
@@ -176,11 +194,60 @@ class ExternalProgramTool:
             **completed,
         }
     # ====== 功能：在 reroute 前对 KiCad 版图执行分块检索压缩。 ======
+    async def _prepare_reroute_inputs(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        work_dir = self._work_dir(context) / "reroute_inputs"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        delete_result = context.get("deleteTracesResult") if isinstance(context.get("deleteTracesResult"), dict) else {}
+        source_payload = delete_result.get("projectData") or delete_result.get("project_data") or delete_result.get("boardData") or context.get("projectData") or context.get("board_data")
+        board_text, source_path = board_text_from_payload(source_payload)
+        if not board_text:
+            return {"status": "failed", "tool": self.name, "reason": "missing board data for reroute input preparation"}
+        try:
+            kicad_path, kicad_text, source_layout_path = _ensure_reroute_kicad_input(self.config.root, board_text, source_path, work_dir)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": f"格式转换错误：无法把当前版图数据转换为重布线输入格式（{exc}）",
+                "sourceLayoutPath": source_path,
+            }
+
+        missing_routes = delete_result.get("missing_routes") or delete_result.get("missingRoutes") or context.get("missingRoutes") or []
+        if not isinstance(missing_routes, list):
+            missing_routes = []
+        selected_nets = _nets_from_missing_routes(missing_routes) or list(context.get("selectedNets") or [])
+        route_params = {
+            "missingRoutes": missing_routes,
+            "orderLines": missing_routes,
+            "pcbrouterNets": missing_routes,
+            "selectedNets": selected_nets,
+            "localRouteCsvPath": arguments.get("localRouteCsvPath") or context.get("localRouteCsvPath"),
+        }
+        csv_path, csv_mode = _prepare_local_route_csv(self.config.root, route_params, kicad_text, work_dir)
+        return {
+            "status": "ok",
+            "tool": self.name,
+            "sourceLayoutPath": source_layout_path,
+            "kicadBoardPath": str(kicad_path),
+            "kicadBoardText": kicad_text,
+            "localRouteCsvPath": str(csv_path),
+            "missingRoutes": missing_routes,
+            "selectedNets": selected_nets,
+            "csvMode": csv_mode,
+            "workDir": str(work_dir),
+        }
+
+    # ====== 功能：在 reroute 前对 KiCad 版图执行分块检索压缩。 ======
     async def _compress_reroute_context(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0)
+        reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
         delete_result = context.get("deleteTracesResult") if isinstance(context.get("deleteTracesResult"), dict) else {}
         local_context = delete_result.get("localContext") if isinstance(delete_result.get("localContext"), dict) else context.get("localContext") or {}
-        board_text, board_path = board_text_from_payload(delete_result)
+        board_text = str(reroute_input.get("kicadBoardText") or "")
+        board_path = str(reroute_input.get("kicadBoardPath") or "")
+        if not board_text:
+            board_text, board_path = board_text_from_payload(delete_result)
         if not board_text:
             board_text, board_path = board_text_from_payload(context.get("projectData") or context.get("board_data") or context.get("project_data"))
         if not board_text:
@@ -210,20 +277,22 @@ class ExternalProgramTool:
         await asyncio.sleep(0)
         if not self.config.model.base_url or not self.config.model.model:
             return {"status": "unavailable", "tool": self.name, "reason": "reroute model is not configured", "failureStage": "model_config", "failureType": "model_unavailable"}
-        project_data = _project_data_text(context)
-        if not project_data:
-            return {"status": "failed", "tool": self.name, "reason": "missing board data for reroute", "failureStage": "input", "failureType": "missing_board_data"}
+        reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
+        kicad_text = str(reroute_input.get("kicadBoardText") or "")
+        kicad_path = str(reroute_input.get("kicadBoardPath") or "")
+        if not kicad_text or not kicad_text.lstrip().lower().startswith("(kicad_pcb"):
+            return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute", "failureStage": "input", "failureType": "missing_kicad_board_data", "kicadBoardPath": kicad_path}
         attempt = int(arguments.get("attempt") or 0) or int(context.get("rerouteAttemptCount") or 0) + 1
         work_dir = self._work_dir(context) / "reroute" / f"attempt_{attempt}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        prompt_payload = _reroute_model_payload(arguments, context, project_data, attempt)
+        prompt_payload = _reroute_model_payload(arguments, context, reroute_input, attempt)
         messages = [
             {
                 "role": "system",
                 "content": (
                     "你是 PCB 局部拆线重布模型。根据 missing routes、压缩版图上下文和 DRC 反馈，"
-                    "输出本轮可用于 DRC 检查的 reroute 结果。优先返回 JSON；可包含 "
-                    "routingResult/importLinesFilePath/routedLayoutTxtFilePath/report/content 字段。"
+                    "输出本轮可用于 DRC 回填检查的 KiCad patch 文本。优先返回 JSON；可包含 "
+                    "routedText/content/report 字段，不能把解释性文字伪装成可导入布线文件。"
                 ),
             },
             {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
@@ -238,14 +307,12 @@ class ExternalProgramTool:
         routed_text = _first_text(parsed.get("routedText"), parsed.get("content"), parsed.get("report"), model_result.content)
         output_path = work_dir / "reroute_output.txt"
         output_path.write_text(routed_text, encoding="utf-8")
-        import_path = _existing_path(parsed.get("importLinesFilePath")) or _existing_path(parsed.get("routedLayoutTxtFilePath")) or _existing_path(parsed.get("routingResult")) or output_path
         return {
             "status": "ok",
             "tool": self.name,
             "attempt": attempt,
-            "routingResult": str(parsed.get("routingResult") or output_path),
-            "routedLayoutTxtFilePath": str(parsed.get("routedLayoutTxtFilePath") or import_path),
-            "importLinesFilePath": str(parsed.get("importLinesFilePath") or import_path),
+            "modelOutputText": routed_text,
+            "modelOutputPath": str(output_path),
             "routedText": routed_text,
             "report": str(parsed.get("report") or "模型 reroute 已生成候选结果。"),
             "modelRaw": parsed,
@@ -253,6 +320,7 @@ class ExternalProgramTool:
             "elapsedMs": model_result.elapsed_ms,
             "modelOutputChars": len(str(model_result.content or "")),
             "modelParsedJson": parsed_json is not None,
+            "kicadBoardPath": kicad_path,
             "selectedNets": prompt_payload.get("selectedNets") or [],
             "rawSummary": str(model_result.content or "")[:1200],
         }
@@ -262,13 +330,19 @@ class ExternalProgramTool:
         await asyncio.sleep(0)
         if not self.config.reroute_help.enabled:
             return {"status": "failed", "tool": self.name, "reason": "reroute help_planner is disabled in config"}
-        project_data = _project_data_text(context)
+        reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
+        project_data = str(reroute_input.get("kicadBoardText") or "")
+        source_board_path = str(reroute_input.get("kicadBoardPath") or "")
         route_params = _help_route_params(arguments, context)
-        if not project_data:
-            return {"status": "failed", "tool": self.name, "reason": "missing board data for help_planner"}
+        if reroute_input.get("localRouteCsvPath"):
+            route_params["localRouteCsvPath"] = reroute_input.get("localRouteCsvPath")
+        if reroute_input.get("selectedNets"):
+            route_params["selectedNets"] = reroute_input.get("selectedNets")
         work_dir = self._work_dir(context) / "help_planner"
         pcbrouter_bin = _resolve_path(self.config.root, self.config.router.pcbrouter_bin)
-        source_board_path = _source_board_path(context)
+        if not project_data:
+            diagnostics = _help_planner_diagnostics(work_dir, pcbrouter_bin, source_board_path)
+            return {"status": "failed", "tool": self.name, "reason": "help_planner requires KiCad .kicad_pcb input; rerouteInput is missing", "routeParams": route_params, **diagnostics}
         input_error = _help_planner_input_error(project_data, source_board_path)
         if input_error:
             diagnostics = _help_planner_diagnostics(work_dir, pcbrouter_bin, source_board_path)
@@ -294,12 +368,28 @@ class ExternalProgramTool:
                     os.environ["PCBROUTER_BIN"] = old_bin
             payload = _dataclass_to_dict(result)
             routing_path = str(payload.get("routing_result_path") or "")
+            output_csv_path = str(payload.get("output_csv_path") or "")
+            import_path = ""
+            import_notes: list[str] = []
+            if routing_path:
+                import_path, import_notes = _write_helper_router_incremental_import_file(
+                    original_board_text=project_data,
+                    routed_board_path=Path(routing_path),
+                    selected_nets=list(reroute_input.get("selectedNets") or route_params.get("selectedNets") or []),
+                    work_dir=work_dir,
+                )
             return {
                 "status": "ok",
                 "tool": self.name,
                 "routingResult": routing_path,
-                "routedLayoutTxtFilePath": routing_path,
-                "importLinesFilePath": routing_path,
+                "routedKicadFilePath": routing_path,
+                "routedLayoutTxtFilePath": "",
+                "importLinesFilePath": import_path,
+                "incrementalImportFilePath": import_path,
+                "incrementalImportNotes": import_notes,
+                "inputBoardPath": str(payload.get("input_board_path") or ""),
+                "inputCsvPath": str(payload.get("input_csv_path") or ""),
+                "outputCsvPath": output_csv_path,
                 "report": payload.get("report") or "pcbrouter local route completed",
                 "detail": payload,
                 "workDir": str(work_dir),
@@ -443,7 +533,8 @@ class AnalysisTool:
         if not eval_root.exists():
             return {"status": "failed", "tool": self.name, "reason": "DRC eval_root does not exist", "eval_root": str(eval_root)}
 
-        original_board = _project_data_text(context)
+        reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
+        original_board = str(reroute_input.get("kicadBoardText") or "") or _project_data_text(context)
         routed_text = _routed_text(arguments, context)
         if not original_board:
             return {"status": "failed", "tool": self.name, "reason": "missing original board data for DRC"}
@@ -624,6 +715,213 @@ def _help_planner_diagnostics(work_dir: Path, pcbrouter_bin: Path, source_board_
         files["stderrSummary"] = stderr_path.read_text(encoding="utf-8", errors="replace")[:1600]
     return {"workDir": str(work_dir), "pcbrouterBin": str(pcbrouter_bin), "sourceBoardPath": source_board_path, **files}
 
+
+def _ensure_reroute_kicad_input(project_root: Path, board_text: str, source_path: str, work_dir: Path) -> tuple[Path, str, str]:
+    source = Path(str(source_path or "")) if source_path else None
+    if source and source.is_file() and source.suffix.lower() == ".kicad_pcb":
+        target = work_dir / source.name
+        shutil.copyfile(source, target)
+        return target, target.read_text(encoding="utf-8", errors="ignore"), str(source)
+    if board_text.lstrip().lower().startswith("(kicad_pcb"):
+        target = work_dir / "reroute_input.kicad_pcb"
+        target.write_text(board_text, encoding="utf-8")
+        return target, board_text, str(source or target)
+
+    txt_source = source if source and source.is_file() else work_dir / "reroute_input.txt"
+    if not txt_source.exists():
+        txt_source.write_text(board_text, encoding="utf-8")
+    convert_mod = _load_module("_pcb_agent_langgraph_convert", project_root / "convert.py")
+    output_dir = work_dir / "kicad"
+    result = convert_mod.convert_one("txt_to_kicad", txt_source, output_dir, None)
+    output_path = Path(str(result.get("output") or ""))
+    if not output_path.is_file():
+        raise RuntimeError(f"txt_to_kicad did not create output for {txt_source}")
+    return output_path, output_path.read_text(encoding="utf-8", errors="ignore"), str(txt_source)
+
+
+def _nets_from_missing_routes(routes: list[Any]) -> list[str]:
+    nets: list[str] = []
+    for item in routes:
+        if isinstance(item, dict):
+            value = item.get("net") or item.get("net_name") or item.get("netName") or item.get("name")
+        else:
+            value = item
+        net = str(value or "").strip()
+        if net and net not in nets:
+            nets.append(net)
+    return nets
+
+
+def _prepare_local_route_csv(project_root: Path, route_params: dict[str, Any], kicad_text: str, work_dir: Path) -> tuple[Path, str]:
+    local_router = _load_module("_pcb_agent_langgraph_local_router_prepare", project_root / "tools" / "pcb_local_router.py")
+    csv_path = local_router.write_local_route_csv(route_params=route_params, project_data=kicad_text, work_dir=work_dir)
+    header = csv_path.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip().lower()
+    return csv_path, "fixed_route_layer" if "route_layer" in header else "net_only"
+
+
+def _write_helper_router_incremental_import_file(
+    *,
+    original_board_text: str,
+    routed_board_path: Path,
+    selected_nets: list[Any],
+    work_dir: Path,
+) -> tuple[str, list[str]]:
+    if not routed_board_path.is_file():
+        return "", [f"helper_router_routed_board_missing:{routed_board_path}"]
+    routed_board_text = routed_board_path.read_text(encoding="utf-8", errors="ignore")
+    original_segments = {_segment_diff_key(segment) for segment in _parse_kicad_segments(original_board_text)}
+    selected_net_names = {str(item).strip() for item in selected_nets if str(item).strip()}
+    changed_segments: list[dict[str, Any]] = []
+    for segment in _parse_kicad_segments(routed_board_text):
+        if _segment_diff_key(segment) in original_segments:
+            continue
+        if selected_net_names and str(segment.get("netName") or "") not in selected_net_names:
+            continue
+        changed_segments.append(segment)
+    if not changed_segments:
+        return "", ["helper_router_incremental_import_no_changed_segments"]
+
+    import_dir = work_dir / "import"
+    import_dir.mkdir(parents=True, exist_ok=True)
+    output_path = import_dir / "helper_router_reroute_line.out"
+    line_records = [_segment_to_line_out(segment) for segment in changed_segments]
+    import_text = "\n".join(record for record in line_records if record) + "\n"
+    passed, reason, stats = _validate_line_out_text(import_text)
+    if not passed:
+        return "", [f"helper_router_incremental_import_invalid:{reason}"]
+    output_path.write_text(import_text, encoding="utf-8")
+    return str(output_path), [f"generated_helper_router_incremental_line_out:{output_path}", f"lineCount:{stats.get('lineCount', 0)}"]
+
+
+def _parse_kicad_segments(board_text: str) -> list[dict[str, Any]]:
+    net_id_to_name = _kicad_net_id_to_name(board_text)
+    segments: list[dict[str, Any]] = []
+    for block in _extract_balanced_sexpr_blocks(board_text, "segment"):
+        start = re.search(r"\(\s*start\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        end = re.search(r"\(\s*end\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        width = re.search(r"\(\s*width\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        layer = re.search(r"\(\s*layer\s+\"?([^\s\)\"]+)\"?\s*\)", block, re.IGNORECASE)
+        net = re.search(r"\(\s*net\s+(\d+)\s*\)", block, re.IGNORECASE)
+        if not (start and end and width and layer and net):
+            continue
+        net_id = net.group(1).strip()
+        segments.append(
+            {
+                "x1": float(start.group(1)),
+                "y1": float(start.group(2)),
+                "x2": float(end.group(1)),
+                "y2": float(end.group(2)),
+                "width": float(width.group(1)),
+                "layer": layer.group(1).strip(),
+                "netId": net_id,
+                "netName": net_id_to_name.get(net_id, net_id).replace("!", "_"),
+            }
+        )
+    return segments
+
+
+def _extract_balanced_sexpr_blocks(text: str, head: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    blocks: list[str] = []
+    pattern = re.compile(rf"\(\s*{re.escape(head)}\b", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(match.start(), len(text)):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "(":
+                depth += 1
+                continue
+            if char == ")":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[match.start():pos + 1].strip())
+                    break
+    return blocks
+
+
+def _kicad_net_id_to_name(board_text: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for pattern in (
+        re.compile(r"\(\s*net\s+(\d+)\s+\"([^\"]+)\"\s*\)", re.IGNORECASE),
+        re.compile(r"\(\s*net\s+(\d+)\s+([^\s\)]+)\s*\)", re.IGNORECASE),
+    ):
+        for match in pattern.finditer(board_text or ""):
+            mapping[match.group(1).strip()] = match.group(2).strip()
+    return mapping
+
+
+def _segment_diff_key(segment: dict[str, Any]) -> tuple[Any, ...]:
+    x1 = round(float(segment.get("x1") or 0), 6)
+    y1 = round(float(segment.get("y1") or 0), 6)
+    x2 = round(float(segment.get("x2") or 0), 6)
+    y2 = round(float(segment.get("y2") or 0), 6)
+    endpoints = tuple(sorted(((x1, y1), (x2, y2))))
+    return (endpoints, str(segment.get("layer") or ""), round(float(segment.get("width") or 0), 6), str(segment.get("netName") or segment.get("netId") or ""))
+
+
+def _segment_to_line_out(segment: dict[str, Any]) -> str:
+    return (
+        f"{_kicad_layer_to_line_out_layer(str(segment.get('layer') or ''))}!LINE!0!{str(segment.get('netName') or segment.get('netId') or '').replace('!', '_')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(segment.get('x1') or 0), 'x')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(segment.get('y1') or 0), 'y')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(segment.get('x2') or 0), 'x')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(segment.get('y2') or 0), 'y')}!"
+        f"{_kicad_mm_to_mil_text(float(segment.get('width') or 0))}"
+    )
+
+
+def _kicad_layer_to_line_out_layer(layer: str) -> str:
+    layer = str(layer or "").strip().strip('"')
+    aliases = {"F.Cu": "TOP", "B.Cu": "BOTTOM", "Top": "TOP", "Bottom": "BOTTOM", "Conductor/Top": "TOP", "Conductor/Bottom": "BOTTOM"}
+    if layer in aliases:
+        return aliases[layer]
+    if layer.startswith("Conductor/"):
+        layer = layer.split("/", 1)[1]
+    if layer.lower() == "top":
+        return "TOP"
+    if layer.lower() == "bottom":
+        return "BOTTOM"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", layer).upper()
+
+
+def _kicad_mm_to_line_out_coord_text(value: float, axis: str) -> str:
+    origin = 363386.0 if axis == "x" else 534646.0
+    dbu_mm = 0.000254
+    local_mil = (float(value) / dbu_mm - origin) / 100.0
+    return f"{local_mil:.2f}"
+
+
+def _kicad_mm_to_mil_text(value: float) -> str:
+    return f"{(float(value) / 0.0254):.2f}"
+
+
+def _validate_line_out_text(text: str) -> tuple[bool, str, dict[str, Any]]:
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return False, "增量导入文件为空", {"lineCount": 0}
+    valid_count = 0
+    for raw in stripped.splitlines():
+        parts = [part.strip() for part in raw.split("!")]
+        if len(parts) == 9 and parts[1].upper() == "LINE" and parts[0] and parts[3]:
+            valid_count += 1
+    if valid_count <= 0:
+        return False, "增量导入文件未包含有效 LINE 记录", {"lineCount": 0}
+    return True, "", {"lineCount": valid_count}
+
 def _project_data_text(context: dict[str, Any]) -> str:
     project = context.get("projectData") or context.get("project_data")
     if isinstance(project, str):
@@ -650,14 +948,14 @@ def _routed_text(arguments: dict[str, Any], context: dict[str, Any]) -> str:
             return value
     for item in (context.get("fanout_routeResult"), context.get("rerouteResult"), context.get("importLinesResult")):
         if isinstance(item, dict):
+            for key in ("modelOutputText", "routedText", "content", "data"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
             for key in ("importLinesFilePath", "routedLayoutTxtFilePath", "routingResult", "filePath"):
                 path = item.get(key)
                 if isinstance(path, str) and Path(path).exists():
                     return Path(path).read_text(encoding="utf-8", errors="ignore")
-            for key in ("routedText", "content", "data"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
     return ""
 
 
@@ -668,9 +966,9 @@ def _routed_board_path(arguments: dict[str, Any], context: dict[str, Any]) -> Pa
             return Path(value)
     for item in (context.get("fanout_routeResult"), context.get("rerouteResult"), context.get("helpPlannerResult"), context.get("importLinesResult")):
         if isinstance(item, dict):
-            for key in ("routedKicadFilePath", "routedBoardDataFilePath", "routedLayoutKicadFilePath", "boardFilePath"):
+            for key in ("routedKicadFilePath", "importLinesFilePath", "routedBoardDataFilePath", "routedLayoutKicadFilePath", "boardFilePath"):
                 value = str(item.get(key) or "").strip()
-                if value and Path(value).exists():
+                if value and Path(value).suffix.lower() == ".kicad_pcb" and Path(value).exists():
                     return Path(value)
     return None
 
@@ -905,17 +1203,20 @@ def _fanout_import_file(work_dir: Path, router_type: str, output_path: Path) -> 
 
 
 # ====== 功能：构造主模型 reroute 输入，包含上一轮 DRC 反馈。 ======
-def _reroute_model_payload(arguments: dict[str, Any], context: dict[str, Any], project_data: str, attempt: int) -> dict[str, Any]:
+def _reroute_model_payload(arguments: dict[str, Any], context: dict[str, Any], reroute_input: dict[str, Any], attempt: int) -> dict[str, Any]:
     delete_result = context.get("deleteTracesResult") if isinstance(context.get("deleteTracesResult"), dict) else {}
-    missing_routes = context.get("missingRoutes") or delete_result.get("missing_routes") or []
+    kicad_text = str(reroute_input.get("kicadBoardText") or "")
+    missing_routes = reroute_input.get("missingRoutes") or context.get("missingRoutes") or delete_result.get("missing_routes") or []
     return {
         "task": "pcb_local_reroute",
+        "inputFormat": "kicad_pcb",
         "attempt": attempt,
         "instruction": "根据 missing routes 补全局部重布；如有上一轮 DRC 反馈，请修正后重新输出。",
         "missingRoutes": missing_routes,
-        "selectedNets": context.get("selectedNets") or [],
+        "selectedNets": reroute_input.get("selectedNets") or context.get("selectedNets") or [],
         "rerouteContext": context.get("rerouteContext") or {},
-        "projectDataPreview": project_data[:12000],
+        "kicadBoardPreview": kicad_text[:12000],
+        "kicadBoardPath": reroute_input.get("kicadBoardPath") or "",
         "previousRerouteResult": context.get("lastRerouteResult") or context.get("rerouteResult") or {},
         "drcFeedbackHistory": context.get("rerouteDrcFeedbackHistory") or [],
         "lastDrcResult": context.get("lastDrcResult") or context.get("drcResult") or {},
@@ -978,20 +1279,6 @@ def _build_report(drc_result: Any) -> str:
     if passed:
         return "DRC passed. No hard-rule violations were reported."
     return f"DRC status={status}; errors={json.dumps(errors, ensure_ascii=False)}"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -10,6 +10,7 @@ from pcb_agent_langgraph.models.pcb_model import PCBModel
 from pcb_agent_langgraph.planner.intent_entities import extract_fanout_entities, normalize_router_type
 from pcb_agent_langgraph.planner.prompts import planner_system_prompt
 from pcb_agent_langgraph.planner.tool_call_parser import parse_tool_call_markup
+from pcb_agent_langgraph.utils.config import AppConfig
 
 
 # ====== 功能：判断 DRC 工具结果是否失败。 ======
@@ -81,10 +82,11 @@ def _bga_selection(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
 # ====== 功能：根据用户输入和中间状态规划下一步工具调用。 ======
 class PCBPlanner:
     # ====== 功能：初始化对象并保存运行所需依赖。 ======
-    def __init__(self, model: PCBModel | None = None, use_model: bool = True, require_model: bool = False) -> None:
+    def __init__(self, model: PCBModel | None = None, use_model: bool = True, require_model: bool = False, config: AppConfig | None = None) -> None:
         self.model = model
         self.use_model = use_model
         self.require_model = require_model
+        self.config = config
 
     # ====== 功能：根据当前状态生成下一步执行计划。 ======
     def plan(self, state: PCBState) -> PlannerOutput:
@@ -151,6 +153,8 @@ class PCBPlanner:
             # reroute 由 LangGraph 控制阶段推进：前端拆线 -> 重布 -> 导入 -> DRC/解释 -> 必要时 help_planner 兜底。
             if not cache.get("deleteTracesResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_entry", [{"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0}])
+            if not cache.get("rerouteInput"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "prepare_reroute_inputs", [{"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0}])
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "compress_context", [{"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0}])
             if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
@@ -158,8 +162,8 @@ class PCBPlanner:
                 return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_unavailable", "tool_calls": [], "response": f"主模型 reroute 不可用：{reason}"}
             if not cache.get("rerouteResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
-            if _drc_failed(cache.get("drcResult")) and int(cache.get("rerouteDrcFailureCount", 0)) >= 3 and not cache.get("helpPlannerResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after 3 attempts"}, "timeout": 900.0}])
+            if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0}])
             if _drc_failed(cache.get("drcResult")):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_retry", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
             if not cache.get("drcResult"):
@@ -276,14 +280,16 @@ class PCBPlanner:
         if intent == "reroute" or workflow == "pcb_reroute_flow":
             if not cache.get("deleteTracesResult"):
                 return [self._tool_call({"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0})], "reroute_entry"
+            if not cache.get("rerouteInput"):
+                return [self._tool_call({"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0})], "prepare_reroute_inputs"
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return [self._tool_call({"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0})], "compress_context"
             if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
                 return [], "reroute_unavailable"
             if not cache.get("rerouteResult"):
                 return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute"
-            if _drc_failed(cache.get("drcResult")) and int(cache.get("rerouteDrcFailureCount", 0)) >= 3 and not cache.get("helpPlannerResult"):
-                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after 3 attempts"}, "timeout": 900.0})], "help_planner"
+            if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
+                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0})], "help_planner"
             if _drc_failed(cache.get("drcResult")):
                 return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute_retry"
             if not cache.get("drcResult"):
@@ -311,6 +317,19 @@ class PCBPlanner:
             "arguments": dict(raw.get("arguments") or {}),
             "timeout": float(raw.get("timeout", 360.0)),
         }
+
+    def _reroute_elapsed_limit_reached(self, cache: dict[str, Any]) -> bool:
+        started = cache.get("rerouteStartedAt")
+        try:
+            started_at = float(started)
+        except (TypeError, ValueError):
+            return False
+        import time
+
+        limit = 900
+        if self.config is not None:
+            limit = int(getattr(self.config.reroute_help, "max_elapsed_seconds", 900) or 900)
+        return limit > 0 and (time.time() - started_at) >= limit
 
     @staticmethod
     # ====== 功能：从工具结果中提取可导入的布线文件路径。 ======
@@ -593,7 +612,4 @@ def _normalize_validated_call(call: ToolCall, entities: dict[str, Any]) -> ToolC
 def _append_reason(existing: Any, note: str) -> str:
     text = str(existing or "").strip()
     return f"{text}; {note}" if text else note
-
-
-
 

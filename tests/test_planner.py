@@ -92,6 +92,8 @@ def test_explain_and_help_config_defaults_present():
 def test_reroute_drc_failure_triggers_help_planner():
     cache = {
         "deleteTracesResult": {"status": "ok", "selectedNets": ["DDR_DQ0"]},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
         "rerouteResult": {"status": "ok", "importLinesFilePath": "missing.kicad_pcb"},
         "importLinesResult": {"status": "ok"},
         "drcResult": {"status": "failed", "reason": "violation"},
@@ -115,11 +117,11 @@ def test_model_parameter_only_output_repairs_to_fanout_plan():
     assert plan["tool_calls"][0]["name"] == "getProjectData"
     assert plan["tool_calls"][0]["arguments"]["selectedBGA"] == "U22"
     assert plan["tool_calls"][0]["arguments"]["constraints"] == {"LineWidth": 4, "LineSpacing": 3}
-# ====== 功能：验证 reroute 删除走线后先压缩 KiCad 上下文再进入模型重布。 ======
-def test_reroute_after_delete_compresses_context_before_model():
+# ====== 功能：验证 reroute 删除走线后先准备统一 KiCad/CSV 输入。 ======
+def test_reroute_after_delete_prepares_inputs_before_context():
     cache = {"deleteTracesResult": {"status": "ok", "selectedNets": ["DDR_DQ0"], "projectData": {"boardData": "(kicad_pcb (segment (net 1)))"}}}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续 reroute", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["tool_calls"][0]["name"] == "compress_reroute_context"
+    assert plan["tool_calls"][0]["name"] == "prepare_reroute_inputs"
 
 
 # ====== 功能：验证 KiCad reroute 上下文压缩会优先检索目标网络片段。 ======
@@ -131,6 +133,57 @@ def test_reroute_context_retrieves_target_net_chunk():
     assert result["status"] == "ok"
     assert "DDR_DQ0" in result["contextText"]
     assert result["stats"]["retrievedSegmentCount"] == 1
+
+
+# ====== 功能：验证 reroute 输入准备可直接使用 KiCad 并生成 net-only CSV。 ======
+def test_prepare_reroute_inputs_accepts_kicad_and_writes_net_csv(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text("(kicad_pcb (version 20240108) (layers (0 \"F.Cu\" signal)))\n", encoding="utf-8")
+    context = {
+        "session_id": "s1",
+        "deleteTracesResult": {"projectData": str(board_path), "missing_routes": [{"net_name": "DDR_DQ0"}]},
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert result["kicadBoardPath"].endswith(".kicad_pcb")
+    assert result["selectedNets"] == ["DDR_DQ0"]
+    assert result["csvMode"] == "net_only"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net", "DDR_DQ0"]
+
+
+# ====== 功能：验证 reroute 输入准备在存在固定层时生成 route_layer CSV。 ======
+def test_prepare_reroute_inputs_writes_fixed_route_layer_csv(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text("(kicad_pcb (version 20240108) (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))\n", encoding="utf-8")
+    context = {
+        "session_id": "s2",
+        "deleteTracesResult": {"projectData": str(board_path), "missing_routes": [{"net_name": "DDR_DQ1", "route_layer": "Top"}]},
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert result["csvMode"] == "fixed_route_layer"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net,route_layer", "DDR_DQ1,F.Cu"]
+
+
+# ====== 功能：验证 reroute 输入转换失败时返回前端友好的格式转换错误。
+def test_prepare_reroute_inputs_conversion_error_hides_internal_format_name(monkeypatch, tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+
+    def fail_convert(*_args, **_kwargs):
+        raise RuntimeError("converter exploded")
+
+    monkeypatch.setattr("pcb_agent_langgraph.tools.external._ensure_reroute_kicad_input", fail_convert)
+    result = asyncio.run(tool.ainvoke({}, {"session_id": "s3", "deleteTracesResult": {"projectData": {"boardData": "(layout broken)"}}}))
+
+    assert result["status"] == "failed"
+    assert "格式转换错误" in result["reason"]
+    assert "KiCad" not in result["reason"]
+    assert "kicad" not in result["reason"].lower()
 # ====== 功能：验证 DRC 和可解释性结果会被组装成 Markdown 报告。 ======
 def test_markdown_report_contains_drc_and_explainability():
     from pcb_agent_langgraph.reports.markdown import build_markdown_report
@@ -181,7 +234,7 @@ def test_fanout_single_bga_candidate_returns_selection():
 
 # ====== 功能：验证 reroute 上下文完成后直接进入主模型重布。 ======
 def test_reroute_after_context_calls_model_reroute_directly():
-    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["GND"]}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     state = {"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(use_model=False).plan(state)
     assert plan["action"] == "reroute"
@@ -229,7 +282,7 @@ def test_fanout_route_result_calls_import_lines_directly():
 
 # ====== 功能：验证 reroute 上下文压缩后不再等待确认。 ======
 def test_reroute_context_calls_reroute_without_confirm():
-    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["GND"]}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert plan["action"] == "reroute"
     assert plan["tool_calls"][0]["name"] == "reroute"
@@ -261,6 +314,81 @@ def test_reroute_progress_suffix_includes_model_evidence():
     assert "模型耗时 0.9s" in suffix
     assert "模型输出 42 字符" in suffix
     assert "workDir=work/reroute/attempt_1" in suffix
+
+
+# ====== 功能：验证 DRC 通过后传给 importLines 的是轻量增量 line.out，不是完整 KiCad 文件。 ======
+def test_drc_pass_generates_reroute_incremental_import_file(tmp_path):
+    from pcb_agent_langgraph.graph.nodes import _update_cache_from_tool
+
+    work_dir = tmp_path / "attempt_1"
+    work_dir.mkdir()
+    routed_kicad = tmp_path / "routed.kicad_pcb"
+    routed_kicad.write_text("(kicad_pcb routed)", encoding="utf-8")
+    cache = {
+        "rerouteInput": {
+            "kicadBoardText": "(kicad_pcb (net 58 Z7_SPI0_SCK))",
+            "missingRoutes": [{"net_name": "Z7_SPI0_SCK", "start": {"layer": "Top", "x": 106.479086, "y": 139.17295}, "end": {"layer": "Top", "x": 106.479086, "y": 135.62838}}],
+        },
+        "missingRoutes": [{"net_name": "Z7_SPI0_SCK", "start": {"layer": "Top", "x": 106.479086, "y": 139.17295}, "end": {"layer": "Top", "x": 106.479086, "y": 135.62838}}],
+        "rerouteResult": {
+            "status": "ok",
+            "workDir": str(work_dir),
+            "modelOutputText": "\n".join(
+                [
+                    "(segment (start 106.480000 139.170000) (end 106.480000 135.630000) (width 0.152400) (layer Top) (net 58))",
+                    "(segment (start 106.480000 135.630000) (end 106.480000 132.790000) (width 0.152400) (layer Top) (net 58))",
+                ]
+            ),
+        },
+    }
+    _update_cache_from_tool(cache, "drc_check", {"status": "ok", "passed": True, "detail": {"filled_board_data_file_path": str(routed_kicad)}})
+    import_path = Path(cache["rerouteResult"]["importLinesFilePath"])
+    assert import_path.name.endswith("_reroute_line.out")
+    assert import_path.suffix == ".out"
+    assert cache["rerouteResult"]["routedKicadFilePath"] == str(routed_kicad)
+    assert cache["rerouteResult"]["importLinesFilePath"] != str(routed_kicad)
+    assert import_path.read_text(encoding="utf-8").startswith("TOP!LINE!0!Z7_SPI0_SCK!")
+
+
+# ====== 功能：验证 helper-router 的完整板输出会 diff 成前端可导入的 line.out。
+def test_helper_router_routed_board_diff_generates_incremental_line_out(tmp_path):
+    from pcb_agent_langgraph.tools.external import _write_helper_router_incremental_import_file
+
+    original = """
+    (kicad_pcb
+      (net 1 DDR_DQ0)
+      (net 2 DDR_DQ1)
+      (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+    )
+    """
+    routed_path = tmp_path / "routed.kicad_pcb"
+    routed_path.write_text(
+        """
+        (kicad_pcb
+          (net 1 DDR_DQ0)
+          (net 2 DDR_DQ1)
+          (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+          (segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))
+          (segment (start 30 40) (end 31 40) (width 0.1524) (layer F.Cu) (net 2))
+        )
+        """,
+        encoding="utf-8",
+    )
+
+    import_path, notes = _write_helper_router_incremental_import_file(
+        original_board_text=original,
+        routed_board_path=routed_path,
+        selected_nets=["DDR_DQ0"],
+        work_dir=tmp_path,
+    )
+
+    assert import_path
+    assert Path(import_path).name == "helper_router_reroute_line.out"
+    text = Path(import_path).read_text(encoding="utf-8")
+    assert text.count("!LINE!") == 1
+    assert "DDR_DQ0" in text
+    assert "DDR_DQ1" not in text
+    assert any("generated_helper_router_incremental_line_out" in note for note in notes)
 # ====== 功能：验证普通消息不携带空 selection。 ======
 def test_agent_message_omits_none_selection():
     message = agent_message("s1", "p1", "正文", selection=None)
@@ -344,7 +472,7 @@ def test_model_repeated_compress_context_rewritten_to_reroute():
         def complete(self, messages, temperature=0.0):
             return ModelResult(content='{"intent":"reroute","workflow":"pcb_reroute_flow","tool_calls":[{"name":"compress_reroute_context","arguments":{}}]}', raw={}, elapsed_ms=1.0, usage={})
 
-    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}}
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}, "rerouteContext": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}}
     state = {"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(model=FakeModel(), use_model=True, require_model=True).plan(state)
     assert plan["action"] == "reroute"
@@ -357,6 +485,41 @@ def test_help_planner_rejects_export_txt_input():
     result = asyncio.run(tool.ainvoke({}, context))
     assert result["status"] == "failed"
     assert "requires KiCad .kicad_pcb input" in result["reason"]
+
+
+# ====== 功能：验证主模型 payload 使用 KiCad 输入契约，不暴露 PCB Builder txt 字段。 ======
+def test_reroute_model_payload_uses_kicad_contract():
+    from pcb_agent_langgraph.tools.external import _reroute_model_payload
+
+    payload = _reroute_model_payload(
+        {},
+        {"rerouteContext": {"status": "ok"}, "selectedNets": ["DDR_DQ0"]},
+        {"kicadBoardText": "(kicad_pcb demo)", "kicadBoardPath": "board.kicad_pcb", "missingRoutes": [{"net_name": "DDR_DQ0"}]},
+        1,
+    )
+    assert payload["inputFormat"] == "kicad_pcb"
+    assert payload["kicadBoardPreview"] == "(kicad_pcb demo)"
+    assert payload["kicadBoardPath"] == "board.kicad_pcb"
+    assert "projectDataPreview" not in payload
+
+
+# ====== 功能：验证 DRC 失败超过耗时上限会进入 help_planner。 ======
+def test_reroute_drc_failure_elapsed_limit_triggers_help_planner():
+    import time
+
+    config = load_config("missing-config.ini")
+    config.reroute_help.max_elapsed_seconds = 1
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok"},
+        "drcResult": {"status": "failed", "passed": False},
+        "rerouteDrcFailureCount": 1,
+        "rerouteStartedAt": time.time() - 5,
+    }
+    plan = PCBPlanner(use_model=False, config=config).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["tool_calls"][0]["name"] == "help_planner"
 
 # ====== 功能：验证 fanout 实体跨轮保存，U5 后续选择 135 不会丢失目标 BGA。 ======
 def test_fanout_entities_persist_across_router_turn():
@@ -389,7 +552,7 @@ def test_new_fanout_clears_import_rejection_state():
 
 # ====== 功能：验证主 reroute unavailable 直接报告，不进入 help_planner。 ======
 def test_reroute_unavailable_does_not_call_help_planner():
-    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteUnavailable": True, "rerouteUnavailableReason": "model 401"}
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteUnavailable": True, "rerouteUnavailableReason": "model 401"}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert plan["tool_calls"] == []
     assert plan["action"] == "reroute_unavailable"

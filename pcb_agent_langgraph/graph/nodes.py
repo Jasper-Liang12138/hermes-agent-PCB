@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
+import time
+from pathlib import Path
 from typing import Any
 
 from pcb_agent_langgraph.graph.state import PCBState, add_trace
@@ -287,6 +291,18 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
             cache["importLinesResult"] = result
     elif tool_name == "pcb_extra_bga":
         cache["bgaCandidates"] = (result or {}).get("components", []) if isinstance(result, dict) else []
+    elif tool_name == "prepare_reroute_inputs":
+        cache["rerouteInput"] = result
+        if isinstance(result, dict):
+            if result.get("selectedNets"):
+                cache["selectedNets"] = result.get("selectedNets")
+            if result.get("missingRoutes"):
+                cache["missingRoutes"] = result.get("missingRoutes")
+            if result.get("kicadBoardText"):
+                cache["projectData"] = result.get("kicadBoardText")
+                cache["boardData"] = result.get("kicadBoardText")
+            if result.get("localRouteCsvPath"):
+                cache["localRouteCsvPath"] = result.get("localRouteCsvPath")
     elif tool_name == "compress_reroute_context":
         cache["rerouteContext"] = result
     elif tool_name in {"fanout_route", "reroute"}:
@@ -299,6 +315,7 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
         cache[f"{tool_name}Result"] = result
         if tool_name == "reroute" and isinstance(result, dict):
             cache["lastRerouteResult"] = result
+            cache.setdefault("rerouteStartedAt", time.time())
             cache["rerouteAttemptCount"] = max(int(cache.get("rerouteAttemptCount", 0)), int(result.get("attempt") or 0))
             cache.pop("drcResult", None)
             cache.pop("explainabilityReport", None)
@@ -306,6 +323,21 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
             cache["fanoutParams"] = result.get("fanoutParams")
     elif tool_name == "drc_check":
         cache["drcResult"] = result
+        if isinstance(result, dict) and isinstance(cache.get("rerouteResult"), dict):
+            detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
+            filled_path = detail.get("filled_board_data_file_path") or result.get("filledBoardDataFilePath")
+            if filled_path:
+                reroute_result = dict(cache.get("rerouteResult") or {})
+                reroute_result["routedKicadFilePath"] = filled_path
+                import_path, notes = _write_reroute_incremental_import_file(cache, reroute_result)
+                if import_path:
+                    reroute_result["importLinesFilePath"] = import_path
+                    reroute_result["incrementalImportFilePath"] = import_path
+                    reroute_result["incrementalImportNotes"] = notes
+                else:
+                    reroute_result.pop("importLinesFilePath", None)
+                    reroute_result["incrementalImportNotes"] = notes or ["reroute_incremental_import_not_generated"]
+                cache["rerouteResult"] = reroute_result
         if _result_failed(result):
             cache["rerouteDrcFailureCount"] = int(cache.get("rerouteDrcFailureCount", 0)) + 1
             history = list(cache.get("rerouteDrcFeedbackHistory") or [])
@@ -576,3 +608,243 @@ def _reroute_feedback_summary(cache: dict[str, Any]) -> dict[str, Any]:
         "explainStatus": explain.get("status"),
         "explainReason": explain.get("reason") or str(explain.get("report") or "")[:1200],
     }
+
+
+def _write_reroute_incremental_import_file(cache: dict[str, Any], reroute_result: dict[str, Any]) -> tuple[str, list[str]]:
+    patch_text = str(reroute_result.get("modelOutputText") or reroute_result.get("routedText") or "").strip()
+    reroute_input = cache.get("rerouteInput") if isinstance(cache.get("rerouteInput"), dict) else {}
+    board_text = str(reroute_input.get("kicadBoardText") or cache.get("boardData") or cache.get("projectData") or "")
+    work_dir = Path(str(reroute_result.get("workDir") or (reroute_input or {}).get("workDir") or "."))
+    session_id = str(cache.get("session_id") or "session")
+    local_context = {"missingRoutes": cache.get("missingRoutes") or reroute_input.get("missingRoutes") or []}
+    if not patch_text:
+        return "", ["reroute_incremental_import_missing_patch_text"]
+    if not board_text:
+        return "", ["reroute_incremental_import_missing_board_text"]
+
+    net_id_to_name = _kicad_net_id_to_name(board_text)
+    line_records: list[str] = []
+    for block in _extract_balanced_sexpr_blocks(patch_text, "segment"):
+        start = re.search(r"\(\s*start\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        end = re.search(r"\(\s*end\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        width = re.search(r"\(\s*width\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        layer = re.search(r"\(\s*layer\s+\"?([^\s\)\"]+)\"?\s*\)", block, re.IGNORECASE)
+        net = re.search(r"\(\s*net\s+(\d+)\s*\)", block, re.IGNORECASE)
+        if not (start and end and width and layer and net):
+            continue
+        net_name = net_id_to_name.get(net.group(1).strip(), net.group(1).strip()).replace("!", "_")
+        line_layer = _kicad_layer_to_line_out_layer(layer.group(1))
+        width_mil = _kicad_mm_to_mil_text(width.group(1))
+        x1_raw = float(start.group(1))
+        y1_raw = float(start.group(2))
+        x2_raw = float(end.group(1))
+        y2_raw = float(end.group(2))
+        clip = _single_axis_missing_route_clip(local_context, net_name, layer.group(1))
+        clipped = _clip_segment_to_single_axis_missing_route(x1=x1_raw, y1=y1_raw, x2=x2_raw, y2=y2_raw, clip=clip)
+        if clipped is None:
+            continue
+        x1_raw, y1_raw, x2_raw, y2_raw = clipped
+        line_records.append(
+            f"{line_layer}!LINE!0!{net_name}!"
+            f"{_kicad_mm_to_line_out_coord_text(str(x1_raw), 'x')}!"
+            f"{_kicad_mm_to_line_out_coord_text(str(y1_raw), 'y')}!"
+            f"{_kicad_mm_to_line_out_coord_text(str(x2_raw), 'x')}!"
+            f"{_kicad_mm_to_line_out_coord_text(str(y2_raw), 'y')}!"
+            f"{width_mil}"
+        )
+    if not line_records:
+        return "", ["reroute_incremental_import_no_segment_records"]
+
+    import_dir = work_dir / "import"
+    import_dir.mkdir(parents=True, exist_ok=True)
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id).strip("_") or "session"
+    output_path = import_dir / f"{safe_session}_reroute_line.out"
+    import_text = "\n".join(line_records) + "\n"
+    passed, reason, stats = _validate_reroute_incremental_import_text(import_text)
+    if not passed:
+        return "", [f"reroute_incremental_import_invalid:{reason}"]
+    output_path.write_text(import_text, encoding="utf-8")
+    return str(output_path), [f"generated_reroute_incremental_line_out:{output_path}", f"lineCount:{stats.get('lineCount', 0)}"]
+
+
+def _extract_balanced_sexpr_blocks(text: str, head: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    blocks: list[str] = []
+    pattern = re.compile(rf"\(\s*{re.escape(head)}\b", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(match.start(), len(text)):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "(":
+                depth += 1
+                continue
+            if char == ")":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[match.start():pos + 1].strip())
+                    break
+    return blocks
+
+
+def _parse_kicad_net_name_to_id(board_text: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not isinstance(board_text, str) or not board_text:
+        return mapping
+    for pattern in (
+        re.compile(r"\(\s*net\s+(\d+)\s+\"([^\"]+)\"\s*\)", re.IGNORECASE),
+        re.compile(r"\(\s*net\s+(\d+)\s+([^\s\)]+)\s*\)", re.IGNORECASE),
+    ):
+        for match in pattern.finditer(board_text):
+            net_id = match.group(1).strip()
+            net_name = match.group(2).strip()
+            if net_name and net_name not in mapping:
+                mapping[net_name] = net_id
+    return mapping
+
+
+def _kicad_net_id_to_name(board_text: str) -> dict[str, str]:
+    return {net_id: net_name for net_name, net_id in _parse_kicad_net_name_to_id(board_text).items()}
+
+
+def _kicad_mm_to_mil_text(value: str) -> str:
+    return f"{(float(value) / 0.0254):.2f}"
+
+
+def _kicad_mm_to_line_out_coord_text(value: str, axis: str) -> str:
+    origin = 363386.0 if axis == "x" else 534646.0
+    dbu_mm = 0.000254
+    local_mil = (float(value) / dbu_mm - origin) / 100.0
+    return f"{local_mil:.2f}"
+
+
+def _kicad_layer_to_line_out_layer(layer: str) -> str:
+    layer = str(layer or "").strip().strip('"')
+    aliases = {"F.Cu": "TOP", "B.Cu": "BOTTOM", "Top": "TOP", "Bottom": "BOTTOM", "Conductor/Top": "TOP", "Conductor/Bottom": "BOTTOM"}
+    if layer in aliases:
+        return aliases[layer]
+    if layer.startswith("Conductor/"):
+        layer = layer.split("/", 1)[1]
+    if layer.lower() == "top":
+        return "TOP"
+    if layer.lower() == "bottom":
+        return "BOTTOM"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", layer).upper()
+
+
+def _validate_reroute_incremental_import_text(text: str) -> tuple[bool, str, dict[str, Any]]:
+    stripped = str(text or "").lstrip()
+    if not stripped:
+        return False, "轻量 line.out 导入文件为空", {"lineCount": 0}
+    if stripped.startswith("(layout"):
+        return False, "轻量 line.out 导入文件不能是完整 layout", {}
+    if stripped.startswith("(wires"):
+        return False, "轻量 line.out 导入文件不能是 (wires ...) 子结构", {}
+    valid_count = 0
+    layers: list[str] = []
+    invalid_reasons: list[str] = []
+    for line_no, raw in enumerate(stripped.splitlines(), start=1):
+        parts = [part.strip() for part in raw.split("!")]
+        if len(parts) != 9 or parts[1].upper() != "LINE":
+            invalid_reasons.append(f"line {line_no}: 不是 LINE 记录")
+            continue
+        layer, _, _, net, x1, y1, x2, y2, width = parts
+        if not layer or "/" in layer or ".Cu" in layer:
+            invalid_reasons.append(f"line {line_no}: 层名不是 line.out 原生层名")
+            continue
+        if not net:
+            invalid_reasons.append(f"line {line_no}: 缺少 net")
+            continue
+        try:
+            values = [float(x1), float(y1), float(x2), float(y2), float(width)]
+        except ValueError:
+            invalid_reasons.append(f"line {line_no}: 坐标或线宽不是数字")
+            continue
+        if any(not math.isfinite(value) for value in values):
+            invalid_reasons.append(f"line {line_no}: 坐标或线宽不是有限数字")
+            continue
+        if values[-1] < 0 or values[-1] > 250:
+            invalid_reasons.append(f"line {line_no}: 线宽超出 importLines 范围")
+            continue
+        layers.append(layer.upper())
+        valid_count += 1
+    if valid_count <= 0:
+        reason = "轻量 line.out 导入文件未包含有效 LINE 记录"
+        if invalid_reasons:
+            reason += "：" + "; ".join(invalid_reasons[:3])
+        return False, reason, {"lineCount": 0, "layers": sorted(set(layers))}
+    return True, "", {"lineCount": valid_count, "layers": sorted(set(layers))}
+
+
+def _single_axis_missing_route_clip(local_context: Any, net_name: str, layer_name: str) -> dict[str, Any] | None:
+    if not isinstance(local_context, dict):
+        return None
+    routes = local_context.get("missingRoutes")
+    if not isinstance(routes, list) or len(routes) != 1:
+        return None
+    route = routes[0]
+    if not isinstance(route, dict):
+        return None
+    route_net = str(route.get("net_name") or route.get("net") or "").strip()
+    if route_net and route_net != net_name:
+        return None
+    start = route.get("start")
+    end = route.get("end")
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return None
+    route_layer = str(start.get("layer") or end.get("layer") or "").strip()
+    if route_layer and _kicad_layer_to_line_out_layer(route_layer) != _kicad_layer_to_line_out_layer(layer_name):
+        return None
+    try:
+        sx = float(start["x"])
+        sy = float(start["y"])
+        ex = float(end["x"])
+        ey = float(end["y"])
+    except Exception:
+        return None
+    tolerance = 0.05
+    if abs(sx - ex) <= tolerance:
+        return {"axis": "y", "fixed": sx, "min": min(sy, ey), "max": max(sy, ey), "tolerance": tolerance}
+    if abs(sy - ey) <= tolerance:
+        return {"axis": "x", "fixed": sy, "min": min(sx, ex), "max": max(sx, ex), "tolerance": tolerance}
+    return None
+
+
+def _clip_segment_to_single_axis_missing_route(*, x1: float, y1: float, x2: float, y2: float, clip: dict[str, Any] | None) -> tuple[float, float, float, float] | None:
+    if not clip:
+        return x1, y1, x2, y2
+    axis = clip.get("axis")
+    fixed = float(clip.get("fixed"))
+    lower = float(clip.get("min"))
+    upper = float(clip.get("max"))
+    tolerance = float(clip.get("tolerance", 0.05))
+    if axis == "y":
+        if abs(x1 - fixed) > tolerance or abs(x2 - fixed) > tolerance:
+            return None
+        seg_lower, seg_upper = min(y1, y2), max(y1, y2)
+        overlap_lower, overlap_upper = max(seg_lower, lower), min(seg_upper, upper)
+        if overlap_upper - overlap_lower <= tolerance:
+            return None
+        return (fixed, overlap_lower, fixed, overlap_upper) if y1 <= y2 else (fixed, overlap_upper, fixed, overlap_lower)
+    if axis == "x":
+        if abs(y1 - fixed) > tolerance or abs(y2 - fixed) > tolerance:
+            return None
+        seg_lower, seg_upper = min(x1, x2), max(x1, x2)
+        overlap_lower, overlap_upper = max(seg_lower, lower), min(seg_upper, upper)
+        if overlap_upper - overlap_lower <= tolerance:
+            return None
+        return (overlap_lower, fixed, overlap_upper, fixed) if x1 <= x2 else (overlap_upper, fixed, overlap_lower, fixed)
+    return x1, y1, x2, y2

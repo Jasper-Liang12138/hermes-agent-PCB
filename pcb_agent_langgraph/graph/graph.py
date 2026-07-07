@@ -8,16 +8,17 @@ from pcb_agent_langgraph.models.pcb_model import PCBModel
 from pcb_agent_langgraph.planner.planner import PCBPlanner
 from pcb_agent_langgraph.tools.base import Tool
 from pcb_agent_langgraph.tools.frontend import ProgressSender
+from pcb_agent_langgraph.utils.config import AppConfig
 
 
 # ====== 功能：创建并编译 PCB Agent 的 LangGraph 状态图。 ======
-def build_graph(model: PCBModel | None, tools: dict[str, Tool], *, progress_sender: ProgressSender | None = None, use_model_planner: bool = True, require_model_planner: bool = False) -> Any:
+def build_graph(model: PCBModel | None, tools: dict[str, Tool], *, progress_sender: ProgressSender | None = None, use_model_planner: bool = True, require_model_planner: bool = False, config: AppConfig | None = None) -> Any:
     try:
         from langgraph.graph import END, StateGraph
     except Exception as exc:
         raise RuntimeError("LangGraph is required. Install requirements.txt before running the PCB agent.") from exc
 
-    nodes = GraphNodes(PCBPlanner(model=model, use_model=use_model_planner, require_model=require_model_planner), tools, progress_sender=progress_sender)
+    nodes = GraphNodes(PCBPlanner(model=model, use_model=use_model_planner, require_model=require_model_planner, config=config), tools, progress_sender=progress_sender)
     graph = StateGraph(PCBState)
     graph.add_node("intent", nodes.intent)
     graph.add_node("plan", nodes.plan)
@@ -32,7 +33,6 @@ def build_graph(model: PCBModel | None, tools: dict[str, Tool], *, progress_send
     graph.add_edge("reflect", "finish")
     graph.add_edge("finish", END)
     return graph.compile()
-
 
 
 
