@@ -19,6 +19,7 @@ def build_tool_registry(config: AppConfig, frontend_sender: FrontendToolSender |
         "escape_order": ExternalProgramTool("escape_order", config),
         "fanout_route": ExternalProgramTool("fanout_route", config),
         "prepare_reroute_inputs": ExternalProgramTool("prepare_reroute_inputs", config),
+        "reroute_loop": ExternalProgramTool("reroute_loop", config),
         "reroute": ExternalProgramTool("reroute", config),
         "compress_reroute_context": ExternalProgramTool("compress_reroute_context", config),
         "help_planner": ExternalProgramTool("help_planner", config),
@@ -44,5 +45,4 @@ def tool_context_from_state(state: dict[str, Any], call_id: str, timeout: float)
         **dict(cache.get("fanoutEntities") or {}),
         **cache,
     }
-
 

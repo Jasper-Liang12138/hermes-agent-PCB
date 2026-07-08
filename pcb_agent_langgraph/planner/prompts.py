@@ -41,9 +41,19 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": {"type": "object", "properties": {"routerType": {"type": "string"}, "boardPath": {"type": "string"}}},
     },
     {
+        "name": "prepare_reroute_inputs",
+        "description": "Prepare KiCad board input and local route CSV before local reroute.",
+        "parameters": {"type": "object", "properties": {"localRouteCsvPath": {"type": "string"}}},
+    },
+    {
         "name": "reroute",
-        "description": "Run local reroute after selected traces are removed.",
+        "description": "Debug/manual fallback: run one legacy local reroute model attempt after selected traces are removed.",
         "parameters": {"type": "object", "properties": {"localRerouteCompletionPolicy": {"type": "object"}}},
+    },
+    {
+        "name": "reroute_loop",
+        "description": "Run the VSEA reroute pipeline for model generation, fill, hard DRC, and repair retry.",
+        "parameters": {"type": "object", "properties": {"provider": {"type": "string"}}},
     },
     {
         "name": "compress_reroute_context",
@@ -84,7 +94,9 @@ def planner_system_prompt() -> str:
         "If escape order is completed but fanout route is not completed, call fanout_route. "
         "If fanout route is completed and import file exists, call importLines directly; the frontend importLines approval UI is the only import confirmation. "
         "After fanout importLines succeeds, stop with result_review/report; never call drc_check or explainability_report for fanout. "
-        "For reroute, after deleteTracesForRerouting completes, call compress_reroute_context before reroute; after user confirms, call reroute first, then drc_check/explainability_report, retry reroute with DRC feedback up to 3 attempts before help_planner. "
+        "For reroute, after deleteTracesForRerouting completes, call prepare_reroute_inputs, then compress_reroute_context, then reroute_loop. "
+        "If reroute_loop succeeds, trust its hard DRC result and call explainability_report before reporting import confirmation. "
+        "If reroute_loop fails, call help_planner fallback directly. Do not call legacy reroute or drc_check in the default reroute flow. "
         "Example: {\"intent\":\"global_fanout\",\"workflow\":\"pcb_escape_flow\",\"action\":\"get_project\","
         "\"tool_calls\":[{\"name\":\"getProjectData\",\"arguments\":{\"selectedBGA\":\"U22\","
         "\"routerType\":\"rule_135\",\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}}],"

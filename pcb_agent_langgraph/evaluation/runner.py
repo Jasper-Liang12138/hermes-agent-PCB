@@ -111,7 +111,7 @@ class LiveEvaluationRunner:
         if self.simulate_frontend_only:
             # 只替换 EDA 前端交互，外部 router/DRC/explain 仍走 config.ini 的真实入口。
             return agent
-        for name in ("layer_assign", "escape_order", "fanout_route", "reroute", "help_planner", "drc_check", "explainability_report"):
+        for name in ("layer_assign", "escape_order", "fanout_route", "prepare_reroute_inputs", "reroute_loop", "reroute", "help_planner", "drc_check", "explainability_report"):
             agent.tools[name] = SimulatedExternalTool(name, self.output_dir / "simulated_files", sample)
         return agent
 
@@ -254,7 +254,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 

@@ -232,13 +232,13 @@ def test_fanout_single_bga_candidate_returns_selection():
     assert plan["action"] == "select_bga"
     assert plan["selection"][0]["label"] == "U5"
 
-# ====== 功能：验证 reroute 上下文完成后直接进入主模型重布。 ======
-def test_reroute_after_context_calls_model_reroute_directly():
+# ====== 功能：验证 reroute 上下文完成后直接进入 VSEA 主循环。 ======
+def test_reroute_after_context_calls_vsea_reroute_loop_directly():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["GND"]}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     state = {"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(use_model=False).plan(state)
-    assert plan["action"] == "reroute"
-    assert plan["tool_calls"][0]["name"] == "reroute"
+    assert plan["action"] == "reroute_loop"
+    assert plan["tool_calls"][0]["name"] == "reroute_loop"
 # ====== 功能：验证唯一 BGA 自动进入参数生成后停在 fanoutParams 确认。 ======
 def test_fanout_single_bga_stops_for_fanout_params_review():
     cache = {
@@ -284,8 +284,8 @@ def test_fanout_route_result_calls_import_lines_directly():
 def test_reroute_context_calls_reroute_without_confirm():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["GND"]}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "reroute"
-    assert plan["tool_calls"][0]["name"] == "reroute"
+    assert plan["action"] == "reroute_loop"
+    assert plan["tool_calls"][0]["name"] == "reroute_loop"
 
 
 # ====== 功能：验证 reroute 成功写缓存时不会因日志摘要缺少 json 导入而中断。 ======
@@ -389,6 +389,213 @@ def test_helper_router_routed_board_diff_generates_incremental_line_out(tmp_path
     assert "DDR_DQ0" in text
     assert "DDR_DQ1" not in text
     assert any("generated_helper_router_incremental_line_out" in note for note in notes)
+
+
+# ====== 功能：验证 VSEA reroute_loop 成功后生成可导入增量 line.out 并信任 hard DRC。 ======
+def test_reroute_loop_vsea_success_generates_incremental_import(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    class FakeSchemas:
+        class RerouteInput:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    class FakeResult:
+        def __init__(self, routed_path: Path):
+            self.routed_path = routed_path
+
+        def to_dict(self):
+            return {
+                "success": True,
+                "status": "passed",
+                "routing_patch": "(segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))",
+                "completed_kicad_path": str(self.routed_path),
+                "drc_report": {"violations": 0},
+            }
+
+    class FakeAgent:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def run(self, request):
+            assert request.kwargs["routing_task_prompt"]
+            routed_path = tmp_path / "completed.kicad_pcb"
+            routed_path.write_text(
+                """
+                (kicad_pcb
+                  (net 1 DDR_DQ0)
+                  (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+                  (segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))
+                )
+                """,
+                encoding="utf-8",
+            )
+            return FakeResult(routed_path)
+
+    class FakeAgentModule:
+        RerouteAgent = FakeAgent
+
+    def fake_import(_pipeline_root, module_name):
+        return FakeSchemas if module_name.endswith(".schemas") else FakeAgentModule
+
+    pipeline_root = tmp_path / "VSEA-PCB"
+    pipeline_root.mkdir()
+    config = load_config("missing-config.ini")
+    config.reroute_loop.pipeline_root = str(pipeline_root)
+    monkeypatch.setattr(external, "_import_vsea_module", fake_import)
+    tool = ExternalProgramTool("reroute_loop", config)
+    context = {
+        "session_id": "s1",
+        "rerouteInput": {
+            "kicadBoardText": """
+            (kicad_pcb
+              (net 1 DDR_DQ0)
+              (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+            )
+            """,
+            "kicadBoardPath": str(tmp_path / "input.kicad_pcb"),
+            "selectedNets": ["DDR_DQ0"],
+            "missingRoutes": [{"net_name": "DDR_DQ0"}],
+        },
+        "rerouteContext": {"contextText": "DDR_DQ0 local area"},
+    }
+
+    result = asyncio.run(tool.ainvoke({}, context))
+
+    assert result["status"] == "ok"
+    assert result["source"] == "vsea_reroute_pipeline"
+    assert result["drcResult"]["passed"] is True
+    import_path = Path(result["importLinesFilePath"])
+    assert import_path.suffix == ".out"
+    assert "DDR_DQ0" in import_path.read_text(encoding="utf-8")
+
+
+# ====== 功能：验证 VSEA reroute_loop 失败不会给前端导入路径。 ======
+def test_reroute_loop_vsea_failure_has_no_import_path(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    class FakeSchemas:
+        class RerouteInput:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    class FakeResult:
+        def to_dict(self):
+            return {"success": False, "status": "drc_failed", "error": "violation"}
+
+    class FakeAgent:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def run(self, _request):
+            return FakeResult()
+
+    class FakeAgentModule:
+        RerouteAgent = FakeAgent
+
+    pipeline_root = tmp_path / "VSEA-PCB"
+    pipeline_root.mkdir()
+    config = load_config("missing-config.ini")
+    config.reroute_loop.pipeline_root = str(pipeline_root)
+    monkeypatch.setattr(external, "_import_vsea_module", lambda _root, name: FakeSchemas if name.endswith(".schemas") else FakeAgentModule)
+    result = asyncio.run(
+        ExternalProgramTool("reroute_loop", config).ainvoke(
+            {},
+            {
+                "session_id": "s2",
+                "rerouteInput": {"kicadBoardText": "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteContext": {"contextText": "DDR_DQ0"},
+            },
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["failureType"] == "drc_failed"
+    assert "importLinesFilePath" not in result
+
+
+# ====== 功能：验证 VSEA 只返回 completed_kicad 文本时会落盘后生成增量导入文件。 ======
+def test_reroute_loop_vsea_completed_text_generates_import(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    class FakeSchemas:
+        class RerouteInput:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+    class FakeResult:
+        def to_dict(self):
+            return {
+                "success": True,
+                "status": "passed",
+                "routing_patch": "(segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))",
+                "completed_kicad": """
+                (kicad_pcb
+                  (net 1 DDR_DQ0)
+                  (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+                  (segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))
+                )
+                """,
+                "drc_report": {"violations": 0},
+            }
+
+    class FakeAgent:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def run(self, _request):
+            return FakeResult()
+
+    class FakeAgentModule:
+        RerouteAgent = FakeAgent
+
+    pipeline_root = tmp_path / "VSEA-PCB"
+    pipeline_root.mkdir()
+    config = load_config("missing-config.ini")
+    config.reroute_loop.pipeline_root = str(pipeline_root)
+    monkeypatch.setattr(external, "_import_vsea_module", lambda _root, name: FakeSchemas if name.endswith(".schemas") else FakeAgentModule)
+    result = asyncio.run(
+        ExternalProgramTool("reroute_loop", config).ainvoke(
+            {},
+            {
+                "session_id": "s4",
+                "rerouteInput": {
+                    "kicadBoardText": """
+                    (kicad_pcb
+                      (net 1 DDR_DQ0)
+                      (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+                    )
+                    """,
+                    "selectedNets": ["DDR_DQ0"],
+                },
+                "rerouteContext": {"contextText": "DDR_DQ0"},
+            },
+        )
+    )
+    assert result["status"] == "ok"
+    assert Path(result["routedKicadFilePath"]).name == "completed_from_vsea.kicad_pcb"
+    assert Path(result["importLinesFilePath"]).suffix == ".out"
+
+
+# ====== 功能：验证 VSEA pipeline 路径缺失时明确失败。 ======
+def test_reroute_loop_missing_pipeline_root_fails(tmp_path):
+    config = load_config("missing-config.ini")
+    config.reroute_loop.pipeline_root = str(tmp_path / "missing-vsea")
+    result = asyncio.run(
+        ExternalProgramTool("reroute_loop", config).ainvoke(
+            {},
+            {
+                "session_id": "s3",
+                "rerouteInput": {"kicadBoardText": "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteContext": {"contextText": "DDR_DQ0"},
+            },
+        )
+    )
+    assert result["status"] == "failed"
+    assert result["failureType"] == "pipeline_unavailable"
 # ====== 功能：验证普通消息不携带空 selection。 ======
 def test_agent_message_omits_none_selection():
     message = agent_message("s1", "p1", "正文", selection=None)
@@ -475,8 +682,8 @@ def test_model_repeated_compress_context_rewritten_to_reroute():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}, "rerouteContext": {"status": "ok", "selectedNets": ["Z7_SPI0_SCK"]}}
     state = {"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
     plan = PCBPlanner(model=FakeModel(), use_model=True, require_model=True).plan(state)
-    assert plan["action"] == "reroute"
-    assert plan["tool_calls"][0]["name"] == "reroute"
+    assert plan["action"] == "reroute_loop"
+    assert plan["tool_calls"][0]["name"] == "reroute_loop"
 # ====== 功能：验证 help_planner 不会把 export.txt 伪装成 KiCad 输入。 ======
 def test_help_planner_rejects_export_txt_input():
     config = load_config("missing-config.ini")
@@ -550,13 +757,12 @@ def test_new_fanout_clears_import_rejection_state():
     assert "importLinesResult" not in cache
 
 
-# ====== 功能：验证主 reroute unavailable 直接报告，不进入 help_planner。 ======
-def test_reroute_unavailable_does_not_call_help_planner():
+# ====== 功能：验证旧主模型 unavailable 标记不再阻塞 VSEA reroute_loop。 ======
+def test_legacy_reroute_unavailable_does_not_block_vsea_loop():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteUnavailable": True, "rerouteUnavailableReason": "model 401"}
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "rip_up", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["tool_calls"] == []
-    assert plan["action"] == "reroute_unavailable"
-    assert "model 401" in plan["response"]
+    assert plan["action"] == "reroute_loop"
+    assert plan["tool_calls"][0]["name"] == "reroute_loop"
 
 
 # ====== 功能：验证 patch fill 失败不能被 target scoped DRC 误判为通过。 ======
@@ -592,19 +798,17 @@ def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
     assert result["targetScopedPassed"] is False
 
 
-# ====== 功能：验证 DRC fill failed 后 planner 重试 reroute，不调用 explainability。 ======
-def test_planner_retries_after_drc_fill_failed_not_explainability():
+# ====== 功能：验证默认 reroute_loop 失败后 planner 直接进入 help_planner。 ======
+def test_planner_reroute_loop_failure_calls_help_planner_not_legacy_retry():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
         "rerouteContext": {"status": "ok"},
-        "rerouteResult": {"status": "ok"},
-        "drcResult": {"status": "failed", "passed": False, "drcExecutionValid": False},
-        "rerouteDrcFailureCount": 1,
+        "rerouteLoopResult": {"status": "failed", "reason": "drc_failed"},
     }
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "reroute_retry"
-    assert [call["name"] for call in plan["tool_calls"]] == ["reroute"]
+    assert plan["action"] == "help_planner"
+    assert [call["name"] for call in plan["tool_calls"]] == ["help_planner"]
 
 
 # ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======

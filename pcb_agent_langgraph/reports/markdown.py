@@ -14,7 +14,7 @@ def build_markdown_report(task_type: str, cache: dict[str, Any]) -> dict[str, An
     route = _route_result(cache, task_type)
     import_result = cache.get("importLinesResult") if isinstance(cache.get("importLinesResult"), dict) else {}
 
-    title = "PCB Reroute Report" if task_type == "reroute" else "PCB Report"
+    title = "PCB Reroute Report" if task_type == "reroute" else "PCB Fanout Report" if task_type == "global_fanout" else "PCB Report"
     passed = drc.get("passed")
     status = "passed" if passed is True else str(drc.get("status") or "unknown")
     lines = [

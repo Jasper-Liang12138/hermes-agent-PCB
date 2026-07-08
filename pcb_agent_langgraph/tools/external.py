@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -21,17 +22,13 @@ from pcb_agent_langgraph.utils.config import AppConfig
 
 
 class RerouteLoopTool:
-    # ====== 功能：预留可插拔 reroute loop 接口；当前流程仍由 planner 串联独立工具。
+    # ====== 功能：兼容旧调用方的 reroute loop 工具包装。
+    def __init__(self, config: AppConfig) -> None:
+        self._tool = ExternalProgramTool("reroute_loop", config)
+
     async def ainvoke(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {
-            "status": "failed",
-            "tool": "reroute_loop",
-            "reason": "reroute_loop plugin is not configured; use default reroute -> drc_check -> help_planner flow",
-            "modelAttempts": [],
-            "drcHistory": [],
-            "fallbackUsed": False,
-        }
+        return await self._tool.ainvoke(arguments, context)
 
 
 # ====== 功能：返回第一个非空字符串参数。 ======
@@ -60,6 +57,8 @@ class ExternalProgramTool:
             return await self._run_fanout_route(arguments, context)
         if self.name == "prepare_reroute_inputs":
             return await self._prepare_reroute_inputs(arguments, context)
+        if self.name == "reroute_loop":
+            return await self._run_reroute_loop(arguments, context)
         if self.name == "reroute":
             return await self._run_reroute(arguments, context)
         if self.name == "compress_reroute_context":
@@ -271,6 +270,126 @@ class ExternalProgramTool:
         result["selectedNets"] = nets
         result["selectedTraceIds"] = selected_trace_ids
         return result
+
+    # ====== 功能：调用 VSEA reroute_pipeline 作为主 reroute 模型-DRC loop。
+    async def _run_reroute_loop(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        if not self.config.reroute_loop.enabled:
+            return {"status": "failed", "tool": self.name, "reason": "reroute_loop is disabled in config"}
+        provider = str(arguments.get("provider") or self.config.reroute_loop.provider or "vsea").strip().lower()
+        if provider != "vsea":
+            return {"status": "failed", "tool": self.name, "reason": f"unsupported reroute_loop provider: {provider}"}
+
+        reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
+        kicad_text = str(reroute_input.get("kicadBoardText") or "")
+        if not kicad_text or not kicad_text.lstrip().lower().startswith("(kicad_pcb"):
+            return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute_loop", "failureStage": "input", "failureType": "missing_kicad_board_data"}
+        prompt = _vsea_routing_task_prompt(arguments, context, reroute_input)
+        if not prompt.strip():
+            return {"status": "failed", "tool": self.name, "reason": "missing routing task prompt for reroute_loop", "failureStage": "input", "failureType": "missing_routing_task_prompt"}
+
+        pipeline_root = _resolve_path(self.config.root, arguments.get("pipelineRoot") or self.config.reroute_loop.pipeline_root)
+        if not pipeline_root.exists():
+            return {"status": "failed", "tool": self.name, "reason": "VSEA reroute_pipeline root does not exist", "pipelineRoot": str(pipeline_root), "failureStage": "pipeline_config", "failureType": "pipeline_unavailable"}
+        work_dir = self._work_dir(context) / "vsea_reroute_pipeline"
+        safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(context.get("session_id") or "session")).strip("_") or "session"
+        task_id = f"{safe_session}_reroute"
+        output_dir = work_dir / task_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            schemas_mod = _import_vsea_module(pipeline_root, "reroute_pipeline.schemas")
+            agent_mod = _import_vsea_module(pipeline_root, "reroute_pipeline.agent")
+            request = schemas_mod.RerouteInput(
+                task_id=task_id,
+                context_kicad=kicad_text,
+                routing_task_prompt=prompt,
+                output_dir=str(output_dir),
+                board_id=str(context.get("project_id") or context.get("session_id") or task_id),
+                target_bga=_first_text(arguments.get("target_bga"), arguments.get("targetBGA"), context.get("target_bga"), context.get("targetBGA"), context.get("selectedBGA")),
+                model=str(arguments.get("model") or ""),
+                max_rounds=int(arguments.get("max_rounds") or arguments.get("maxRounds") or self.config.reroute_loop.max_rounds),
+                samples=int(arguments.get("samples") or self.config.reroute_loop.samples),
+                repair_samples=int(arguments.get("repair_samples") or arguments.get("repairSamples") or self.config.reroute_loop.repair_samples),
+                repair_retries=int(arguments.get("repair_retries") or arguments.get("repairRetries") or self.config.reroute_loop.repair_retries),
+            )
+            with _patched_env(_vsea_env(self.config, arguments, output_dir)):
+                result = await asyncio.to_thread(agent_mod.RerouteAgent.from_env().run, request)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": f"重布线主流程失败，已切换兜底布线：{exc}",
+                "failureStage": "pipeline_call",
+                "failureType": "pipeline_exception",
+                "tracebackSummary": _traceback_summary(exc),
+                "pipelineRoot": str(pipeline_root),
+                "workDir": str(output_dir),
+            }
+
+        payload = result.to_dict() if hasattr(result, "to_dict") else _dataclass_to_dict(result)
+        if not bool(payload.get("success")):
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": f"重布线主流程失败，已切换兜底布线：{payload.get('error') or payload.get('status') or 'unknown error'}",
+                "failureStage": "pipeline_result",
+                "failureType": str(payload.get("status") or "failed"),
+                "vseaResult": payload,
+                "workDir": str(output_dir),
+            }
+
+        routed_path = str(payload.get("completed_kicad_path") or "")
+        if not routed_path and str(payload.get("completed_kicad") or "").strip():
+            completed_path = output_dir / "completed_from_vsea.kicad_pcb"
+            completed_path.write_text(str(payload.get("completed_kicad")), encoding="utf-8")
+            routed_path = str(completed_path)
+            payload["completed_kicad_path"] = routed_path
+        if not routed_path:
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": "重布线主流程失败，已切换兜底布线：VSEA did not return completed board data",
+                "failureStage": "pipeline_result",
+                "failureType": "missing_completed_board",
+                "vseaResult": payload,
+                "workDir": str(output_dir),
+            }
+        import_path = ""
+        import_notes: list[str] = []
+        import_path, import_notes = _write_helper_router_incremental_import_file(
+            original_board_text=kicad_text,
+            routed_board_path=Path(routed_path),
+            selected_nets=list(reroute_input.get("selectedNets") or context.get("selectedNets") or []),
+            work_dir=output_dir,
+        )
+        if not import_path:
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": "重布线主流程失败，已切换兜底布线：VSEA completed board could not be converted to incremental import lines",
+                "failureStage": "incremental_import",
+                "failureType": "incremental_import_failed",
+                "incrementalImportNotes": import_notes,
+                "vseaResult": payload,
+                "routedKicadFilePath": routed_path,
+                "workDir": str(output_dir),
+            }
+        return {
+            "status": "ok",
+            "tool": self.name,
+            "source": "vsea_reroute_pipeline",
+            "modelOutputText": str(payload.get("routing_patch") or ""),
+            "routedKicadFilePath": routed_path,
+            "importLinesFilePath": import_path,
+            "incrementalImportFilePath": import_path,
+            "incrementalImportNotes": import_notes,
+            "vseaResult": payload,
+            "drcResult": {"status": "ok", "passed": True, "source": "vsea_reroute_pipeline", "detail": payload.get("drc_report") or {}},
+            "report": "VSEA reroute_pipeline completed and passed hard DRC.",
+            "workDir": str(output_dir),
+            "routingTaskPrompt": prompt,
+        }
 
     # ====== 功能：执行主模型 reroute，一轮只生成候选重布结果，不在这里兜底 help_planner。 ======
     async def _run_reroute(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -782,6 +901,67 @@ def _prepare_local_route_csv(project_root: Path, route_params: dict[str, Any], k
     csv_path = local_router.write_local_route_csv(route_params=route_params, project_data=kicad_text, work_dir=work_dir)
     header = csv_path.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip().lower()
     return csv_path, "fixed_route_layer" if "route_layer" in header else "net_only"
+
+
+@contextmanager
+def _patched_env(values: dict[str, str]):
+    previous: dict[str, str | None] = {}
+    for key, value in values.items():
+        previous[key] = os.environ.get(key)
+        if value and previous[key] in (None, ""):
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _vsea_env(config: AppConfig, arguments: dict[str, Any], output_dir: Path) -> dict[str, str]:
+    return {
+        "REROUTE_LLM_API_KEY": str(arguments.get("api_key") or arguments.get("apiKey") or config.model.api_key or ""),
+        "REROUTE_LLM_BASE_URL": str(arguments.get("base_url") or arguments.get("baseUrl") or config.model.base_url or ""),
+        "REROUTE_MODEL": str(arguments.get("model") or config.model.model or ""),
+        "REROUTE_OUTPUT_DIR": str(output_dir),
+        "REROUTE_TIMEOUT_SECONDS": str(arguments.get("timeout_seconds") or arguments.get("timeoutSeconds") or config.reroute_loop.timeout_seconds),
+    }
+
+
+def _import_vsea_module(pipeline_root: Path, module_name: str):
+    root_text = str(pipeline_root)
+    inserted = False
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+        inserted = True
+    try:
+        return __import__(module_name, fromlist=["*"])
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(root_text)
+            except ValueError:
+                pass
+
+
+def _vsea_routing_task_prompt(arguments: dict[str, Any], context: dict[str, Any], reroute_input: dict[str, Any]) -> str:
+    explicit = _first_text(arguments.get("routing_task_prompt"), arguments.get("routingTaskPrompt"), arguments.get("prompt"))
+    if explicit:
+        return explicit
+    missing_routes = reroute_input.get("missingRoutes") or context.get("missingRoutes") or []
+    selected_nets = reroute_input.get("selectedNets") or context.get("selectedNets") or _nets_from_missing_routes(missing_routes)
+    reroute_context = context.get("rerouteContext") if isinstance(context.get("rerouteContext"), dict) else {}
+    context_text = _first_text(reroute_context.get("contextText"), reroute_context.get("summary"))
+    payload = {
+        "task": "pcb_local_reroute",
+        "instruction": "Repair only the missing local routes listed below. Return KiCad routing objects that complete the selected nets without changing unrelated nets.",
+        "selectedNets": selected_nets,
+        "missingRoutes": missing_routes,
+        "localContext": context_text[:6000],
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _write_helper_router_incremental_import_file(
@@ -1378,8 +1558,4 @@ def _build_report(drc_result: Any) -> str:
     if passed:
         return "DRC passed. No hard-rule violations were reported."
     return f"DRC status={status}; errors={json.dumps(errors, ensure_ascii=False)}"
-
-
-
-
 

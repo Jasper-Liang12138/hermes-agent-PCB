@@ -228,7 +228,7 @@ def route_after_tools(state: PCBState) -> str:
 def _only_recoverable_drc_failures(failed: list[dict[str, Any]], state: PCBState) -> bool:
     if state.get("workflow_id") != "pcb_reroute_flow":
         return False
-    allowed = {"drc_check", "explainability_report"}
+    allowed = {"drc_check", "explainability_report", "reroute_loop"}
     for item in failed:
         call = item.get("call", {}) if isinstance(item, dict) else {}
         if call.get("name") not in allowed:
@@ -305,6 +305,17 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
                 cache["localRouteCsvPath"] = result.get("localRouteCsvPath")
     elif tool_name == "compress_reroute_context":
         cache["rerouteContext"] = result
+    elif tool_name == "reroute_loop":
+        cache["rerouteLoopResult"] = result
+        if isinstance(result, dict) and str(result.get("status", "")).lower() == "ok":
+            cache["rerouteResult"] = result
+            cache.pop("rerouteUnavailable", None)
+            cache.pop("rerouteUnavailableReason", None)
+            if isinstance(result.get("drcResult"), dict):
+                cache["drcResult"] = result.get("drcResult")
+        else:
+            cache.pop("rerouteResult", None)
+            cache.pop("drcResult", None)
     elif tool_name in {"fanout_route", "reroute"}:
         if tool_name == "reroute":
             print(f"reroute_result status={_result_status(result)} reason={_result_reason(result)} attempt={_result_attempt(result)} selectedNets={cache.get('selectedNets')} workDir={_result_work_dir(result)} raw_summary={_result_summary(result)}")
@@ -406,11 +417,13 @@ def _tool_progress_suffix(record: dict[str, Any]) -> str:
     result = record.get("result")
     if not record.get("ok") or _result_failed(result):
         return "返回失败，正在整理原因..."
-    if isinstance(result, dict) and result.get("tool") == "reroute":
+    if isinstance(result, dict) and result.get("tool") in {"reroute", "reroute_loop"}:
         details = []
         elapsed = record.get("elapsed_ms")
         model_elapsed = result.get("elapsedMs")
         output_chars = result.get("modelOutputChars")
+        if result.get("tool") == "reroute_loop":
+            output_chars = output_chars if isinstance(output_chars, int) else len(str(result.get("modelOutputText") or ""))
         work_dir = result.get("workDir")
         if isinstance(elapsed, (int, float)):
             details.append(f"工具耗时 {elapsed / 1000:.1f}s")
@@ -527,7 +540,9 @@ def _reroute_failure_text(diagnostics: dict[str, Any], fallback: str = "") -> st
 def _reroute_stage_label(tool_name: str, action: str = "") -> str:
     mapping = {
         "deleteTracesForRerouting": "前端拆线",
+        "prepare_reroute_inputs": "重布线输入准备",
         "compress_reroute_context": "上下文压缩",
+        "reroute_loop": "VSEA 重布线主流程",
         "reroute": "主模型重布",
         "drc_check": "DRC 检查",
         "explainability_report": "可解释性检查",
@@ -543,6 +558,10 @@ def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
     reason_lower = reason.lower()
     if status.lower() == "unavailable":
         return "model_unavailable"
+    if tool_name == "prepare_reroute_inputs":
+        return "reroute_input_prepare_failed"
+    if tool_name == "reroute_loop":
+        return "reroute_loop_failed"
     if tool_name == "reroute":
         return "model_reroute_failed"
     if tool_name == "compress_reroute_context":
@@ -561,12 +580,16 @@ def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
 def _reroute_next_action(failure_type: str, tool_name: str) -> str:
     if failure_type == "model_unavailable":
         return "检查 [reroute-model] 的 base_url/model/api_key，或查看模型服务返回的 traceback。"
+    if failure_type == "reroute_input_prepare_failed":
+        return "确认前端拆线结果包含可转换的版图数据，并检查格式转换输出目录。"
+    if failure_type == "reroute_loop_failed":
+        return "已切换到 help_planner 兜底；查看 workDir 中的 VSEA 输出、debug 和 DRC 报告。"
     if failure_type == "context_compression_failed":
         return "确认 deleteTracesForRerouting 返回了 projectData/missing_routes，且项目数据是可解析的 KiCad/板级文本。"
     if failure_type == "invalid_kicad_input":
         return "help_planner 需要 .kicad_pcb 输入；请先确认 export.txt 到 KiCad 输入的转换链路。"
     if failure_type == "drc_failed":
-        return "三轮内会携带 DRC 反馈继续调用主模型；满三轮后才进入 help_planner。"
+        return "默认主链路由 VSEA 内部处理 DRC/repair；旧 drc_check 失败时可手动检查 patch fill 和 DRC 明细。"
     if tool_name == "help_planner":
         return "查看 workDir、inputBoardPath、inputCsvPath 和 pcbrouter stderr。"
     return "查看 reportPayload.rerouteDiagnostics 中的路径、stderr 和 tracebackSummary。"

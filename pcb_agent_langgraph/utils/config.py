@@ -74,6 +74,19 @@ class RerouteHelpConfig:
 
 
 @dataclass(slots=True)
+# ====== 功能：保存主 reroute loop 提供方配置。 ======
+class RerouteLoopConfig:
+    enabled: bool = True
+    provider: str = "vsea"
+    pipeline_root: str = ".\\vendor\\VSEA-PCB"
+    max_rounds: int = 2
+    samples: int = 2
+    repair_samples: int = 2
+    repair_retries: int = 2
+    timeout_seconds: int = 900
+
+
+@dataclass(slots=True)
 # ====== 功能：保存 WebSocket 服务监听配置。 ======
 class ServerConfig:
     host: str = "0.0.0.0"
@@ -91,6 +104,7 @@ class AppConfig:
     drc: DrcConfig = field(default_factory=DrcConfig)
     explain_model: ExplainModelConfig = field(default_factory=ExplainModelConfig)
     reroute_help: RerouteHelpConfig = field(default_factory=RerouteHelpConfig)
+    reroute_loop: RerouteLoopConfig = field(default_factory=RerouteLoopConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     board_data_use_file_path: bool = True
 
@@ -165,6 +179,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         reroute_help.max_drc_failures = parser.getint("reroute_help", "max_drc_failures", fallback=reroute_help.max_drc_failures)
         reroute_help.max_elapsed_seconds = parser.getint("reroute_help", "max_elapsed_seconds", fallback=reroute_help.max_elapsed_seconds)
 
+    reroute_loop = RerouteLoopConfig()
+    if parser.has_section("reroute_loop"):
+        reroute_loop.enabled = parser.getboolean("reroute_loop", "enabled", fallback=reroute_loop.enabled)
+        reroute_loop.provider = parser.get("reroute_loop", "provider", fallback=reroute_loop.provider)
+        reroute_loop.pipeline_root = parser.get("reroute_loop", "pipeline_root", fallback=reroute_loop.pipeline_root)
+        reroute_loop.max_rounds = parser.getint("reroute_loop", "max_rounds", fallback=reroute_loop.max_rounds)
+        reroute_loop.samples = parser.getint("reroute_loop", "samples", fallback=reroute_loop.samples)
+        reroute_loop.repair_samples = parser.getint("reroute_loop", "repair_samples", fallback=reroute_loop.repair_samples)
+        reroute_loop.repair_retries = parser.getint("reroute_loop", "repair_retries", fallback=reroute_loop.repair_retries)
+        reroute_loop.timeout_seconds = parser.getint("reroute_loop", "timeout_seconds", fallback=reroute_loop.timeout_seconds)
+
     server = ServerConfig()
     if parser.has_section("server"):
         server.host = parser.get("server", "host", fallback=server.host)
@@ -180,6 +205,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         drc=drc,
         explain_model=explain_model,
         reroute_help=reroute_help,
+        reroute_loop=reroute_loop,
         server=server,
         board_data_use_file_path=board_data_use_file_path,
     )
@@ -238,12 +264,18 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
             "max_drc_failures": config.reroute_help.max_drc_failures,
             "max_elapsed_seconds": config.reroute_help.max_elapsed_seconds,
         },
+        "reroute_loop": {
+            "enabled": config.reroute_loop.enabled,
+            "provider": config.reroute_loop.provider,
+            "pipeline_root": config.reroute_loop.pipeline_root,
+            "max_rounds": config.reroute_loop.max_rounds,
+            "samples": config.reroute_loop.samples,
+            "repair_samples": config.reroute_loop.repair_samples,
+            "repair_retries": config.reroute_loop.repair_retries,
+            "timeout_seconds": config.reroute_loop.timeout_seconds,
+        },
         "server": {"host": config.server.host, "port": config.server.port},
         "board_data_use_file_path": config.board_data_use_file_path,
     }
-
-
-
-
 
 

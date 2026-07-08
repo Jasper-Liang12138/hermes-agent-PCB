@@ -161,11 +161,10 @@ class PCBPlanner:
                 return self._with_calls("reroute", "pcb_reroute_flow", "prepare_reroute_inputs", [{"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0}])
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "compress_context", [{"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0}])
-            if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
-                reason = cache.get("rerouteUnavailableReason") or "reroute model unavailable"
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_unavailable", "tool_calls": [], "response": f"主模型 reroute 不可用：{reason}"}
+            if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0}])
             if not cache.get("rerouteResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "reroute", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
+                return self._with_calls("reroute", "pcb_reroute_flow", "reroute_loop", [{"name": "reroute_loop", "arguments": {}, "timeout": 900.0}])
             if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0}])
             if _drc_failed(cache.get("drcResult")):
@@ -262,7 +261,7 @@ class PCBPlanner:
         if intent == "global_fanout" or workflow == "pcb_escape_flow":
             args = _fanout_args(entities)
             if not cache.get("projectData") and not state.get("pcb_project"):
-                return [self._tool_call({"name": "getProjectData", "arguments": {}, "timeout": 360.0})], "get_project"
+                return [self._tool_call({"name": "getProjectData", "arguments": args, "timeout": 360.0})], "get_project"
             candidates = cache.get("bgaCandidates") if isinstance(cache.get("bgaCandidates"), list) else []
             if not _has_selected_bga(entities) and not candidates:
                 return [self._tool_call({"name": "pcb_extra_bga", "arguments": {}, "timeout": 180.0})], "extract_bga"
@@ -290,10 +289,10 @@ class PCBPlanner:
                 return [self._tool_call({"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0})], "prepare_reroute_inputs"
             if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
                 return [self._tool_call({"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0})], "compress_context"
-            if cache.get("rerouteUnavailable") and not cache.get("rerouteResult"):
-                return [], "reroute_unavailable"
+            if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
+                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0})], "help_planner"
             if not cache.get("rerouteResult"):
-                return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute"
+                return [self._tool_call({"name": "reroute_loop", "arguments": {}, "timeout": 900.0})], "reroute_loop"
             if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
                 return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0})], "help_planner"
             if _drc_failed(cache.get("drcResult")):
@@ -526,7 +525,7 @@ def _state_prompt(state: PCBState) -> str:
         "fanoutEntities": cache.get("fanoutEntities") or cache.get("fanoutParams") or {},
         "next_step_rules": [
             "global_fanout 顺序：getProjectData -> pcb_extra_bga/selection -> router选择(135或arc) -> layer_assign -> escape_order -> fanoutParams确认 -> fanout_route -> importLines(由前端工具审批确认/拒绝) -> result_review(导入成功后生成本轮work_dir报告)；fanout 不调用 DRC/Explainability",
-            "reroute 顺序：deleteTracesForRerouting -> compress_reroute_context -> reroute -> drc_check -> DRC通过后explainability_report一次；DRC失败则带反馈重试reroute最多3轮 -> help_planner兜底 -> report确认 -> importLines；主reroute不可用时直接报告原因，不自动help_planner",
+            "reroute 顺序：deleteTracesForRerouting -> prepare_reroute_inputs -> compress_reroute_context -> reroute_loop(VSEA内部模型/fill/hard DRC/repair) -> explainability_report -> report确认 -> importLines；reroute_loop失败直接 help_planner 兜底；默认不调用旧reroute/drc_check",
             "用户指定 U5/U22 等器件时直接作为 selectedBGA，不要再要求选择 BGA",
             "用户指定线宽线距时写入 entities.constraints.LineWidth 和 LineSpacing，并传给工具 arguments.constraints",
         ],
@@ -617,4 +616,3 @@ def _normalize_validated_call(call: ToolCall, entities: dict[str, Any]) -> ToolC
 def _append_reason(existing: Any, note: str) -> str:
     text = str(existing or "").strip()
     return f"{text}; {note}" if text else note
-

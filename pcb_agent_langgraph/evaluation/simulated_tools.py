@@ -43,14 +43,26 @@ class SimulatedFrontend:
 
     # ====== 功能：生成模拟拆线结果。 ======
     def _delete_traces(self, session_id: str) -> dict[str, Any]:
-        board_path = self.output_dir / f"{session_id}_reroute_input.txt"
-        board_path.write_text("selected traces removed for DDR_DQ0 DDR_DQ1", encoding="utf-8")
+        board_path = self.output_dir / f"{session_id}_reroute_input.kicad_pcb"
+        board_path.write_text(
+            """
+            (kicad_pcb
+              (version 20240108)
+              (layers (0 "F.Cu" signal))
+              (net 1 DDR_DQ0)
+              (net 2 DDR_DQ1)
+              (segment (start 1 1) (end 2 1) (width 0.1524) (layer F.Cu) (net 1))
+            )
+            """,
+            encoding="utf-8",
+        )
         return {
             "status": "ok",
             "source": "simulated_deleteTracesForRerouting",
             "deletedTraceCount": int(self.sample.get("deleted_trace_count", 4)),
             "projectData": {"absolute_path": str(board_path), "boardData": board_path.read_text(encoding="utf-8")},
             "selectedNets": self.sample.get("selected_nets") or ["DDR_DQ0", "DDR_DQ1"],
+            "missing_routes": [{"net_name": net} for net in (self.sample.get("selected_nets") or ["DDR_DQ0", "DDR_DQ1"])],
         }
 
     # ====== 功能：生成模拟导入布线结果。 ======
@@ -87,6 +99,42 @@ class SimulatedExternalTool:
             path = self.output_dir / f"{session_id}_fanout_lines.out"
             path.write_text("LINE DDR_DQ0 0 0 10 10\nLINE DDR_DQ1 0 1 10 11\n", encoding="utf-8")
             return {"status": "ok", "routingResult": str(path), "importLinesFilePath": str(path), "successRate": 1.0, "fanoutParams": dict(arguments)}
+        if self.name == "prepare_reroute_inputs":
+            board_path = self.output_dir / f"{session_id}_reroute_input.kicad_pcb"
+            board_text = board_path.read_text(encoding="utf-8") if board_path.exists() else "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))\n"
+            if not board_path.exists():
+                board_path.write_text(board_text, encoding="utf-8")
+            csv_path = self.output_dir / f"{session_id}_local_route_input.csv"
+            nets = self.sample.get("selected_nets") or ["DDR_DQ0", "DDR_DQ1"]
+            csv_path.write_text("net\n" + "\n".join(str(net) for net in nets) + "\n", encoding="utf-8")
+            return {
+                "status": "ok",
+                "tool": self.name,
+                "sourceLayoutPath": str(board_path),
+                "kicadBoardPath": str(board_path),
+                "kicadBoardText": board_text,
+                "localRouteCsvPath": str(csv_path),
+                "missingRoutes": [{"net_name": net} for net in nets],
+                "selectedNets": list(nets),
+                "csvMode": "net_only",
+            }
+        if self.name == "reroute_loop":
+            if self.sample.get("simulate_reroute_loop_failure"):
+                return {"status": "failed", "tool": self.name, "reason": "simulated VSEA failure", "source": "vsea_reroute_pipeline"}
+            path = self.output_dir / f"{session_id}_vsea_lines.out"
+            path.write_text("TOP!LINE!0!DDR_DQ0!2!1!3!1!0.1524\nTOP!LINE!0!DDR_DQ1!2!2!3!2!0.1524\n", encoding="utf-8")
+            routed = self.output_dir / f"{session_id}_vsea_completed.kicad_pcb"
+            routed.write_text("(kicad_pcb (version 20240108) (net 1 DDR_DQ0))\n", encoding="utf-8")
+            return {
+                "status": "ok",
+                "tool": self.name,
+                "source": "vsea_reroute_pipeline",
+                "modelOutputText": "(segment (start 2 1) (end 3 1) (layer F.Cu) (net 1))",
+                "routedKicadFilePath": str(routed),
+                "importLinesFilePath": str(path),
+                "drcResult": {"status": "ok", "passed": True, "source": "vsea_reroute_pipeline"},
+                "workDir": str(self.output_dir),
+            }
         if self.name == "reroute":
             path = self.output_dir / f"{session_id}_reroute_lines.out"
             path.write_text("LINE DDR_DQ0 1 1 11 11\nLINE DDR_DQ1 1 2 11 12\n", encoding="utf-8")
@@ -103,4 +151,3 @@ class SimulatedExternalTool:
         if self.name == "explainability_report":
             return {"status": "ok", "report": "Simulated DRC report: passed."}
         return {"status": "failed", "reason": f"simulated external tool does not implement {self.name}"}
-
