@@ -23,6 +23,7 @@ dist/
 runtime/
 eval_runs/
 router_work/
+.\\router_work/
 bga_extract_work/
 drc_work/
 
