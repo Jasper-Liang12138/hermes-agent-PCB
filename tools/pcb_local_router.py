@@ -1,9 +1,10 @@
-﻿"""PcbRouter local route completion adapter."""
+"""PcbRouter local route completion adapter."""
 
 from __future__ import annotations
 
 import configparser
 import csv
+import json
 import logging
 import os
 import platform
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,9 @@ class PcbRouterRunOutputs:
     input_csv_path: Path
     stdout_path: Path
     stderr_path: Path
+    seed_geometry_injected: bool = False
+    seed_geometry_count: int = 0
+    seed_geometry_path: Path | None = None
 
 
 # ====== 功能：定位当前工具脚本所在项目根目录。 ======
@@ -179,22 +184,22 @@ def _reset_work_dir(work_dir: Path) -> None:
 def _layer_aliases(project_data: str) -> dict[str, str]:
     aliases: dict[str, str] = {}
     pattern = re.compile(
-        r'\(\s*\d+\s+"([^"]+\.Cu)"\s+(?:signal|power|mixed|jumper)\s*(?:"([^"]+)")?',
+        r'\(\s*\d+\s+"?([^"\s\)]+(?:\.Cu)?)"?\s+(?:signal|power|mixed|jumper)\s*(?:"([^"]+)")?',
         flags=re.IGNORECASE,
     )
     for match in pattern.finditer(project_data or ""):
         canonical = match.group(1).strip()
         display = (match.group(2) or "").strip()
         aliases[canonical.casefold()] = canonical
-        aliases[canonical.replace(".Cu", "").casefold()] = canonical
+        if canonical.endswith(".Cu"):
+            aliases[canonical.replace(".Cu", "").casefold()] = canonical
         if display:
             aliases[display.casefold()] = canonical
-    aliases.setdefault("top", "F.Cu")
-    aliases.setdefault("f.cu", "F.Cu")
-    aliases.setdefault("bottom", "B.Cu")
-    aliases.setdefault("b.cu", "B.Cu")
+    aliases.setdefault("top", aliases.get("f.cu", "Top"))
+    aliases.setdefault("f.cu", aliases.get("top", "F.Cu"))
+    aliases.setdefault("bottom", aliases.get("b.cu", "Bottom"))
+    aliases.setdefault("b.cu", aliases.get("bottom", "B.Cu"))
     return aliases
-
 
 # ====== 功能：归一化局部布线层名。 ======
 def _normalize_route_layer(value: Any, aliases: dict[str, str]) -> str:
@@ -214,39 +219,137 @@ def _normalize_route_layer(value: Any, aliases: dict[str, str]) -> str:
     return ""
 
 
-# ====== 功能：整理局部布线 CSV 行顺序。 ======
-def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -> list[tuple[str, str]]:
-    aliases = _layer_aliases(project_data)
-    rows: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    order_lines = route_params.get("orderLines") or []
-    for item in order_lines:
-        if not isinstance(item, dict):
-            continue
-        net = str(item.get("net") or item.get("net_name") or item.get("netName") or "").strip()
-        if not net or net in seen:
-            continue
-        seen.add(net)
-        rows.append((net, _normalize_route_layer(item.get("route_layer") or item.get("layer"), aliases)))
+# ====== 功能：读取 route 字段中的目标网络名称。
+def _route_net_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("net") or item.get("net_name") or item.get("netName") or item.get("name") or "").strip()
+    return str(item or "").strip()
 
-    for key in ("nets", "selectedNets", "localRouteNets", "pcbrouterNets"):
+
+# ====== 功能：读取局部 route 点，要求已是 KiCad/pcbrouter 坐标语义。
+def _route_point(item: dict[str, Any], key: str) -> dict[str, Any]:
+    point = item.get(key)
+    return point if isinstance(point, dict) else {}
+
+
+# ====== 功能：构造局部布线 CSV 行，保留转换后的几何目标。
+def _local_route_row(item: Any, aliases: dict[str, str]) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"net": _route_net_name(item), "route_layer": ""}
+    start = _route_point(item, "start")
+    end = _route_point(item, "end")
+    layer = _normalize_route_layer(item.get("route_layer") or item.get("layer") or start.get("layer") or end.get("layer"), aliases)
+    row: dict[str, Any] = {"net": _route_net_name(item), "route_layer": layer}
+    for prefix, point in (("start", start), ("end", end)):
+        for coord in ("x", "y"):
+            value = point.get(coord)
+            if isinstance(value, (int, float)):
+                row[f"{prefix}_{coord}"] = value
+        if point.get("component"):
+            row[f"{prefix}_component"] = str(point.get("component"))
+        if point.get("pad"):
+            row[f"{prefix}_pad"] = str(point.get("pad"))
+        if point.get("layer"):
+            row[f"{prefix}_layer"] = _normalize_route_layer(point.get("layer"), aliases) or str(point.get("layer"))
+    return row
+
+
+# ====== 功能：整理局部布线 CSV 行顺序。
+def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -> list[dict[str, Any]]:
+    aliases = _layer_aliases(project_data)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in ("missingRoutesKicad", "missingRoutes", "missing_routes", "orderLines", "pcbrouterNets", "localRouteNets", "selectedNets", "nets"):
         value = route_params.get(key)
         if not isinstance(value, list):
             continue
-        for raw_net in value:
-            if isinstance(raw_net, dict):
-                net = str(raw_net.get("net") or raw_net.get("net_name") or raw_net.get("netName") or raw_net.get("name") or "").strip()
-                layer = _normalize_route_layer(raw_net.get("route_layer") or raw_net.get("layer"), aliases)
-            else:
-                net = str(raw_net or "").strip()
-                layer = ""
+        for item in value:
+            row = _local_route_row(item, aliases)
+            net = str(row.get("net") or "").strip()
             if not net or net in seen:
                 continue
             seen.add(net)
-            rows.append((net, layer))
+            rows.append(row)
     return rows
 
 
+# ====== 功能：返回 CSV 列；几何列只在已有 KiCad 转换几何时写入。
+def _local_route_csv_header(rows: list[dict[str, Any]]) -> list[str]:
+    base = ["net"]
+    if any(row.get("route_layer") for row in rows):
+        base.append("route_layer")
+    geometry_keys = ["start_x", "start_y", "end_x", "end_y", "start_component", "start_pad", "start_layer", "end_component", "end_pad", "end_layer"]
+    for key in geometry_keys:
+        if any(row.get(key) not in (None, "") for row in rows):
+            base.append(key)
+    return base
+
+# ====== 功能：建立 KiCad net 名称到 net id 的映射。
+def _kicad_net_name_to_id(board_text: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    pattern = re.compile(r'\(\s*net\s+(\d+)\s+(?:"([^"]+)"|([^\s\)]+))\s*\)', re.IGNORECASE)
+    for match in pattern.finditer(board_text or ""):
+        net_id = match.group(1).strip()
+        name = (match.group(2) or match.group(3) or "").strip()
+        if name:
+            mapping[name] = net_id
+    return mapping
+
+
+# ====== 功能：从转换后的 missingRoutesKicad 生成临时 seed segment。
+def _seed_segments_from_route_params(route_params: dict[str, Any], board_text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    routes = route_params.get("missingRoutesKicad")
+    if not isinstance(routes, list):
+        return [], []
+    net_ids = _kicad_net_name_to_id(board_text)
+    segments: list[str] = []
+    records: list[dict[str, Any]] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        start = route.get("start") if isinstance(route.get("start"), dict) else {}
+        end = route.get("end") if isinstance(route.get("end"), dict) else {}
+        net_name = _route_net_name(route)
+        net_id = net_ids.get(net_name)
+        layer = str(route.get("route_layer") or start.get("layer") or end.get("layer") or "").strip()
+        try:
+            x1 = float(start.get("x"))
+            y1 = float(start.get("y"))
+            x2 = float(end.get("x"))
+            y2 = float(end.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if not net_name or not net_id or not layer:
+            continue
+        record = {"net": net_name, "netId": net_id, "layer": layer, "start": [x1, y1], "end": [x2, y2]}
+        records.append(record)
+        segments.append(
+            "\n  (segment"
+            f" (start {x1:.6f} {y1:.6f})"
+            f" (end {x2:.6f} {y2:.6f})"
+            " (width 0.1524)"
+            f" (layer \"{layer}\")"
+            f" (net {net_id})"
+            f" (uuid {uuid.uuid4()})"
+            ")"
+        )
+    return segments, records
+
+
+# ====== 功能：把 seed segment 注入 help_planner 的临时 KiCad 板文件。
+def _inject_seed_geometry(input_board_path: Path, route_params: dict[str, Any], work_dir: Path) -> tuple[bool, int, Path | None]:
+    board_text = input_board_path.read_text(encoding="utf-8", errors="replace")
+    segments, records = _seed_segments_from_route_params(route_params, board_text)
+    seed_path = work_dir / "seed_geometry.json"
+    if not segments:
+        if isinstance(route_params.get("missingRoutesKicad"), list) and route_params.get("missingRoutesKicad"):
+            seed_path.write_text(json.dumps({"seedGeometryInjected": False, "seedGeometry": [], "reason": "missingRoutesKicad did not contain usable net/layer/start/end or net id was not found in board"}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return False, 0, seed_path if seed_path.exists() else None
+    insert_at = board_text.rfind(")")
+    seeded_text = board_text[:insert_at] + "".join(segments) + "\n" + board_text[insert_at:] if insert_at >= 0 else board_text + "".join(segments) + "\n"
+    input_board_path.write_text(seeded_text, encoding="utf-8")
+    seed_path.write_text(json.dumps({"seedGeometryInjected": True, "seedGeometryCount": len(records), "seedGeometry": records}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return True, len(records), seed_path
 # ====== 功能：读取用户指定的 CSV 覆盖路径。 ======
 def _csv_override_path(route_params: dict[str, Any]) -> str:
     keys = ("pcbrouterCsvPath", "localRouteCsvPath", "bgaLocalRouteCsvPath", "csvPath")
@@ -276,15 +379,12 @@ def write_local_route_csv(
     rows = _ordered_local_route_rows(route_params, project_data)
     if not rows:
         raise ValueError("局部布线完善缺少可写入 CSV 的目标 net")
-    has_route_layer = any(layer for _, layer in rows)
+    header = _local_route_csv_header(rows)
     with target.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["net", "route_layer"] if has_route_layer else ["net"])
-        for net, layer in rows:
-            if has_route_layer:
-                writer.writerow([net, layer])
-            else:
-                writer.writerow([net])
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow([row.get(key, "") for key in header])
     return target
 
 
@@ -444,6 +544,7 @@ def run_pcbrouter_local_route(
         source_board_path=source_board_path,
         work_dir=run_dir,
     )
+    seed_injected, seed_count, seed_path = _inject_seed_geometry(input_board_path, route_params, run_dir)
     board_text = input_board_path.read_text(encoding="utf-8", errors="replace")
     input_csv_path = write_local_route_csv(
         route_params=route_params,
@@ -481,6 +582,11 @@ def run_pcbrouter_local_route(
         input_csv_path=input_csv_path.resolve(),
         stdout_path=stdout_path.resolve(),
         stderr_path=stderr_path.resolve(),
+        seed_geometry_injected=seed_injected,
+        seed_geometry_count=seed_count,
+        seed_geometry_path=seed_path.resolve() if seed_path else None,
     )
+
+
 
 
