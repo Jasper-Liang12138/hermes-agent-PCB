@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import re
@@ -111,12 +111,38 @@ def _drc_lines(drc: dict[str, Any]) -> list[str]:
         f"- Status: `{drc.get('status', 'unknown')}`",
         f"- Passed: `{bool(drc.get('passed'))}`",
     ]
+    for key, label in (
+        ("drcExecutionValid", "Execution valid"),
+        ("fullBoardPassed", "Full-board passed"),
+        ("targetScopedPassed", "Target-scoped passed"),
+    ):
+        if key in drc:
+            lines.append(f"- {label}: `{bool(drc.get(key))}`")
+    if drc.get("drcInputMode"):
+        lines.append(f"- Input mode: `{drc.get('drcInputMode')}`")
+    if drc.get("drcInputSource"):
+        lines.append(f"- Input source: `{drc.get('drcInputSource')}`")
+    if drc.get("routedBoardPath"):
+        lines.append(f"- Routed board: `{drc.get('routedBoardPath')}`")
+    if drc.get("routedTextChars") is not None:
+        lines.append(f"- Routed text chars: `{drc.get('routedTextChars')}`")
+    if drc.get("targetNets"):
+        lines.append(f"- Target nets: `{', '.join(str(item) for item in drc.get('targetNets') or [])}`")
+    if drc.get("targetIssueCount") is not None:
+        lines.append(f"- Target issue count: `{drc.get('targetIssueCount')}`")
+    if drc.get("fullBoardIssueCount") is not None:
+        lines.append(f"- Full-board issue count: `{drc.get('fullBoardIssueCount')}`")
     if drc.get("score") is not None:
         lines.append(f"- Score: `{drc.get('score')}`")
     errors = drc.get("errors") or []
     if errors:
         lines.append("- Errors:")
         lines.extend(f"  - {_short_text(item)}" for item in errors[:8])
+    for key, title in (("targetIssues", "Target issues"), ("fullBoardIssues", "Full-board/residual issues")):
+        issues = drc.get(key) or []
+        if issues:
+            lines.append(f"- {title}:")
+            lines.extend(f"  - {_short_text(item)}" for item in issues[:5])
     detail = drc.get("detail") if isinstance(drc.get("detail"), dict) else {}
     summary = detail.get("failure_summary") or detail.get("reason")
     if summary:
@@ -128,7 +154,6 @@ def _drc_lines(drc: dict[str, Any]) -> list[str]:
     if eval_root:
         lines.append(f"- Eval root: `{eval_root}`")
     return lines
-
 
 # ====== 功能：生成可解释性报告段落。 ======
 def _explain_lines(explain: dict[str, Any]) -> list[str]:

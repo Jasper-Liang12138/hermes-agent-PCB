@@ -557,3 +557,144 @@ def test_reroute_unavailable_does_not_call_help_planner():
     assert plan["tool_calls"] == []
     assert plan["action"] == "reroute_unavailable"
     assert "model 401" in plan["response"]
+
+
+# ====== 功能：验证 patch fill 失败不能被 target scoped DRC 误判为通过。 ======
+def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    class FakeDrcModule:
+        @staticmethod
+        def validate_kicad_patch_with_drc(**kwargs):
+            return {
+                "passed": False,
+                "drc_result": {"ok": True, "pass": True, "artifacts": {"issues": []}},
+                "fill_detail": {"reason": "fill_failed", "error": "no segment or via"},
+                "failure_summary": "KiCad patch fill failed: no segment or via",
+                "filled_board_data_file_path": "",
+            }
+
+    config = load_config("missing-config.ini")
+    config.drc.enabled = True
+    config.drc.tool_path = "tools/pcb_reroute_drc.py"
+    config.drc.eval_root = "."
+    monkeypatch.setattr(external, "_load_module", lambda *args, **kwargs: FakeDrcModule)
+    context = {
+        "session_id": "s1",
+        "rerouteInput": {"kicadBoardText": "(kicad_pcb demo)", "selectedNets": ["Z7_SPI0_SCK"]},
+        "selectedNets": ["Z7_SPI0_SCK"],
+        "rerouteResult": {"status": "ok", "routedText": "not a segment"},
+    }
+    result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
+    assert result["status"] == "failed"
+    assert result["passed"] is False
+    assert result["drcExecutionValid"] is False
+    assert result["targetScopedPassed"] is False
+
+
+# ====== 功能：验证 DRC fill failed 后 planner 重试 reroute，不调用 explainability。 ======
+def test_planner_retries_after_drc_fill_failed_not_explainability():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok"},
+        "drcResult": {"status": "failed", "passed": False, "drcExecutionValid": False},
+        "rerouteDrcFailureCount": 1,
+    }
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "reroute_retry"
+    assert [call["name"] for call in plan["tool_calls"]] == ["reroute"]
+
+
+# ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======
+def test_planner_calls_explainability_only_after_drc_passed():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok"},
+        "drcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
+    }
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "explainability"
+    assert [call["name"] for call in plan["tool_calls"]] == ["explainability_report"]
+
+
+# ====== 功能：验证 help_planner 完整板输出优先用于 full-board DRC。 ======
+def test_drc_uses_help_planner_full_board_without_routed_text(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    routed_board = tmp_path / "output_bga_local.export.kicad_pcb"
+    routed_board.write_text("(kicad_pcb routed)", encoding="utf-8")
+
+    class FakeDrcModule:
+        called = ""
+
+        @staticmethod
+        def validate_kicad_board_with_drc(**kwargs):
+            FakeDrcModule.called = "board"
+            return {
+                "passed": True,
+                "drc_result": {"ok": True, "pass": True, "artifacts": {"issues": []}},
+                "failure_summary": "",
+                "filled_board_data_file_path": str(routed_board),
+            }
+
+        @staticmethod
+        def validate_kicad_patch_with_drc(**kwargs):
+            FakeDrcModule.called = "patch"
+            return {"passed": False, "drc_result": {"ok": False}, "failure_summary": "patch should not run"}
+
+    config = load_config("missing-config.ini")
+    config.drc.enabled = True
+    config.drc.tool_path = "tools/pcb_reroute_drc.py"
+    config.drc.eval_root = "."
+    monkeypatch.setattr(external, "_load_module", lambda *args, **kwargs: FakeDrcModule)
+    context = {
+        "session_id": "s1",
+        "rerouteInput": {"kicadBoardText": "(kicad_pcb original)", "selectedNets": ["Z7_SPI0_SCK"]},
+        "helpPlannerResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
+        "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
+    }
+    result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
+    assert FakeDrcModule.called == "board"
+    assert result["status"] == "ok"
+    assert result["drcInputMode"] == "full_board"
+    assert result["drcInputSource"] in {"helpPlannerResult", "rerouteResult"}
+
+
+# ====== 功能：验证 full-board 残留非目标错误可和 target scoped 结果区分。 ======
+def test_drc_target_scoped_pass_with_full_board_residual_issue(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    routed_board = tmp_path / "routed.kicad_pcb"
+    routed_board.write_text("(kicad_pcb routed)", encoding="utf-8")
+
+    class FakeDrcModule:
+        @staticmethod
+        def validate_kicad_board_with_drc(**kwargs):
+            return {
+                "passed": False,
+                "drc_result": {"ok": True, "pass": False, "artifacts": {"issues": [{"net": "PS_MIO50_501", "message": "unrelated clearance"}]}},
+                "failure_summary": "hard_issue_count=1",
+                "filled_board_data_file_path": str(routed_board),
+            }
+
+    config = load_config("missing-config.ini")
+    config.drc.enabled = True
+    config.drc.tool_path = "tools/pcb_reroute_drc.py"
+    config.drc.eval_root = "."
+    monkeypatch.setattr(external, "_load_module", lambda *args, **kwargs: FakeDrcModule)
+    context = {
+        "session_id": "s1",
+        "rerouteInput": {"kicadBoardText": "(kicad_pcb original)", "selectedNets": ["Z7_SPI0_SCK"]},
+        "selectedNets": ["Z7_SPI0_SCK"],
+        "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
+    }
+    result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
+    assert result["passed"] is True
+    assert result["fullBoardPassed"] is False
+    assert result["targetScopedPassed"] is True
+    assert result["fullBoardIssueCount"] == 1
+    assert result["targetIssueCount"] == 0

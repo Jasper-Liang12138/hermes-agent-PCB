@@ -536,16 +536,18 @@ class AnalysisTool:
         reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
         original_board = str(reroute_input.get("kicadBoardText") or "") or _project_data_text(context)
         routed_text = _routed_text(arguments, context)
+        routed_board_path = _routed_board_path(arguments, context)
+        drc_input_mode = "full_board" if routed_board_path else "patch"
+        drc_input_source = _drc_input_source(arguments, context, bool(routed_board_path))
         if not original_board:
-            return {"status": "failed", "tool": self.name, "reason": "missing original board data for DRC"}
-        if not routed_text:
-            return {"status": "failed", "tool": self.name, "reason": "missing routed output/import lines for DRC"}
+            return {"status": "failed", "tool": self.name, "reason": "missing original board data for DRC", "drcInputMode": drc_input_mode, "drcInputSource": drc_input_source, "routedBoardPath": str(routed_board_path or ""), "routedTextChars": len(routed_text), "drcExecutionValid": False}
+        if not routed_board_path and not routed_text:
+            return {"status": "failed", "tool": self.name, "reason": "missing routed output/import lines for DRC", "drcInputMode": drc_input_mode, "drcInputSource": drc_input_source, "routedBoardPath": "", "routedTextChars": 0, "drcExecutionValid": False}
 
         try:
             module = _load_module("_pcb_agent_langgraph_drc_tool", tool_path)
             if hasattr(module, "set_eval_root"):
                 module.set_eval_root(eval_root)
-            routed_board_path = _routed_board_path(arguments, context)
             if routed_board_path and routed_board_path.suffix.lower() == ".kicad_pcb" and routed_board_path.exists() and hasattr(module, "validate_kicad_board_with_drc"):
                 attempt = module.validate_kicad_board_with_drc(
                     board_path=routed_board_path,
@@ -561,22 +563,45 @@ class AnalysisTool:
                     iteration=1,
                 )
             payload = _dataclass_to_dict(attempt)
-            passed = bool(payload.get("passed"))
             drc_result = payload.get("drc_result") or {}
+            target_nets = _target_nets_from_drc_context(arguments, context)
+            full_board_passed = bool(payload.get("passed"))
+            execution_valid = _drc_execution_valid(payload, drc_result, routed_board_path)
+            if execution_valid:
+                target_scope = _target_scoped_drc_result(drc_result, target_nets)
+            else:
+                all_issues = _drc_issues(drc_result)
+                target_scope = {"passed": False, "targetIssues": [], "targetIssueCount": 0, "fullBoardIssues": all_issues, "fullBoardIssueCount": len(all_issues)}
+            target_scoped_passed = bool(target_scope.get("passed")) and execution_valid
+            passed = bool(execution_valid and (full_board_passed or target_scoped_passed))
+            failure_summary = payload.get("failure_summary") or ("DRC execution failed" if not execution_valid else "DRC failed")
+            print(f"drc_input mode={drc_input_mode} source={drc_input_source} routedBoardPath={str(routed_board_path or '')} routedTextChars={len(routed_text)}")
+            print(f"drc_result status={'ok' if passed else 'failed'} passed={passed} fullBoardPassed={full_board_passed} targetScopedPassed={target_scoped_passed} executionValid={execution_valid} mode={drc_input_mode} source={drc_input_source} failure_summary={failure_summary}")
             return {
                 "status": "ok" if passed else "failed",
                 "tool": self.name,
                 "passed": passed,
-                "errors": [] if passed else [payload.get("failure_summary") or "DRC failed"],
+                "errors": [] if passed else [failure_summary],
                 "score": 1.0 if passed else 0.0,
                 "detail": payload,
                 "tool_path": str(tool_path),
                 "eval_root": str(eval_root),
                 "drc_result": drc_result,
+                "drcInputMode": drc_input_mode,
+                "drcInputSource": drc_input_source,
+                "routedBoardPath": str(routed_board_path or ""),
+                "routedTextChars": len(routed_text),
+                "fullBoardPassed": full_board_passed,
+                "targetScopedPassed": target_scoped_passed,
+                "drcExecutionValid": execution_valid,
+                "targetNets": target_nets,
+                "targetIssueCount": int(target_scope.get("targetIssueCount") or 0),
+                "fullBoardIssueCount": int(target_scope.get("fullBoardIssueCount") or 0),
+                "targetIssues": target_scope.get("targetIssues") or [],
+                "fullBoardIssues": target_scope.get("fullBoardIssues") or [],
             }
         except Exception as exc:
-            return {"status": "failed", "tool": self.name, "reason": str(exc), "tool_path": str(tool_path), "eval_root": str(eval_root)}
-
+            return {"status": "failed", "tool": self.name, "reason": str(exc), "tool_path": str(tool_path), "eval_root": str(eval_root), "drcInputMode": drc_input_mode, "drcInputSource": drc_input_source, "routedBoardPath": str(routed_board_path or ""), "routedTextChars": len(routed_text), "drcExecutionValid": False}
 
 
     # ====== 功能：调用可解释性模型 runtime 并读取报告。 ======
@@ -1259,6 +1284,80 @@ def _load_module(module_name: str, file_path: Path):
     spec.loader.exec_module(module)
     return module
 
+# ====== 功能：标记 DRC 输入来自哪个上游结果。 ======
+def _drc_input_source(arguments: dict[str, Any], context: dict[str, Any], full_board: bool) -> str:
+    if any(arguments.get(key) for key in ("routedKicadFilePath", "routedBoardFilePath", "boardPath")):
+        return "arguments"
+    if full_board:
+        for name in ("helpPlannerResult", "rerouteResult", "fanout_routeResult", "importLinesResult"):
+            item = context.get(name)
+            if isinstance(item, dict):
+                for key in ("routedKicadFilePath", "routedBoardDataFilePath", "routedLayoutKicadFilePath", "boardFilePath"):
+                    value = str(item.get(key) or "").strip()
+                    if value and Path(value).suffix.lower() == ".kicad_pcb" and Path(value).exists():
+                        return name
+    for name in ("rerouteResult", "fanout_routeResult", "importLinesResult"):
+        item = context.get(name)
+        if isinstance(item, dict):
+            for key in ("modelOutputText", "routedText", "content", "data", "importLinesFilePath", "routingResult"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return name
+    return "unknown"
+
+
+# ====== 功能：判断 DRC 工具是否真的完成了可用检查。 ======
+def _drc_execution_valid(payload: dict[str, Any], drc_result: dict[str, Any], routed_board_path: Path | None) -> bool:
+    if not isinstance(drc_result, dict) or drc_result.get("ok") is not True:
+        return False
+    fill_detail = payload.get("fill_detail") if isinstance(payload.get("fill_detail"), dict) else {}
+    reason = str(fill_detail.get("reason") or "").lower()
+    if reason == "fill_failed":
+        return False
+    filled_path = str(payload.get("filled_board_data_file_path") or "").strip()
+    if filled_path and not Path(filled_path).exists():
+        return False
+    if not filled_path and not routed_board_path:
+        return False
+    return True
+
+
+# ====== 功能：从 DRC 结果中抽取 issues 列表。 ======
+def _drc_issues(drc_result: dict[str, Any]) -> list[dict[str, Any]]:
+    artifacts = drc_result.get("artifacts") if isinstance(drc_result, dict) else {}
+    issues = artifacts.get("issues") if isinstance(artifacts, dict) else []
+    if not isinstance(issues, list):
+        return []
+    return [item for item in issues if isinstance(item, dict)]
+
+
+# ====== 功能：提取当前 reroute 的目标网络。 ======
+def _target_nets_from_drc_context(arguments: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    nets = target_nets_from_context(arguments, context, context.get("rerouteInput"), context.get("rerouteResult"), context.get("helpPlannerResult"), context.get("deleteTracesResult"))
+    return [str(net).strip() for net in nets if str(net).strip()]
+
+
+# ====== 功能：根据目标网络判断 DRC 是否只剩非目标残留问题。 ======
+def _target_scoped_drc_result(drc_result: dict[str, Any], target_nets: list[str]) -> dict[str, Any]:
+    issues = _drc_issues(drc_result)
+    if not target_nets:
+        return {"passed": bool(drc_result.get("pass")), "targetIssues": issues, "targetIssueCount": len(issues), "fullBoardIssues": issues, "fullBoardIssueCount": len(issues)}
+    target_set = {net.lower() for net in target_nets}
+    target_issues: list[dict[str, Any]] = []
+    residual_issues: list[dict[str, Any]] = []
+    for issue in issues:
+        issue_text = json.dumps(issue, ensure_ascii=False).lower()
+        if any(net.lower() in issue_text for net in target_set):
+            target_issues.append(issue)
+        else:
+            residual_issues.append(issue)
+    return {
+        "passed": len(target_issues) == 0,
+        "targetIssues": target_issues,
+        "targetIssueCount": len(target_issues),
+        "fullBoardIssues": residual_issues,
+        "fullBoardIssueCount": len(issues),
+    }
 
 # ====== 功能：把 dataclass 或 dict 统一转换为字典。 ======
 def _dataclass_to_dict(value: Any) -> dict[str, Any]:
