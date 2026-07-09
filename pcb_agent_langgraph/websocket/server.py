@@ -96,10 +96,30 @@ class PCBWebSocketServer:
         return getattr(self, "_active_frontend_tool_names", {}).get(call_id, "")
 
     # ====== 功能：后台执行一轮 LangGraph 调用并发送最终结果。 ======
-    async def _run_agent_turn(self, websocket: Any, session_id: str, project_id: str, content: str, turn_msg_id: str) -> None:
+    async def _run_agent_turn(
+        self,
+        websocket: Any,
+        session_id: str,
+        project_id: str,
+        content: str,
+        turn_msg_id: str,
+        *,
+        entry_module: str = "",
+        entry_action: str = "",
+        entry_payload: dict[str, Any] | None = None,
+    ) -> None:
         try:
             await self.send_progress(session_id, "思考中...")
-            task = asyncio.create_task(self.agent.ainvoke(session_id, project_id, content))
+            task = asyncio.create_task(
+                self.agent.ainvoke(
+                    session_id,
+                    project_id,
+                    content,
+                    entry_module=entry_module,
+                    entry_action=entry_action,
+                    entry_payload=entry_payload or {},
+                )
+            )
             result = await self._await_with_progress(task, session_id, "正在分析任务...", interval=5.0)
             fields: dict[str, Any] = {}
             if result.get("markdown_report"):
@@ -127,7 +147,17 @@ class PCBWebSocketServer:
             self._last_progress.pop(session_id, None)
 
     # ====== 功能：处理一条前端用户消息并启动后台 Agent 任务。 ======
-    async def _start_agent_turn(self, websocket: Any, session_id: str, project_id: str, content: str) -> None:
+    async def _start_agent_turn(
+        self,
+        websocket: Any,
+        session_id: str,
+        project_id: str,
+        content: str,
+        *,
+        entry_module: str = "",
+        entry_action: str = "",
+        entry_payload: dict[str, Any] | None = None,
+    ) -> None:
         active = self._active_turn_tasks.get(session_id)
         if active and not active.done():
             self._connections[session_id] = (websocket, project_id)
@@ -138,7 +168,18 @@ class PCBWebSocketServer:
         self._websocket_sessions.setdefault(id(websocket), set()).add(session_id)
         self._active_message_ids[session_id] = turn_msg_id
         self._last_progress.pop(session_id, None)
-        self._active_turn_tasks[session_id] = asyncio.create_task(self._run_agent_turn(websocket, session_id, project_id, content, turn_msg_id))
+        self._active_turn_tasks[session_id] = asyncio.create_task(
+            self._run_agent_turn(
+                websocket,
+                session_id,
+                project_id,
+                content,
+                turn_msg_id,
+                entry_module=entry_module,
+                entry_action=entry_action,
+                entry_payload=entry_payload or {},
+            )
+        )
 
     # ====== 功能：WebSocket 断开时清理连接相关任务和缓存。 ======
     def _cleanup_websocket(self, websocket: Any) -> None:
@@ -176,7 +217,15 @@ class PCBWebSocketServer:
                         continue
                     raw_session_id, project_id, content = parsed
                     session_id = self._resolve_session_id(websocket, project_id, raw_session_id)
-                    await self._start_agent_turn(websocket, session_id, project_id, content)
+                    await self._start_agent_turn(
+                        websocket,
+                        session_id,
+                        project_id,
+                        content,
+                        entry_module=getattr(parsed, "entry_module", ""),
+                        entry_action=getattr(parsed, "entry_action", ""),
+                        entry_payload=getattr(parsed, "entry_payload", {}),
+                    )
                 except Exception as exc:
                     raw_data = data if isinstance(data, dict) else {}
                     payload = raw_data.get("payload") if isinstance(raw_data.get("payload"), dict) else raw_data

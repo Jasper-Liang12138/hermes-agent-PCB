@@ -243,7 +243,7 @@ def _merge_call_with_entities(call: dict[str, Any], entities: dict[str, Any]) ->
     if call.get("name") not in {"layer_assign", "escape_order", "fanout_route"}:
         return call
     args = dict(call.get("arguments") or {})
-    for key in ("selectedBGA", "targetBGA", "targetBGAs", "routerType", "constraints"):
+    for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
         value = entities.get(key) if isinstance(entities, dict) else None
         if value not in (None, "", [], {}) and key not in args:
             args[key] = value
@@ -275,7 +275,7 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
         cache["layerAssignResult"] = result
         if isinstance(result, dict) and isinstance(result.get("fanoutParams"), dict):
             cache["fanoutParams"] = result.get("fanoutParams")
-            cache["fanoutEntities"] = {**dict(cache.get("fanoutEntities") or {}), **{k: v for k, v in result.get("fanoutParams", {}).items() if k in {"selectedBGA", "routerType", "constraints"}}}
+            cache["fanoutEntities"] = {**dict(cache.get("fanoutEntities") or {}), **{k: v for k, v in result.get("fanoutParams", {}).items() if k in {"selectedBGA", "bgaType", "bgaLayoutType", "routerType", "constraints"}}}
     elif tool_name == "escape_order":
         cache["escapeOrderResult"] = result
         if isinstance(result, dict) and isinstance(result.get("fanoutParams"), dict):

@@ -80,6 +80,7 @@ class ExternalProgramTool:
 
         # router 类型和工艺约束来自用户输入或上一轮缓存，最终写入真实 router 的输入文件。
         router_type = normalize_router_type(_first_text(arguments.get("routerType"), context.get("routerType"))) or "rule_135"
+        bga_type = _first_text(arguments.get("bgaType"), arguments.get("bgaLayoutType"), context.get("bgaType"), context.get("bgaLayoutType"))
         constraints = _merge_constraints(context.get("constraints"), arguments.get("constraints"))
         work_dir = self._work_dir(context)
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,9 @@ class ExternalProgramTool:
             "routeOutputPath": str(_route_output_path(work_dir, router_type)),
             "orderLines": _read_lines(layer_path),
         }
+        if bga_type:
+            fanout_params["bgaType"] = bga_type
+            fanout_params["bgaLayoutType"] = bga_type
         return {"status": "ok", "tool": self.name, "fanoutParams": fanout_params, "workDir": str(work_dir), "stdout": stdout, "stderr": stderr, "returncode": return_code}
 
     # ====== 功能：生成或调用逃逸顺序工具并更新 fanout 参数。 ======
@@ -603,14 +607,14 @@ class AnalysisTool:
         output_path = work_dir / "bga_components.json"
         cache_payload = _load_bga_cache(input_path)
         if cache_payload:
-            cache_payload.update({"status": "ok", "tool": self.name, "source": str(input_path), "execution": "cache", "input_path": str(input_path), "output_path": str(output_path)})
+            cache_payload.update({"status": "ok", "tool": self.name, "source": "script", "execution": "cache", "script_path": str(tool_path), "input_path": str(input_path), "output_path": str(output_path)})
             output_path.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             return cache_payload
         try:
             module = _load_module("_pcb_agent_langgraph_extract_bga", tool_path)
             components = module.extract_bga_components(input_path)
             payload = {
-                "source": str(input_path),
+                "source": "script",
                 "match_rule": f"script function extract_bga_components; U components over {getattr(module, 'BGA_PIN_THRESHOLD', 200)} pins are included",
                 "count": len(components),
                 "components": components,
@@ -631,7 +635,7 @@ class AnalysisTool:
         if completed["returncode"] != 0:
             fallback_payload = _load_bga_cache(input_path)
             if fallback_payload:
-                fallback_payload.update({"status": "ok", "tool": self.name, "source": str(input_path), "execution": "cache_after_script_failure", "input_path": str(input_path), "output_path": str(output_path), "script_error": {"in_process_error": in_process_error, "command": command, "tool_path": str(tool_path), **_command_summary(completed)}})
+                fallback_payload.update({"status": "ok", "tool": self.name, "source": "script", "execution": "cache_after_script_failure", "script_path": str(tool_path), "input_path": str(input_path), "output_path": str(output_path), "script_error": {"in_process_error": in_process_error, "command": command, "tool_path": str(tool_path), **_command_summary(completed)}})
                 output_path.write_text(json.dumps(fallback_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 return fallback_payload
             return {"status": "failed", "tool": self.name, "reason": "BGA extract script failed", "in_process_error": in_process_error, "command": command, "tool_path": str(tool_path), "input_path": str(input_path), "output_path": str(output_path), **completed}
@@ -1292,7 +1296,10 @@ def _python_executable(config: AppConfig) -> Path:
 
 # ====== 功能：把相对路径解析为项目内绝对路径。 ======
 def _resolve_path(root: Path, value: str | Path) -> Path:
-    path = Path(value)
+    text = str(value)
+    if re.match(r"^[A-Za-z]:[\\/]", text):
+        return Path(text.replace("\\", "/"))
+    path = Path(text.replace("\\", "/"))
     return path if path.is_absolute() else root / path
 
 
@@ -1558,4 +1565,3 @@ def _build_report(drc_result: Any) -> str:
     if passed:
         return "DRC passed. No hard-rule violations were reported."
     return f"DRC status={status}; errors={json.dumps(errors, ensure_ascii=False)}"
-

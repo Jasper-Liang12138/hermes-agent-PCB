@@ -59,6 +59,9 @@ class PCBState(TypedDict, total=False):
     task_type: TaskType
     workflow_id: str
     workflow_state: str
+    entry_module: str
+    entry_action: str
+    entry_payload: dict[str, Any]
     current_stage: Stage
     pcb_project: dict[str, Any]
     design_state: dict[str, Any]
@@ -87,6 +90,9 @@ def initial_state(session_id: str, project_id: str, user_input: str, history: li
         "task_type": "unknown",
         "workflow_id": "idle",
         "workflow_state": "idle",
+        "entry_module": "",
+        "entry_action": "",
+        "entry_payload": {},
         "current_stage": "input",
         "pcb_project": {},
         "design_state": {},
@@ -111,7 +117,6 @@ def add_trace(state: PCBState, node: str, payload: dict[str, Any]) -> PCBState:
     trace = list(state.get("trace", []))
     trace.append({"node": node, "payload": payload})
     return {"trace": trace}
-
 
 
 

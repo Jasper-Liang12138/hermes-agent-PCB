@@ -5,6 +5,7 @@ import re
 import uuid
 from typing import Any
 
+from pcb_agent_langgraph.entry import ENTRY_MODULE_KEYS, entry_task_workflow, normalize_entry_module
 from pcb_agent_langgraph.graph.state import PCBState, PlannerOutput, ToolCall
 from pcb_agent_langgraph.models.pcb_model import PCBModel
 from pcb_agent_langgraph.planner.intent_entities import extract_fanout_entities, normalize_router_type
@@ -58,7 +59,7 @@ def _has_selected_bga(entities: dict[str, Any]) -> bool:
 # ====== 功能：从实体中筛选 fanout 工具需要的参数。 ======
 def _fanout_args(entities: dict[str, Any]) -> dict[str, Any]:
     args: dict[str, Any] = {}
-    for key in ("selectedBGA", "targetBGA", "targetBGAs", "routerType", "constraints"):
+    for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
         value = entities.get(key)
         if value not in (None, "", [], {}):
             args[key] = value
@@ -70,18 +71,58 @@ def _is_confirm_text(text: str) -> bool:
     return bool(re.search(r"确认|继续|开始|可以|yes|ok|执行|导入", text, re.IGNORECASE))
 
 
-# ====== 功能：把 BGA 候选转换成前端 v0.6 selection 结构。 ======
-def _bga_selection(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-    selection: list[dict[str, str]] = []
+# ====== 功能：把 BGA 候选转换成前端 v0.6 selection 结构，并保留 BGA 类型等元数据。 ======
+def _bga_selection(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selection: list[dict[str, Any]] = []
     for item in candidates:
         refdes = str(item.get("refdes") or item.get("reference") or "").upper()
         if not refdes:
             continue
-        pincount = item.get("pincount") or item.get("pinCount") or item.get("pins") or ""
-        package = item.get("package") or item.get("footprint") or ""
-        detail_parts = [part for part in (f"pins={pincount}" if pincount else "", str(package)) if part]
-        selection.append({"label": refdes, "detail": " ".join(detail_parts) or refdes})
+        pin_count = item.get("pinCount") or item.get("pincount") or item.get("pins") or ""
+        footprint = str(item.get("footprint") or item.get("package") or "").strip()
+        part = str(item.get("part") or item.get("name") or "").strip()
+        bga_type, type_source = _bga_type(item)
+        detail_parts = [part for part in (f"pins={pin_count}" if pin_count else "", footprint, f"type={bga_type}" if bga_type != "unknown" else "") if part]
+        selection.append(
+            {
+                "label": refdes,
+                "value": refdes,
+                "detail": " ".join(detail_parts) or refdes,
+                "componentId": refdes,
+                "refdes": refdes,
+                "pinCount": pin_count,
+                "pincount": pin_count,
+                "footprint": footprint,
+                "package": footprint,
+                "part": part,
+                "bgaType": bga_type,
+                "bgaLayoutType": bga_type,
+                "typeSource": type_source,
+            }
+        )
     return selection
+
+
+# ====== 功能：从候选 BGA 中读取前端或脚本提供的类型信息。 ======
+def _bga_type(item: dict[str, Any]) -> tuple[str, str]:
+    for key in ("bgaType", "bga_type", "bgaLayoutType", "layoutType", "type"):
+        value = item.get(key)
+        normalized = _normalize_bga_type(value)
+        if normalized:
+            return normalized, str(item.get("typeSource") or "provided")
+    return "unknown", "missing"
+
+
+# ====== 功能：统一前端传入的 BGA 类型命名。 ======
+def _normalize_bga_type(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"rect", "rectangle", "rectangular", "矩形", "正交", "regular"}:
+        return "rectangular"
+    if text in {"stagger", "staggered", "交错", "错列"}:
+        return "staggered"
+    return text
 
 # ====== 功能：根据用户输入和中间状态规划下一步工具调用。 ======
 class PCBPlanner:
@@ -94,7 +135,12 @@ class PCBPlanner:
 
     # ====== 功能：根据当前状态生成下一步执行计划。 ======
     def plan(self, state: PCBState) -> PlannerOutput:
-        text = state.get("user_input", "")
+        entry_state = _state_with_explicit_entry(state)
+        if entry_state is not None:
+            plan = self._rule_plan(entry_state)
+            plan["planner_source"] = "entry"
+            plan["reason"] = _append_reason(plan.get("reason"), f"explicit entry module: {entry_state.get('entry_module', '')}")
+            return plan
         if self.use_model and self.model is not None:
             try:
                 return self._model_plan(state)
@@ -145,15 +191,19 @@ class PCBPlanner:
         workflow_state = state.get("workflow_state", "idle")
         cache = state.get("intermediate_cache", {})
         entities = _merge_entities(cache.get("fanoutParams"), cache.get("fanoutEntities"), extract_fanout_entities(text))
+        explicit_entry = _entry_intent(state)
+
+        if explicit_entry == "qa":
+            return {"intent": "qa", "workflow": "pcb_qa_flow", "action": "chat", "tool_calls": [], "response": "我可以协助 PCB 工程问答、Fanout 和局部拆线重布。请描述你要处理的对象或约束。"}
 
         # 流程中的“解释/状态/为什么”等问题先作为上下文问答处理，不打断当前 fanout/reroute 状态。
-        if self._is_context_chat(text) and state.get("workflow_id") in {"pcb_escape_flow", "pcb_reroute_flow"}:
+        if explicit_entry is None and self._is_context_chat(text) and state.get("workflow_id") in {"pcb_escape_flow", "pcb_reroute_flow"}:
             return {"intent": "qa", "workflow": state.get("workflow_id", "pcb_qa_flow"), "action": "workflow_chat", "tool_calls": [], "response": "当前流程状态已保留。我可以解释刚才的步骤，也可以继续执行后续 PCB 操作。"}
 
-        if self._is_cancel(text) and not (workflow_state == "review" and state.get("workflow_id") == "pcb_escape_flow" and _is_reject_import_text(text)):
+        if explicit_entry is None and self._is_cancel(text) and not (workflow_state == "review" and state.get("workflow_id") == "pcb_escape_flow" and _is_reject_import_text(text)):
             return {"intent": "qa", "workflow": "idle", "action": "cancel_flow", "response": "已取消当前 PCB 流程。", "tool_calls": []}
 
-        if self._is_reroute(text) or state.get("task_type") == "reroute" or state.get("workflow_id") == "pcb_reroute_flow":
+        if explicit_entry == "reroute" or (explicit_entry is None and (self._is_reroute(text) or state.get("task_type") == "reroute" or state.get("workflow_id") == "pcb_reroute_flow")):
             # reroute 由 LangGraph 控制阶段推进：前端拆线 -> 重布 -> 导入 -> DRC/解释 -> 必要时 help_planner 兜底。
             if not cache.get("deleteTracesResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_entry", [{"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0}])
@@ -183,7 +233,7 @@ class PCBPlanner:
             return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "局部拆线重布、导入、DRC 和分析报告已完成。"}
 
 
-        if self._is_fanout(text) or state.get("task_type") == "global_fanout" or state.get("workflow_id") == "pcb_escape_flow" or (workflow_state == "result_review" and re.search(r"重新|重来|again|rerun", lower)):
+        if explicit_entry == "global_fanout" or (explicit_entry is None and (self._is_fanout(text) or state.get("task_type") == "global_fanout" or state.get("workflow_id") == "pcb_escape_flow" or (workflow_state == "result_review" and re.search(r"重新|重来|again|rerun", lower)))):
             # fanout 允许用户直接指定 U5/BGA 和线宽线距；未指定目标时必须先调用脚本提取 BGA 并展示候选。
             candidates = cache.get("bgaCandidates") if isinstance(cache.get("bgaCandidates"), list) else []
             if not cache.get("projectData") and not state.get("pcb_project"):
@@ -453,6 +503,37 @@ def _normalize_workflow(value: Any, intent: str) -> str:
     if re.search(r"reroute|重布|拆线", workflow, re.IGNORECASE):
         return "pcb_reroute_flow"
     return PCBPlanner._workflow_for_intent(intent)
+
+
+# ====== 功能：读取显式入口按钮字段并生成 planner 使用的状态副本。 ======
+def _state_with_explicit_entry(state: PCBState) -> PCBState | None:
+    entry = _entry_task_from_state(state)
+    if entry is None:
+        return None
+    task_type, workflow_id, module = entry
+    copied = dict(state)
+    copied["task_type"] = task_type
+    copied["workflow_id"] = workflow_id
+    copied["entry_module"] = module
+    return copied
+
+
+# ====== 功能：从 state 或 entry_payload 中解析显式入口意图。 ======
+def _entry_intent(state: PCBState) -> str | None:
+    entry = _entry_task_from_state(state)
+    return entry[0] if entry else None
+
+
+# ====== 功能：兼容 state.entry_module 和 payload.module/chain/workflow 等入口字段。 ======
+def _entry_task_from_state(state: PCBState) -> tuple[str, str, str] | None:
+    payload = state.get("entry_payload") if isinstance(state.get("entry_payload"), dict) else {}
+    candidates = [state.get("entry_module")]
+    candidates.extend(payload.get(key) for key in ENTRY_MODULE_KEYS)
+    for value in candidates:
+        mapped = entry_task_workflow(value)
+        if mapped:
+            return mapped[0], mapped[1], normalize_entry_module(value)
+    return None
 
 
 # ====== 功能：修正模型工具调用名称和参数结构。 ======

@@ -10,6 +10,69 @@ def test_parse_payload_wrapped_user_message():
     assert content == "拆线重布"
 
 
+# ====== 功能：验证用户消息会携带前端按钮入口信号，且保留旧三元组解包兼容。 ======
+def test_parse_user_message_carries_entry_signal():
+    msg = {
+        "payload": {
+            "sessionId": "S1",
+            "projectID": "P1",
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": "",
+                "module": "fanout",
+                "action": "enter",
+                "selectedBGA": "U5",
+            },
+        }
+    }
+    parsed = parse_user_message(msg)
+    session_id, project_id, content = parsed
+    assert (session_id, project_id, content) == ("S1", "P1", "")
+    assert parsed.entry_module == "global_fanout"
+    assert parsed.entry_action == "enter"
+    assert parsed.entry_payload["selectedBGA"] == "U5"
+
+
+# ====== 功能：验证入口分流兼容 chain/workflow 等别名字段。 ======
+def test_parse_user_message_normalizes_entry_aliases():
+    msg = {
+        "payload": {
+            "sessionId": "S1",
+            "projectID": "P1",
+            "type": "message",
+            "chain": "pcb_reroute_flow",
+            "body": {"role": "user", "content": ""},
+        }
+    }
+    parsed = parse_user_message(msg)
+    assert parsed.entry_module == "reroute"
+
+
+# ====== 功能：验证 content 对象内的结构化 BGA 选择可以被解析到 entry_payload。 ======
+def test_parse_user_message_structured_bga_selection_content():
+    msg = {
+        "payload": {
+            "sessionId": "S1",
+            "projectID": "P1",
+            "type": "message",
+            "body": {
+                "role": "user",
+                "content": {
+                    "module": "global_fanout",
+                    "action": "select_bga",
+                    "bga": {"componentId": "U5", "bgaType": "rectangular"},
+                },
+            },
+        }
+    }
+    parsed = parse_user_message(msg)
+    assert parsed.content == ""
+    assert parsed.entry_module == "global_fanout"
+    assert parsed.entry_action == "select_bga"
+    assert parsed.entry_payload["bga"] == {"componentId": "U5", "bgaType": "rectangular"}
+
+
 # ====== 功能：验证前端 payload 包裹且 result 为 JSON 字符串的工具结果可以被解析。 ======
 def test_parse_payload_wrapped_tool_result_json_string():
     msg = {
@@ -119,7 +182,7 @@ def test_handler_keeps_reading_tool_results_during_agent_turn():
         server._active_turn_tasks = {}
         server._websocket_sessions = {}
 
-        async def fake_ainvoke(session_id, project_id, user_input):
+        async def fake_ainvoke(session_id, project_id, user_input, **kwargs):
             result = await server.send_tool_call(session_id, "call-get-project", {"__tool_name__": "getProjectData"}, 1.0)
             return {"final_response": f"loaded {result}", "markdown_report": "", "report_payload": {}, "selection": None}
 
@@ -168,7 +231,7 @@ def test_handler_rejects_parallel_turn_for_same_session():
         server._websocket_sessions = {}
         event = asyncio.Event()
 
-        async def fake_ainvoke(session_id, project_id, user_input):
+        async def fake_ainvoke(session_id, project_id, user_input, **kwargs):
             await event.wait()
             return {"final_response": "done", "markdown_report": "", "report_payload": {}, "selection": None}
 
@@ -187,6 +250,46 @@ def test_handler_rejects_parallel_turn_for_same_session():
         assert busy is not None
         event.set()
         await asyncio.sleep(0.05)
+        await ws.close()
+        await handler_task
+
+    asyncio.run(scenario())
+
+
+# ====== 功能：验证 WebSocket server 会把入口信号传入 Agent。 ======
+def test_handler_passes_entry_signal_to_agent():
+    import asyncio
+
+    from pcb_agent_langgraph.websocket.server import PCBWebSocketServer
+
+    async def scenario():
+        server = PCBWebSocketServer.__new__(PCBWebSocketServer)
+        server._pending = {}
+        server._connections = {}
+        server._connection_sessions = {}
+        server._active_message_ids = {}
+        server._last_progress = {}
+        server._session_pending_tools = {}
+        server._active_turn_tasks = {}
+        server._websocket_sessions = {}
+        received = {}
+
+        async def fake_ainvoke(session_id, project_id, user_input, **kwargs):
+            received.update({"session_id": session_id, "project_id": project_id, "user_input": user_input, **kwargs})
+            return {"final_response": "ok", "markdown_report": "", "report_payload": {}, "selection": None}
+
+        server.agent = type("FakeAgent", (), {"ainvoke": staticmethod(fake_ainvoke)})()
+        ws = _FakeWebSocket()
+        handler_task = asyncio.create_task(server.handler(ws))
+        await ws.push({"payload": {"sessionId": "S1", "projectID": "P1", "type": "message", "body": {"role": "user", "content": "", "module": "fanout", "action": "enter"}}})
+
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if received:
+                break
+        assert received["entry_module"] == "global_fanout"
+        assert received["entry_action"] == "enter"
+        assert received["entry_payload"]["entry_module"] == "global_fanout"
         await ws.close()
         await handler_task
 

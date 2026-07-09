@@ -24,6 +24,62 @@ def test_rule_planner_reroute():
     assert plan["tool_calls"][0]["name"] == "deleteTracesForRerouting"
 
 
+# ====== 功能：验证前端 Fanout 按钮空文本也会显式进入 fanout chain。 ======
+def test_explicit_fanout_entry_routes_to_get_project_data():
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "entry_module": "fanout", "workflow_state": "idle", "intermediate_cache": {}})
+    assert plan["planner_source"] == "entry"
+    assert plan["intent"] == "global_fanout"
+    assert plan["workflow"] == "pcb_escape_flow"
+    assert plan["tool_calls"][0]["name"] == "getProjectData"
+
+
+# ====== 功能：验证 Fanout 显式入口拿到项目数据后，第一个业务节点是 BGA 提取。 ======
+def test_explicit_fanout_entry_calls_bga_extract_after_project_data():
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "entry_module": "global_fanout", "workflow_state": "idle", "intermediate_cache": {"projectData": "board.txt"}})
+    assert plan["planner_source"] == "entry"
+    assert plan["intent"] == "global_fanout"
+    assert plan["workflow"] == "pcb_escape_flow"
+    assert plan["tool_calls"][0]["name"] == "pcb_extra_bga"
+
+
+# ====== 功能：验证前端 QA 按钮优先于文本意图，不会误入 fanout/reroute。 ======
+def test_explicit_qa_entry_overrides_text_inference():
+    plan = PCBPlanner(use_model=False).plan({"user_input": "帮我做逃逸布线", "entry_module": "qa", "workflow_state": "idle", "intermediate_cache": {}})
+    assert plan["planner_source"] == "entry"
+    assert plan["intent"] == "qa"
+    assert plan["workflow"] == "pcb_qa_flow"
+    assert plan["tool_calls"] == []
+
+
+# ====== 功能：验证 Fanout 按钮优先于冲突文本，不会误入 reroute。 ======
+def test_explicit_fanout_entry_overrides_reroute_text():
+    plan = PCBPlanner(use_model=False).plan({"user_input": "拆线重布", "entry_module": "global_fanout", "workflow_state": "idle", "intermediate_cache": {}})
+    assert plan["planner_source"] == "entry"
+    assert plan["intent"] == "global_fanout"
+    assert plan["workflow"] == "pcb_escape_flow"
+    assert plan["tool_calls"][0]["name"] == "getProjectData"
+
+
+# ====== 功能：验证前端 Reroute 按钮空文本会进入当前 VSEA reroute chain 入口。 ======
+def test_explicit_reroute_entry_routes_to_delete_traces():
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "entry_module": "pcb_reroute_flow", "workflow_state": "idle", "intermediate_cache": {}})
+    assert plan["planner_source"] == "entry"
+    assert plan["intent"] == "reroute"
+    assert plan["workflow"] == "pcb_reroute_flow"
+    assert plan["tool_calls"][0]["name"] == "deleteTracesForRerouting"
+
+
+# ====== 功能：验证显式按钮入口在模型 planner 开启时仍优先走确定入口。 ======
+def test_explicit_entry_skips_model_planner():
+    class FailingModel:
+        def complete(self, messages, temperature=0.0):
+            raise AssertionError("model should not be called for explicit entry")
+
+    plan = PCBPlanner(model=FailingModel(), use_model=True, require_model=True).plan({"user_input": "", "entry_module": "global_fanout", "workflow_state": "idle", "intermediate_cache": {}})
+    assert plan["planner_source"] == "entry"
+    assert plan["tool_calls"][0]["name"] == "getProjectData"
+
+
 # ====== 功能：验证 fanout entities u5 width spacing 场景。 ======
 def test_fanout_entities_u5_width_spacing():
     plan = PCBPlanner(use_model=False).plan({"user_input": "对 U5 进行逃逸布线，线宽3mil，线距4.5mil，用135规则", "workflow_state": "idle", "intermediate_cache": {"projectData": "board.txt"}})
@@ -33,6 +89,84 @@ def test_fanout_entities_u5_width_spacing():
     assert args["constraints"]["LineWidth"] == 3
     assert args["constraints"]["LineSpacing"] == 4.5
     assert args["routerType"] == "rule_135"
+
+
+# ====== 功能：验证前端结构化入口 payload 会写入 fanout cache。 ======
+def test_fanout_entry_payload_caches_selected_bga_type_and_algorithm():
+    cache = PCBLangGraphAgent._cache_for_entry_payload(
+        {"projectData": "board.txt"},
+        {
+            "selectedBGA": "u5",
+            "bgaType": "staggered",
+            "algorithm": "arc",
+            "constraints": {"LineWidth": 4},
+            "bgaList": [{"refdes": "U5", "bgaType": "staggered"}],
+        },
+    )
+    assert cache["bgaCandidates"][0]["refdes"] == "U5"
+    assert cache["fanoutEntities"]["selectedBGA"] == "U5"
+    assert cache["fanoutEntities"]["targetBGAs"] == ["U5"]
+    assert cache["fanoutEntities"]["bgaType"] == "staggered"
+    assert cache["fanoutEntities"]["routerType"] == "rule_arc"
+    assert cache["fanoutEntities"]["constraints"] == {"LineWidth": 4}
+
+
+# ====== 功能：验证结构化选择 BGA 后不再停在 select_bga，而是进入 router 选择。 ======
+def test_structured_select_bga_entry_prompts_router_choice():
+    cache = PCBLangGraphAgent._cache_for_entry_payload(
+        {"projectData": "board.txt", "bgaCandidates": [{"refdes": "U5", "bgaType": "rectangular"}]},
+        {"entry_action": "select_bga", "bga": {"componentId": "U5", "bgaType": "rectangular"}},
+    )
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "entry_module": "global_fanout", "entry_action": "select_bga", "workflow_state": "select_bga", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": cache})
+    assert plan["planner_source"] == "entry"
+    assert plan["tool_calls"] == []
+    assert plan["action"] == "router_type_prompt"
+    assert plan["entities"]["selectedBGA"] == "U5"
+    assert plan["entities"]["bgaType"] == "rectangular"
+
+
+# ====== 功能：验证结构化选择 BGA 和算法后直接进入 layer_assign。 ======
+def test_structured_select_bga_and_algorithm_calls_layer_assign():
+    cache = PCBLangGraphAgent._cache_for_entry_payload(
+        {"projectData": "board.txt"},
+        {"entry_action": "select_algorithm", "selectedBGA": "U5", "bgaType": "交错", "algorithm": "135"},
+    )
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "entry_module": "global_fanout", "entry_action": "select_algorithm", "workflow_state": "wait_router_type", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": cache})
+    args = plan["tool_calls"][0]["arguments"]
+    assert plan["action"] == "layer_assign"
+    assert plan["tool_calls"][0]["name"] == "layer_assign"
+    assert args["selectedBGA"] == "U5"
+    assert args["bgaType"] == "staggered"
+    assert args["routerType"] == "rule_135"
+
+
+# ====== 功能：验证开发文档字段会映射到 fanoutParams 并标记参数确认。 ======
+def test_fanout_entry_payload_maps_document_fields_to_fanout_params():
+    cache = PCBLangGraphAgent._cache_for_entry_payload(
+        {"projectData": "board.txt"},
+        {
+            "entry_action": "start_routing",
+            "taskId": "task_1",
+            "bga": {"componentId": "U5", "name": "BGA_XXX", "pinCount": 256, "bgaType": "rectangular"},
+            "layout": {"boardId": "board_1", "snapshotId": "snap_1"},
+            "rules": {"ruleManagerConfigId": "rule_1", "constraints": {"LineSpacing": 3}},
+            "routingPlan": {"algorithm": "arc", "layerAssignment": [{"layer": "Top"}], "escapeOrder": [{"net": "DDR_D0", "layer": "Top"}]},
+            "networkInfo": {"netCount": 1},
+        },
+    )
+    params = cache["fanoutParams"]
+    assert cache["fanoutParamsConfirmed"] is True
+    assert params["taskId"] == "task_1"
+    assert params["selectedBGA"] == "U5"
+    assert params["bgaType"] == "rectangular"
+    assert params["boardId"] == "board_1"
+    assert params["snapshotId"] == "snap_1"
+    assert params["ruleManagerConfigId"] == "rule_1"
+    assert params["routerType"] == "rule_arc"
+    assert params["constraints"] == {"LineSpacing": 3}
+    assert params["layerAssignment"] == [{"layer": "Top"}]
+    assert params["orderLines"] == [{"net": "DDR_D0", "layer": "Top"}]
+    assert params["networkInfo"] == {"netCount": 1}
 
 
 # ====== 功能：验证 fanout entities multiple bgas arc 场景。 ======
@@ -231,6 +365,22 @@ def test_fanout_single_bga_candidate_returns_selection():
     assert plan["tool_calls"] == []
     assert plan["action"] == "select_bga"
     assert plan["selection"][0]["label"] == "U5"
+
+
+# ====== 功能：验证 BGA 选择列表返回结构化 BGA 类型和候选元数据。 ======
+def test_fanout_bga_selection_carries_bga_type_metadata():
+    cache = {"projectData": "F:/demo/export.txt", "bgaCandidates": [{"refdes": "U5", "pincount": 450, "footprint": "PBGA450", "bgaType": "矩形"}]}
+    state = {"user_input": "", "entry_module": "global_fanout", "workflow_state": "idle", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": cache}
+    plan = PCBPlanner(use_model=False).plan(state)
+    item = plan["selection"][0]
+    assert plan["action"] == "select_bga"
+    assert item["label"] == "U5"
+    assert item["componentId"] == "U5"
+    assert item["pinCount"] == 450
+    assert item["footprint"] == "PBGA450"
+    assert item["bgaType"] == "rectangular"
+    assert item["bgaLayoutType"] == "rectangular"
+
 
 # ====== 功能：验证 reroute 上下文完成后直接进入 VSEA 主循环。 ======
 def test_reroute_after_context_calls_vsea_reroute_loop_directly():

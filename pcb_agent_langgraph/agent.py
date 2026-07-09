@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from pcb_agent_langgraph.entry import entry_task_workflow, normalize_entry_module
 from pcb_agent_langgraph.graph.graph import build_graph
 from pcb_agent_langgraph.graph.state import ChatMessage, PCBState, initial_state
 from pcb_agent_langgraph.models.pcb_model import PCBModel
@@ -25,10 +26,12 @@ class PCBLangGraphAgent:
         self._session_states: dict[str, PCBState] = {}
 
     # ====== 功能：异步执行当前工具或 Agent 调用。 ======
-    async def ainvoke(self, session_id: str, project_id: str, user_input: str) -> PCBState:
+    async def ainvoke(self, session_id: str, project_id: str, user_input: str, *, entry_module: str = "", entry_action: str = "", entry_payload: dict[str, Any] | None = None) -> PCBState:
         previous = self._session_states.get(session_id)
         history: list[ChatMessage] = list(previous.get("conversation_history", [])) if previous else []
         state = initial_state(session_id=session_id, project_id=project_id, user_input=user_input, history=history)
+        normalized_entry = normalize_entry_module(entry_module)
+        payload = dict(entry_payload or {})
         if previous:
             # 多轮对话复用上轮项目状态和中间 cache，使 fanout/reroute 可以被追问后继续执行。
             state["pcb_project"] = previous.get("pcb_project", {})
@@ -36,9 +39,32 @@ class PCBLangGraphAgent:
             state["intermediate_cache"] = self._cache_for_turn(previous.get("intermediate_cache", {}), user_input, previous.get("workflow_state", "idle"))
             state["workflow_id"] = previous.get("workflow_id", "idle")
             state["workflow_state"] = previous.get("workflow_state", "idle")
+        if normalized_entry:
+            state["entry_module"] = normalized_entry
+            state["entry_action"] = str(entry_action or "")
+            payload["entry_module"] = normalized_entry
+            if entry_action:
+                payload["entry_action"] = str(entry_action)
+            state["entry_payload"] = payload
+            if normalized_entry == "global_fanout":
+                state["intermediate_cache"] = self._cache_for_entry_payload(state.get("intermediate_cache", {}), payload)
+            task_workflow = entry_task_workflow(normalized_entry)
+            if task_workflow:
+                task_type, workflow_id = task_workflow
+                previous_workflow = previous.get("workflow_id", "idle") if previous else "idle"
+                state["task_type"] = task_type
+                state["workflow_id"] = workflow_id
+                if previous_workflow != workflow_id:
+                    state["workflow_state"] = "idle"
         result = await self.graph.ainvoke(state)
         self._session_states[session_id] = result
         return result
+
+
+    @staticmethod
+    # ====== 功能：把前端入口 payload 中的 fanout 结构化字段写入 cache。 ======
+    def _cache_for_entry_payload(cache: dict, entry_payload: dict[str, Any]) -> dict:
+        return _cache_for_entry_payload(cache, entry_payload)
 
 
     @staticmethod
@@ -80,7 +106,7 @@ class PCBLangGraphAgent:
             next_cache["fanoutParams"] = merged_params
             next_cache["fanoutParamsConfirmed"] = True
             merged_entities = dict(next_cache.get("fanoutEntities") or {})
-            for key in ("selectedBGA", "targetBGA", "targetBGAs", "routerType", "constraints"):
+            for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
                 value = merged_params.get(key)
                 if value not in (None, "", [], {}):
                     merged_entities[key] = value
@@ -113,6 +139,195 @@ def _is_fanout_signal(user_input: str, entities: dict[str, Any], router_type: st
     return any(token in user_input for token in ("逃逸", "扇出", "线宽", "线距", "间距")) or any(
         token in text for token in ("fanout", "escape", "width", "spacing")
     )
+
+
+# ====== 功能：把前端结构化 fanout 入口数据合并到中间缓存。 ======
+def _cache_for_entry_payload(cache: dict, entry_payload: dict[str, Any]) -> dict:
+    payload = entry_payload if isinstance(entry_payload, dict) else {}
+    next_cache = dict(cache or {})
+    entities = dict(next_cache.get("fanoutEntities") or {})
+    action = str(payload.get("entry_action") or payload.get("action") or "").strip()
+
+    candidates = _payload_bga_candidates(payload)
+    if candidates:
+        next_cache["bgaCandidates"] = candidates
+
+    selected = _payload_text(payload, ("selectedBGA", "targetBGA", "componentId", "refdes"))
+    if selected:
+        selected = selected.upper()
+        entities["selectedBGA"] = selected
+        entities["targetBGAs"] = [selected]
+        entities["bgaSelectionConfirmed"] = True
+
+    bga_type = _normalize_bga_type_text(_payload_text(payload, ("bgaType", "bga_type", "bgaLayoutType", "layoutType")))
+    if bga_type:
+        entities["bgaType"] = bga_type
+        entities["bgaLayoutType"] = bga_type
+
+    router_type = normalize_router_type(_payload_text(payload, ("routerType", "algorithm", "router", "routeType")))
+    if router_type:
+        entities["routerType"] = router_type
+
+    constraints = payload.get("constraints") if isinstance(payload.get("constraints"), dict) else {}
+    if constraints:
+        entities["constraints"] = dict(constraints)
+
+    if entities:
+        next_cache["fanoutEntities"] = entities
+
+    fanout_params = _fanout_params_from_payload(payload)
+    if fanout_params:
+        merged_params = _merge_fanout_params(dict(next_cache.get("fanoutParams") or {}), fanout_params)
+        next_cache["fanoutParams"] = merged_params
+        merged_entities = dict(next_cache.get("fanoutEntities") or {})
+        for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
+            value = merged_params.get(key)
+            if value not in (None, "", [], {}):
+                merged_entities[key] = value
+        if merged_entities:
+            next_cache["fanoutEntities"] = merged_entities
+
+    if _is_fanout_param_confirm_action(action) or payload.get("fanoutParamsConfirmed") is True:
+        next_cache["fanoutParamsConfirmed"] = True
+    return next_cache
+
+
+# ====== 功能：从入口 payload 中兼容读取 BGA 候选列表。 ======
+def _payload_bga_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("bgaCandidates", "bgaList", "bgaComponents", "components"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+# ====== 功能：把开发文档中的 bga/layout/rules/routingPlan 映射到 fanoutParams。 ======
+def _fanout_params_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    explicit = payload.get("fanoutParams") if isinstance(payload.get("fanoutParams"), dict) else {}
+    if explicit:
+        params = _merge_fanout_params(params, explicit)
+
+    bga = payload.get("bga") if isinstance(payload.get("bga"), dict) else {}
+    selected = _payload_text(payload, ("selectedBGA", "targetBGA", "componentId", "refdes"))
+    if selected:
+        params["selectedBGA"] = selected.upper()
+        params["targetBGAs"] = [selected.upper()]
+    if bga:
+        params["bga"] = dict(bga)
+        if bga.get("pinCount") not in (None, "", [], {}):
+            params["pinCount"] = bga.get("pinCount")
+        if bga.get("name") not in (None, "", [], {}):
+            params["bgaName"] = bga.get("name")
+
+    bga_type = _normalize_bga_type_text(_payload_text(payload, ("bgaType", "bga_type", "bgaLayoutType", "layoutType")))
+    if bga_type:
+        params["bgaType"] = bga_type
+        params["bgaLayoutType"] = bga_type
+
+    routing_plan = payload.get("routingPlan") if isinstance(payload.get("routingPlan"), dict) else {}
+    router_type = normalize_router_type(_payload_text(payload, ("routerType", "algorithm", "router", "routeType"))) or normalize_router_type(_first_text_from_dict(routing_plan, ("routerType", "algorithm", "router", "routeType")))
+    if router_type:
+        params["routerType"] = router_type
+
+    constraints = _merge_constraints_from_payload(payload, routing_plan)
+    if constraints:
+        params["constraints"] = constraints
+
+    layout = payload.get("layout") if isinstance(payload.get("layout"), dict) else {}
+    if layout:
+        params["layout"] = dict(layout)
+        for source_key, target_key in (("boardId", "boardId"), ("snapshotId", "snapshotId")):
+            if layout.get(source_key) not in (None, "", [], {}):
+                params[target_key] = layout.get(source_key)
+
+    rules = payload.get("rules") if isinstance(payload.get("rules"), dict) else {}
+    if rules:
+        params["rules"] = dict(rules)
+        rule_id = rules.get("ruleManagerConfigId") or rules.get("ruleConfigId") or rules.get("id")
+        if rule_id not in (None, "", [], {}):
+            params["ruleManagerConfigId"] = rule_id
+
+    network_info = _first_payload_value(payload, ("networkInfo", "networks", "nets"))
+    if network_info not in (None, "", [], {}):
+        params["networkInfo"] = network_info
+
+    if routing_plan:
+        params["routingPlan"] = dict(routing_plan)
+        for source_key, target_key in (("layerAssignment", "layerAssignment"), ("escapeOrder", "escapeOrder"), ("orderLines", "orderLines")):
+            value = routing_plan.get(source_key)
+            if value not in (None, "", [], {}):
+                params[target_key] = value
+        if "orderLines" not in params and routing_plan.get("escapeOrder") not in (None, "", [], {}):
+            params["orderLines"] = routing_plan.get("escapeOrder")
+
+    task_id = payload.get("taskId")
+    if task_id not in (None, "", [], {}):
+        params["taskId"] = task_id
+    return {key: value for key, value in params.items() if value not in (None, "", [], {})}
+
+
+# ====== 功能：从 payload/routingPlan/rules 中合并前端约束。 ======
+def _merge_constraints_from_payload(payload: dict[str, Any], routing_plan: dict[str, Any]) -> dict[str, Any]:
+    constraints: dict[str, Any] = {}
+    for source in (
+        payload.get("constraints") if isinstance(payload.get("constraints"), dict) else {},
+        routing_plan.get("constraints") if isinstance(routing_plan.get("constraints"), dict) else {},
+        (payload.get("rules") or {}).get("constraints") if isinstance(payload.get("rules"), dict) and isinstance((payload.get("rules") or {}).get("constraints"), dict) else {},
+    ):
+        constraints.update({key: value for key, value in source.items() if value not in (None, "", [], {})})
+    return constraints
+
+
+# ====== 功能：判断前端动作是否代表 fanout 参数已确认。 ======
+def _is_fanout_param_confirm_action(action: str) -> bool:
+    normalized = action.replace("-", "_").lower()
+    return normalized in {"confirm", "confirm_params", "submit_params", "parameter_config_result", "start_routing", "start_route", "start_fanout"}
+
+
+# ====== 功能：从 payload 或嵌套 bga 对象中读取第一个非空文本字段。 ======
+def _payload_text(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    sources = [payload]
+    for nested_key in ("bga", "selected", "selection"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return str(value).strip()
+    return ""
+
+
+# ====== 功能：从字典中读取第一个非空文本字段。 ======
+def _first_text_from_dict(source: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = source.get(key)
+        if value not in (None, "", [], {}):
+            return str(value).strip()
+    return ""
+
+
+# ====== 功能：读取 payload 顶层第一个非空对象字段。 ======
+def _first_payload_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+# ====== 功能：统一前端传入的 BGA 类型命名。 ======
+def _normalize_bga_type_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"rect", "rectangle", "rectangular", "矩形", "正交", "regular"}:
+        return "rectangular"
+    if text in {"stagger", "staggered", "交错", "错列"}:
+        return "staggered"
+    return text
 
 
 # ====== 功能：增量合并 fanout 实体，constraints 不整体覆盖。 ======
@@ -157,8 +372,9 @@ def _parse_fanout_param_confirmation(payload: Any) -> dict[str, Any] | None:
         if params is None:
             continue
         nested = params.get("fanoutParams") if isinstance(params.get("fanoutParams"), dict) else params
-        if _looks_like_fanout_params(nested):
-            return dict(nested)
+        normalized = _fanout_params_from_payload(dict(nested))
+        if _looks_like_fanout_params(nested) or normalized:
+            return normalized or dict(nested)
     return None
 
 
@@ -180,7 +396,7 @@ def _loads_json_object(value: Any) -> dict[str, Any] | None:
 
 # ====== 功能：判断前端返回是否像 fanout 参数确认。 ======
 def _looks_like_fanout_params(value: Any) -> bool:
-    return isinstance(value, dict) and any(key in value for key in ("orderLines", "constraints", "routerType", "selectedBGA", "targetBGAs"))
+    return isinstance(value, dict) and any(key in value for key in ("orderLines", "constraints", "routerType", "algorithm", "selectedBGA", "targetBGAs", "bga", "bgaType", "layout", "rules", "routingPlan", "layerAssignment", "escapeOrder"))
 
 
 # ====== 功能：合并前端确认参数，避免空 orderLines 覆盖真实逃逸顺序。 ======
@@ -196,8 +412,14 @@ def _merge_fanout_params(original: dict[str, Any], updates: dict[str, Any]) -> d
             constraints.update({k: v for k, v in value.items() if v not in (None, "")})
             merged["constraints"] = constraints
             continue
-        if key == "routerType":
+        if key in {"routerType", "algorithm", "routeType"}:
             normalized = normalize_router_type(value) or _router_choice_from_text(value)
+            if normalized:
+                merged[key] = normalized
+                merged["routerType"] = normalized
+            continue
+        if key in {"bgaType", "bgaLayoutType"}:
+            normalized = _normalize_bga_type_text(value)
             if normalized:
                 merged[key] = normalized
             continue
@@ -216,5 +438,3 @@ def _has_effective_order_lines(value: Any) -> bool:
         if isinstance(item, dict) and (str(item.get("net") or "").strip() or str(item.get("layer") or "").strip()):
             return True
     return False
-
-
