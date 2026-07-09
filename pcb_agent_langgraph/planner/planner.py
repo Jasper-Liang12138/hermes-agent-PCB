@@ -26,6 +26,10 @@ def _drc_failed(result: Any) -> bool:
 def _drc_passed(result: Any) -> bool:
     return isinstance(result, dict) and result.get("passed") is True and result.get("drcExecutionValid") is not False
 
+# ====== 功能：判断阶段产物是否真实成功，避免 failed dict 被当成完成态。
+def _stage_ok(result: Any) -> bool:
+    return isinstance(result, dict) and str(result.get("status", "")).lower() == "ok"
+
 # ====== 功能：合并多轮对话抽取到的 fanout 实体和约束。 ======
 def _merge_entities(*items: Any) -> dict[str, Any]:
     # 多轮对话里，用户可能分几次补充 BGA、router 类型、线宽线距等约束。
@@ -207,9 +211,9 @@ class PCBPlanner:
             # reroute 由 LangGraph 控制阶段推进：前端拆线 -> 重布 -> 导入 -> DRC/解释 -> 必要时 help_planner 兜底。
             if not cache.get("deleteTracesResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_entry", [{"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0}])
-            if not cache.get("rerouteInput"):
+            if not _stage_ok(cache.get("rerouteInput")):
                 return self._with_calls("reroute", "pcb_reroute_flow", "prepare_reroute_inputs", [{"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0}])
-            if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
+            if not cache.get("rerouteResult") and not _stage_ok(cache.get("rerouteContext")):
                 return self._with_calls("reroute", "pcb_reroute_flow", "compress_context", [{"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0}])
             if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0}])
@@ -335,9 +339,9 @@ class PCBPlanner:
         if intent == "reroute" or workflow == "pcb_reroute_flow":
             if not cache.get("deleteTracesResult"):
                 return [self._tool_call({"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0})], "reroute_entry"
-            if not cache.get("rerouteInput"):
+            if not _stage_ok(cache.get("rerouteInput")):
                 return [self._tool_call({"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0})], "prepare_reroute_inputs"
-            if not cache.get("rerouteResult") and not cache.get("rerouteContext"):
+            if not cache.get("rerouteResult") and not _stage_ok(cache.get("rerouteContext")):
                 return [self._tool_call({"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0})], "compress_context"
             if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
                 return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0})], "help_planner"

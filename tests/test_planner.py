@@ -303,6 +303,24 @@ def test_prepare_reroute_inputs_writes_fixed_route_layer_csv(tmp_path):
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net,route_layer", "DDR_DQ1,F.Cu"]
 
 
+# ====== 功能：验证 reroute 输入准备接受 KiCad S-expression 常见根节点空格。
+def test_prepare_reroute_inputs_accepts_spaced_kicad_root_from_board_text(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    context = {
+        "session_id": "s_spaced_prepare",
+        "deleteTracesResult": {
+            "projectData": {
+                "boardData": "( kicad_pcb (version 20240108) (layers (0 \"F.Cu\" signal)))\n",
+            },
+            "missing_routes": [{"net_name": "DDR_DQ2"}],
+        },
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert result["selectedNets"] == ["DDR_DQ2"]
+    assert result["kicadBoardText"].lstrip().startswith("( kicad_pcb")
+
 # ====== 功能：验证 reroute 输入转换失败时返回前端友好的格式转换错误。
 def test_prepare_reroute_inputs_conversion_error_hides_internal_format_name(monkeypatch, tmp_path):
     config = load_config("missing-config.ini")
@@ -389,6 +407,27 @@ def test_reroute_after_context_calls_vsea_reroute_loop_directly():
     plan = PCBPlanner(use_model=False).plan(state)
     assert plan["action"] == "reroute_loop"
     assert plan["tool_calls"][0]["name"] == "reroute_loop"
+# ====== 功能：验证 failed rerouteInput 不会推进到上下文压缩。
+def test_failed_reroute_input_does_not_advance_to_compress_context():
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "failed", "reason": "bad input"}}
+    state = {"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
+    plan = PCBPlanner(use_model=False).plan(state)
+    assert plan["action"] == "prepare_reroute_inputs"
+    assert plan["tool_calls"][0]["name"] == "prepare_reroute_inputs"
+
+
+# ====== 功能：验证 failed rerouteContext 不会推进到 VSEA reroute_loop。
+def test_failed_reroute_context_does_not_advance_to_reroute_loop():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok", "selectedNets": ["GND"]},
+        "rerouteContext": {"status": "failed", "reason": "bad context"},
+    }
+    state = {"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
+    plan = PCBPlanner(use_model=False).plan(state)
+    assert plan["action"] == "compress_context"
+    assert plan["tool_calls"][0]["name"] == "compress_reroute_context"
+
 # ====== 功能：验证唯一 BGA 自动进入参数生成后停在 fanoutParams 确认。 ======
 def test_fanout_single_bga_stops_for_fanout_params_review():
     cache = {
@@ -655,7 +694,7 @@ def test_reroute_loop_vsea_failure_has_no_import_path(monkeypatch, tmp_path):
             {},
             {
                 "session_id": "s2",
-                "rerouteInput": {"kicadBoardText": "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteInput": {"kicadBoardText": "( kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
                 "rerouteContext": {"contextText": "DDR_DQ0"},
             },
         )
@@ -739,7 +778,7 @@ def test_reroute_loop_missing_pipeline_root_fails(tmp_path):
             {},
             {
                 "session_id": "s3",
-                "rerouteInput": {"kicadBoardText": "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteInput": {"kicadBoardText": "( kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
                 "rerouteContext": {"contextText": "DDR_DQ0"},
             },
         )
@@ -843,6 +882,12 @@ def test_help_planner_rejects_export_txt_input():
     assert result["status"] == "failed"
     assert "requires KiCad .kicad_pcb input" in result["reason"]
 
+
+# ====== 功能：验证 help_planner 接受 KiCad S-expression 常见根节点空格。
+def test_help_planner_input_error_accepts_spaced_kicad_root():
+    from pcb_agent_langgraph.tools.external import _help_planner_input_error
+
+    assert _help_planner_input_error("( kicad_pcb (version 20240108))", "") == ""
 
 # ====== 功能：验证主模型 payload 使用 KiCad 输入契约，不暴露 PCB Builder txt 字段。 ======
 def test_reroute_model_payload_uses_kicad_contract():

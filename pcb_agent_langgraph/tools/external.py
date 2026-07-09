@@ -39,6 +39,10 @@ def _first_text(*values: Any) -> str:
     return ""
 
 
+# ====== 功能：判断文本是否是 KiCad .kicad_pcb 板文件根节点。
+def _is_kicad_board_text(text: Any) -> bool:
+    return re.match(r"^\s*\(\s*kicad_pcb\b", str(text or ""), re.IGNORECASE) is not None
+
 # ====== 功能：封装真实外部 PCB 程序工具调用。 ======
 class ExternalProgramTool:
     # 外部程序工具是 LangGraph 与真实 PCB 工具链的边界：本类只准备输入、执行命令、解析结果，不做流程决策。
@@ -286,7 +290,7 @@ class ExternalProgramTool:
 
         reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
         kicad_text = str(reroute_input.get("kicadBoardText") or "")
-        if not kicad_text or not kicad_text.lstrip().lower().startswith("(kicad_pcb"):
+        if not _is_kicad_board_text(kicad_text):
             return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute_loop", "failureStage": "input", "failureType": "missing_kicad_board_data"}
         prompt = _vsea_routing_task_prompt(arguments, context, reroute_input)
         if not prompt.strip():
@@ -403,7 +407,7 @@ class ExternalProgramTool:
         reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
         kicad_text = str(reroute_input.get("kicadBoardText") or "")
         kicad_path = str(reroute_input.get("kicadBoardPath") or "")
-        if not kicad_text or not kicad_text.lstrip().lower().startswith("(kicad_pcb"):
+        if not _is_kicad_board_text(kicad_text):
             return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute", "failureStage": "input", "failureType": "missing_kicad_board_data", "kicadBoardPath": kicad_path}
         attempt = int(arguments.get("attempt") or 0) or int(context.get("rerouteAttemptCount") or 0) + 1
         work_dir = self._work_dir(context) / "reroute" / f"attempt_{attempt}"
@@ -837,7 +841,7 @@ def _help_planner_input_error(project_data: str, source_board_path: str) -> str:
         return ""
     if maybe_path and maybe_path.suffix.lower() == ".txt":
         return f"help_planner requires KiCad .kicad_pcb input; got PCB Builder/export txt path: {maybe_path}"
-    if text.lstrip().lower().startswith("(kicad_pcb"):
+    if _is_kicad_board_text(text):
         return ""
     return "help_planner requires KiCad .kicad_pcb input; current projectData is not KiCad board text"
 
@@ -870,7 +874,7 @@ def _ensure_reroute_kicad_input(project_root: Path, board_text: str, source_path
         target = work_dir / source.name
         shutil.copyfile(source, target)
         return target, target.read_text(encoding="utf-8", errors="ignore"), str(source)
-    if board_text.lstrip().lower().startswith("(kicad_pcb"):
+    if _is_kicad_board_text(board_text):
         target = work_dir / "reroute_input.kicad_pcb"
         target.write_text(board_text, encoding="utf-8")
         return target, board_text, str(source or target)
