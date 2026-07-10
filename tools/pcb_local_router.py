@@ -199,15 +199,31 @@ def _layer_aliases(project_data: str) -> dict[str, str]:
     for match in pattern.finditer(project_data or ""):
         canonical = match.group(1).strip()
         display = (match.group(2) or "").strip()
-        aliases[canonical.casefold()] = canonical
-        aliases[canonical.replace(".Cu", "").casefold()] = canonical
+        plain = _plain_route_layer_name(canonical)
+        aliases[canonical.casefold()] = plain
+        aliases[canonical.replace(".Cu", "").casefold()] = plain
         if display:
-            aliases[display.casefold()] = canonical
-    aliases.setdefault("top", "F.Cu")
-    aliases.setdefault("f.cu", "F.Cu")
-    aliases.setdefault("bottom", "B.Cu")
-    aliases.setdefault("b.cu", "B.Cu")
+            aliases[display.casefold()] = plain
+    aliases.setdefault("top", "Top")
+    aliases.setdefault("f.cu", "Top")
+    aliases.setdefault("conductor/top", "Top")
+    aliases.setdefault("bottom", "Bottom")
+    aliases.setdefault("b.cu", "Bottom")
+    aliases.setdefault("conductor/bottom", "Bottom")
     return aliases
+
+
+def _plain_route_layer_name(value: Any) -> str:
+    layer = str(value or "").strip()
+    folded = layer.casefold()
+    if folded in {"top", "f.cu", "front", "conductor/top"}:
+        return "Top"
+    if folded in {"bottom", "b.cu", "back", "conductor/bottom"}:
+        return "Bottom"
+    match = re.fullmatch(r"In(\d+)(?:\.Cu)?", layer, flags=re.IGNORECASE)
+    if match:
+        return f"In{match.group(1)}.Cu"
+    return layer
 
 
 # ====== 功能：归一化局部布线层名。 ======
@@ -222,9 +238,9 @@ def _normalize_route_layer(value: Any, aliases: dict[str, str]) -> str:
         number = re.search(r"\d+", layer)
         return f"In{number.group(0)}.Cu" if number else layer
     if layer.casefold() in {"f.cu", "b.cu"}:
-        return layer[0].upper() + ".Cu"
+        return _plain_route_layer_name(layer)
     if layer.endswith(".Cu"):
-        return layer
+        return _plain_route_layer_name(layer)
     return ""
 
 

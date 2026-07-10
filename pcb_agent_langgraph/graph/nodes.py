@@ -120,18 +120,18 @@ class GraphNodes:
         tool_name = str(call.get("name") or "工具")
         is_frontend_tool = tool_name in {"getProjectData", "importLines", "deleteTracesForRerouting"}
         if self.progress_sender and session_id and not is_frontend_tool:
-            await self.progress_sender(session_id, f"正在调用 {tool_name}...")
+            await self.progress_sender(session_id, _tool_progress_start_message(call))
         task = asyncio.create_task(invoke_tool(tool, call, context))
+        started_at = time.monotonic()
         while not task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
             except asyncio.TimeoutError:
                 if self.progress_sender and session_id and not is_frontend_tool:
-                    await self.progress_sender(session_id, f"{tool_name} 执行中...")
+                    await self.progress_sender(session_id, _tool_progress_wait_message(call, time.monotonic() - started_at))
         record = await task
         if self.progress_sender and session_id and not is_frontend_tool:
-            suffix = _tool_progress_suffix(record)
-            await self.progress_sender(session_id, f"{tool_name} {suffix}")
+            await self.progress_sender(session_id, _tool_progress_done_message(record))
         return record
     # ====== 功能：根据工具结果生成当前轮回复和流程状态。 ======
     async def reflect(self, state: PCBState) -> dict[str, Any]:
@@ -443,6 +443,51 @@ def _result_work_dir(result: Any) -> str:
     if not isinstance(result, dict):
         return ""
     return str(result.get("workDir") or result.get("work_dir") or result.get("outputPath") or "")[:240]
+
+
+def _tool_timeout_seconds(call: dict[str, Any]) -> float:
+    try:
+        timeout = float(call.get("timeout") or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    return timeout if timeout > 0 else 900.0
+
+
+def _eta_minutes(call: dict[str, Any], elapsed_seconds: float = 0.0) -> int:
+    # VSEA reroute usually runs model sampling, fill and hard DRC internally. Use the tool timeout
+    # as a coarse upper bound so frontend text stays useful without pretending precision.
+    remaining = max(60.0, _tool_timeout_seconds(call) - max(0.0, elapsed_seconds))
+    return max(1, int(math.ceil(remaining / 60.0)))
+
+
+def _tool_progress_start_message(call: dict[str, Any]) -> str:
+    tool_name = str(call.get("name") or "工具")
+    if tool_name == "reroute_loop":
+        minutes = _eta_minutes(call)
+        if minutes >= 10:
+            lower = max(1, minutes - 5)
+            return f"正在重布中，预计还需要 {lower}-{minutes} 分钟。"
+        return f"正在重布中，预计还需要约 {minutes} 分钟。"
+    return f"正在调用 {tool_name}..."
+
+
+def _tool_progress_wait_message(call: dict[str, Any], elapsed_seconds: float) -> str:
+    tool_name = str(call.get("name") or "工具")
+    if tool_name == "reroute_loop":
+        minutes = _eta_minutes(call, elapsed_seconds)
+        return f"重布中，预计还需要约 {minutes} 分钟；正在生成候选路线、回填并检查规则..."
+    return f"{tool_name} 执行中..."
+
+
+def _tool_progress_done_message(record: dict[str, Any]) -> str:
+    result = record.get("result")
+    tool_name = str((record.get("call") or {}).get("name") or (result.get("tool") if isinstance(result, dict) else "") or "工具")
+    suffix = _tool_progress_suffix(record)
+    if tool_name == "reroute_loop":
+        if not record.get("ok") or _result_failed(result):
+            return "重布正在加速进行，快完成了！"
+        return f"重布已完成，继续准备导入结果...（{suffix}）"
+    return f"{tool_name} {suffix}"
 
 
 def _tool_progress_suffix(record: dict[str, Any]) -> str:

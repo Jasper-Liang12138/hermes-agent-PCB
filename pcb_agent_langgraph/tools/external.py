@@ -969,9 +969,22 @@ def _help_planner_input_error(project_data: str, source_board_path: str) -> str:
     return "help_planner requires KiCad .kicad_pcb input; current projectData is not KiCad board text"
 
 # ====== 功能：汇总 help_planner 失败时最关键的本地诊断路径。 ======
+def _help_planner_input_board_path(run_dir: Path, source_board_path: str) -> Path:
+    source_name = Path(str(source_board_path or "")).name
+    candidates: list[Path] = []
+    if source_name.lower().endswith(".kicad_pcb"):
+        candidates.append(run_dir / source_name)
+    candidates.append(run_dir / "local_route_input.kicad_pcb")
+    candidates.extend(sorted(path for path in run_dir.glob("*.kicad_pcb") if path.is_file()))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else run_dir / "local_route_input.kicad_pcb"
+
+
 def _help_planner_diagnostics(work_dir: Path, pcbrouter_bin: Path, source_board_path: str) -> dict[str, Any]:
     run_dir = work_dir / "pcbrouter_local_completion"
-    input_board = run_dir / "local_route_input.kicad_pcb"
+    input_board = _help_planner_input_board_path(run_dir, source_board_path)
     input_csv = run_dir / "local_route_input.csv"
     stdout_path = run_dir / "pcbrouter.stdout.log"
     stderr_path = run_dir / "pcbrouter.stderr.log"
@@ -1097,6 +1110,34 @@ def _vsea_env(config: AppConfig, arguments: dict[str, Any], output_dir: Path, ai
     }
 
 
+def _plain_layer_name(value: Any) -> str:
+    layer = str(value or "").strip()
+    folded = layer.casefold()
+    if folded in {"f.cu", "top", "front", "conductor/top"}:
+        return "Top"
+    if folded in {"b.cu", "bottom", "back", "conductor/bottom"}:
+        return "Bottom"
+    match = re.fullmatch(r"In(\d+)(?:\.Cu)?", layer, flags=re.IGNORECASE)
+    if match:
+        return f"In{match.group(1)}.Cu"
+    return layer
+
+
+def _plain_layer_routes(value: Any) -> Any:
+    layer_keys = {"layer", "route_layer", "routelayer", "target_layer", "targetlayer"}
+    if isinstance(value, list):
+        return [_plain_layer_routes(item) for item in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key.casefold() in layer_keys:
+                result[key] = _plain_layer_name(item)
+            else:
+                result[key] = _plain_layer_routes(item)
+        return result
+    return value
+
+
 def _import_vsea_module(pipeline_root: Path, module_name: str):
     root_text = str(pipeline_root)
     inserted = False
@@ -1117,7 +1158,7 @@ def _vsea_routing_task_prompt(arguments: dict[str, Any], context: dict[str, Any]
     explicit = _first_text(arguments.get("routing_task_prompt"), arguments.get("routingTaskPrompt"), arguments.get("prompt"))
     if explicit:
         return explicit
-    missing_routes = reroute_input.get("missingRoutes") or context.get("missingRoutes") or []
+    missing_routes = _plain_layer_routes(reroute_input.get("missingRoutes") or context.get("missingRoutes") or [])
     selected_nets = reroute_input.get("selectedNets") or context.get("selectedNets") or _nets_from_missing_routes(missing_routes)
     reroute_context = context.get("rerouteContext") if isinstance(context.get("rerouteContext"), dict) else {}
     context_text = _first_text(reroute_context.get("contextText"), reroute_context.get("summary"))
@@ -1584,7 +1625,7 @@ def _fanout_import_file(work_dir: Path, router_type: str, output_path: Path) -> 
 def _reroute_model_payload(arguments: dict[str, Any], context: dict[str, Any], reroute_input: dict[str, Any], attempt: int) -> dict[str, Any]:
     delete_result = context.get("deleteTracesResult") if isinstance(context.get("deleteTracesResult"), dict) else {}
     kicad_text = str(reroute_input.get("kicadBoardText") or "")
-    missing_routes = reroute_input.get("missingRoutes") or context.get("missingRoutes") or delete_result.get("missing_routes") or []
+    missing_routes = _plain_layer_routes(reroute_input.get("missingRoutes") or context.get("missingRoutes") or delete_result.get("missing_routes") or [])
     return {
         "task": "pcb_local_reroute",
         "inputFormat": "kicad_pcb",

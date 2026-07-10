@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 from pcb_agent_langgraph.agent import PCBLangGraphAgent
@@ -309,7 +310,7 @@ def test_prepare_reroute_inputs_writes_fixed_route_layer_csv(tmp_path):
     result = asyncio.run(tool.ainvoke({}, context))
     assert result["status"] == "ok"
     assert result["csvMode"] == "fixed_route_layer"
-    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net,route_layer", "DDR_DQ1,F.Cu"]
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net,route_layer", "DDR_DQ1,Top"]
 
 
 # ====== 功能：验证 reroute 输入准备在缺线包含终点时生成目标点 CSV。 ======
@@ -336,7 +337,7 @@ def test_prepare_reroute_inputs_writes_target_endpoint_csv(tmp_path):
     assert result["csvMode"] == "target_endpoint"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
         "net,route_layer,target_x_mm,target_y_mm,target_layer",
-        "NET_U1_B7,F.Cu,47.3,68.3,F.Cu",
+        "NET_U1_B7,Top,47.3,68.3,Top",
     ]
 
 
@@ -369,7 +370,7 @@ def test_prepare_reroute_inputs_converts_mil_endpoint_to_mm(tmp_path):
     assert result["status"] == "ok"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
         "net,route_layer,target_x_mm,target_y_mm,target_layer",
-        "DDR_D3,F.Cu,14.978888,1.773174,F.Cu",
+        "DDR_D3,Top,14.978888,1.773174,Top",
     ]
 
 
@@ -402,7 +403,7 @@ def test_prepare_reroute_inputs_converts_pcb_builder_endpoint_to_mm(tmp_path):
     assert result["status"] == "ok"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
         "net,route_layer,target_x_mm,target_y_mm,target_layer",
-        "R_NAND_RDY0,F.Cu,202.36942,186.208416,F.Cu",
+        "R_NAND_RDY0,Top,202.36942,186.208416,Top",
     ]
 
 
@@ -437,8 +438,24 @@ def test_prepare_reroute_inputs_prefers_pcb_builder_endpoint_when_auto_is_ambigu
     assert result["status"] == "ok"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
         "net,route_layer,target_x_mm,target_y_mm,target_layer",
-        "R_NAND_RDY0,F.Cu,202.36942,186.208416,F.Cu",
+        "R_NAND_RDY0,Top,202.36942,186.208416,Top",
     ]
+
+
+# ====== 功能：验证 help_planner 失败诊断会报告实际复制给 pcbrouter 的输入板文件名。
+def test_help_planner_diagnostics_reports_actual_copied_board_path(tmp_path):
+    from pcb_agent_langgraph.tools.external import _help_planner_diagnostics
+
+    work_dir = tmp_path / "help_planner"
+    run_dir = work_dir / "pcbrouter_local_completion"
+    run_dir.mkdir(parents=True)
+    (run_dir / "export.kicad_pcb").write_text("(kicad_pcb)", encoding="utf-8")
+    (run_dir / "local_route_input.csv").write_text("net\nR_NAND_RDY0\n", encoding="utf-8")
+
+    diagnostics = _help_planner_diagnostics(work_dir, tmp_path / "pcbrouter.exe", str(tmp_path / "source" / "export.kicad_pcb"))
+
+    assert diagnostics["inputBoardPath"] == str(run_dir / "export.kicad_pcb")
+    assert diagnostics["inputBoardPathExists"] is True
 
 
 # ====== 功能：验证终点坐标无法映射到 KiCad mm 时给出明确输入准备失败。
@@ -663,6 +680,37 @@ def test_reroute_cache_update_summarizes_result_without_name_error():
     _update_cache_from_tool(cache, "reroute", result)
     assert cache["rerouteResult"] == result
     assert cache["rerouteAttemptCount"] == 1
+
+
+# ====== 功能：验证 reroute_loop 进度消息面向前端用户，提示正在重布和预计剩余时间。
+def test_reroute_loop_progress_messages_include_eta():
+    from pcb_agent_langgraph.graph.nodes import _tool_progress_done_message, _tool_progress_start_message, _tool_progress_wait_message
+
+    call = {"name": "reroute_loop", "timeout": 900.0}
+    assert _tool_progress_start_message(call) == "正在重布中，预计还需要 10-15 分钟。"
+
+    wait_message = _tool_progress_wait_message(call, elapsed_seconds=125.0)
+    assert wait_message.startswith("重布中，预计还需要约 13 分钟")
+    assert "正在生成候选路线、回填并检查规则" in wait_message
+
+    done_message = _tool_progress_done_message(
+        {
+            "ok": True,
+            "elapsed_ms": 1300.0,
+            "result": {"status": "ok", "tool": "reroute_loop", "modelCalled": True, "fallbackUsed": False, "workDir": "work/vsea"},
+        }
+    )
+    assert done_message.startswith("重布已完成")
+    assert "继续准备导入结果" in done_message
+
+    failed_message = _tool_progress_done_message(
+        {
+            "ok": True,
+            "elapsed_ms": 1300.0,
+            "result": {"status": "failed", "tool": "reroute_loop", "reason": "temporary"},
+        }
+    )
+    assert failed_message == "重布正在加速进行，快完成了！"
 
 
 # ====== 功能：验证 reroute 进度消息携带模型调用证据，避免“已完成”过于含糊。 ======
@@ -1134,7 +1182,7 @@ def test_reroute_failure_text_includes_vsea_and_helper_diagnostics():
             "reason": "pcbrouter 局部布线完善执行失败 (exit 1)",
             "failureType": "pcbrouter_execution_failed",
             "inputCsvPath": "/tmp/local_route_input.csv",
-            "inputCsvPreview": "net,route_layer,target_x_mm,target_y_mm,target_layer\nDDR_D3,F.Cu,14.978888,1.773174,F.Cu",
+            "inputCsvPreview": "net,route_layer,target_x_mm,target_y_mm,target_layer\nDDR_D3,Top,14.978888,1.773174,Top",
         },
     }
     diagnostics = _reroute_diagnostics(cache, record)
@@ -1262,6 +1310,35 @@ def test_reroute_model_payload_uses_kicad_contract():
     assert payload["kicadBoardPreview"] == "(kicad_pcb demo)"
     assert payload["kicadBoardPath"] == "board.kicad_pcb"
     assert "projectDataPreview" not in payload
+
+
+# ====== 功能：验证给模型的结构化缺线层名使用 Top/Bottom，而不是 F.Cu/B.Cu。
+def test_reroute_model_payload_uses_plain_layer_names_for_routes():
+    from pcb_agent_langgraph.tools.external import _reroute_model_payload, _vsea_routing_task_prompt
+
+    reroute_input = {
+        "kicadBoardText": "(kicad_pcb demo)",
+        "kicadBoardPath": "board.kicad_pcb",
+        "selectedNets": ["R_NAND_RDY0"],
+        "missingRoutes": [
+            {
+                "net_name": "R_NAND_RDY0",
+                "route_layer": "B.Cu",
+                "start": {"layer": "F.Cu"},
+                "end": {"layer": "B.Cu", "x": 47.3, "y": 68.3},
+            }
+        ],
+    }
+
+    payload = _reroute_model_payload({}, {}, reroute_input, 1)
+    prompt = json.loads(_vsea_routing_task_prompt({}, {}, reroute_input))
+
+    assert payload["missingRoutes"][0]["route_layer"] == "Bottom"
+    assert payload["missingRoutes"][0]["start"]["layer"] == "Top"
+    assert payload["missingRoutes"][0]["end"]["layer"] == "Bottom"
+    assert prompt["missingRoutes"][0]["route_layer"] == "Bottom"
+    assert "F.Cu" not in json.dumps(payload["missingRoutes"], ensure_ascii=False)
+    assert "B.Cu" not in json.dumps(prompt["missingRoutes"], ensure_ascii=False)
 
 
 # ====== 功能：验证 DRC 失败超过耗时上限会进入 help_planner。 ======
