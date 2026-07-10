@@ -598,6 +598,10 @@ class ExternalProgramTool:
             payload = _dataclass_to_dict(result)
             routing_path = str(payload.get("routing_result_path") or "")
             output_csv_path = str(payload.get("output_csv_path") or "")
+            stdout_path = str(payload.get("stdout_path") or "")
+            stderr_path = str(payload.get("stderr_path") or "")
+            helper_partial = str(payload.get("status") or "").lower() == "partial"
+            pcbrouter_exit_code = payload.get("pcbrouter_exit_code")
             import_path = ""
             import_notes: list[str] = []
             if routing_path:
@@ -607,6 +611,7 @@ class ExternalProgramTool:
                     selected_nets=list(reroute_input.get("selectedNets") or route_params.get("selectedNets") or []),
                     work_dir=work_dir,
                 )
+            routed_txt_path, routed_txt_notes = _write_routed_layout_txt_artifact(self.config.root, routing_path, work_dir)
             if not import_path:
                 return {
                     "status": "failed",
@@ -616,29 +621,41 @@ class ExternalProgramTool:
                     "failureType": "incremental_import_failed",
                     "routingResult": routing_path,
                     "routedKicadFilePath": routing_path,
+                    "routedLayoutTxtFilePath": routed_txt_path,
                     "importLinesFilePath": "",
                     "incrementalImportFilePath": "",
-                    "incrementalImportNotes": import_notes or ["helper_router_incremental_import_not_generated"],
+                    "incrementalImportNotes": (import_notes or ["helper_router_incremental_import_not_generated"]) + routed_txt_notes,
                     "inputBoardPath": str(payload.get("input_board_path") or ""),
                     "inputCsvPath": str(payload.get("input_csv_path") or ""),
                     "outputCsvPath": output_csv_path,
+                    "stdoutPath": stdout_path,
+                    "stderrPath": stderr_path,
+                    "pcbrouterExitCode": pcbrouter_exit_code,
+                    "helperPartial": helper_partial,
                     "report": payload.get("report") or "pcbrouter local route completed without importable delta",
                     "detail": payload,
                     "workDir": str(work_dir),
                 }
+            report = str(payload.get("report") or "pcbrouter local route completed")
+            if helper_partial:
+                report = "已生成可导入重布结果，等待确认导入。 " + report
             return {
                 "status": "ok",
                 "tool": self.name,
                 "routingResult": routing_path,
                 "routedKicadFilePath": routing_path,
-                "routedLayoutTxtFilePath": "",
+                "routedLayoutTxtFilePath": routed_txt_path,
                 "importLinesFilePath": import_path,
                 "incrementalImportFilePath": import_path,
-                "incrementalImportNotes": import_notes,
+                "incrementalImportNotes": import_notes + routed_txt_notes,
                 "inputBoardPath": str(payload.get("input_board_path") or ""),
                 "inputCsvPath": str(payload.get("input_csv_path") or ""),
                 "outputCsvPath": output_csv_path,
-                "report": payload.get("report") or "pcbrouter local route completed",
+                "stdoutPath": stdout_path,
+                "stderrPath": stderr_path,
+                "pcbrouterExitCode": pcbrouter_exit_code,
+                "helperPartial": helper_partial,
+                "report": report,
                 "detail": payload,
                 "workDir": str(work_dir),
             }
@@ -1204,6 +1221,26 @@ def _write_helper_router_incremental_import_file(
         return "", [f"helper_router_incremental_import_invalid:{reason}"]
     output_path.write_text(import_text, encoding="utf-8")
     return str(output_path), [f"generated_helper_router_incremental_line_out:{output_path}", f"lineCount:{stats.get('lineCount', 0)}"]
+
+
+def _write_routed_layout_txt_artifact(project_root: Path, routed_board_path: str, work_dir: Path) -> tuple[str, list[str]]:
+    path = Path(str(routed_board_path or ""))
+    if not path.is_file():
+        return "", []
+    try:
+        convert_mod = _load_module("_pcb_agent_langgraph_convert_routed_txt", project_root / "convert.py")
+        output_dir = work_dir / "routed_txt"
+        result = convert_mod.convert_one("kicad_to_txt", path, output_dir, None)
+        output_path = Path(str(result.get("output") or ""))
+        if output_path.is_file():
+            return str(output_path), [f"generated_routed_layout_txt:{output_path}"]
+        return "", [f"routed_layout_txt_not_generated:{path}"]
+    except Exception as exc:
+        fallback_dir = work_dir / "routed_txt"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        fallback_path = fallback_dir / f"{path.stem}.txt"
+        fallback_path.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        return str(fallback_path), [f"routed_layout_txt_conversion_failed:{exc}", f"routed_layout_txt_fallback_kicad_text:{fallback_path}"]
 
 
 def _parse_kicad_segments(board_text: str) -> list[dict[str, Any]]:

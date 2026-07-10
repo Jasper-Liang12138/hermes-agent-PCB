@@ -33,6 +33,8 @@ class PcbRouterRunOutputs:
     input_csv_path: Path
     stdout_path: Path
     stderr_path: Path
+    status: str = "ok"
+    pcbrouter_exit_code: int = 0
 
 
 @dataclass
@@ -640,6 +642,29 @@ def run_pcbrouter_local_route(
     proc = _run_process(args, run_dir, timeout or _timeout_seconds())
     stdout_path, stderr_path = _write_process_logs(run_dir, proc)
     if proc.returncode != 0:
+        try:
+            partial_routing_result_path = _resolve_routing_result_path(run_dir, input_board_path)
+        except FileNotFoundError:
+            partial_routing_result_path = None
+        if partial_routing_result_path:
+            output_csv_path = _resolve_output_csv_path(run_dir, input_csv_path)
+            row_count = max(0, sum(1 for _ in input_csv_path.open("r", encoding="utf-8", errors="replace")) - 1)
+            report = (
+                f"pcbrouter 局部布线完善未完全成功 (exit {proc.returncode})，"
+                f"但已产出 routed board：目标 net {row_count} 个，输出 {partial_routing_result_path.name}。"
+            )
+            return PcbRouterRunOutputs(
+                routing_result_path=partial_routing_result_path,
+                import_lines_path=None,
+                output_csv_path=output_csv_path,
+                report=report,
+                input_board_path=input_board_path.resolve(),
+                input_csv_path=input_csv_path.resolve(),
+                stdout_path=stdout_path.resolve(),
+                stderr_path=stderr_path.resolve(),
+                status="partial",
+                pcbrouter_exit_code=int(proc.returncode),
+            )
         output = "\n".join(part for part in [proc.stdout.strip(), proc.stderr.strip()] if part)
         raise RuntimeError(f"pcbrouter 局部布线完善执行失败 (exit {proc.returncode}):\n{output[:1600]}")
 

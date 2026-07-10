@@ -78,7 +78,7 @@ model: {model}
 VSEA reroute 的 hard DRC 依赖外部 `DRC_0623_v2\agent_package`。示例配置默认使用相对路径，部署时请把外部 DRC 包放到对应目录，或在 `config.ini` 的 `[reroute_loop]` 中按需改成其它路径：
 
 ```ini
-drc_agent_package = .\external_drc\DRC_0623_v2\agent_package
+drc_agent_package = ..\external_drc\DRC_0623_v2\agent_package
 # agent_drc_python 留空时使用运行环境默认 Python
 agent_drc_python =
 ```
@@ -242,4 +242,3 @@ python_executable = .\runtime\explain_python\Scripts\python.exe
 | `-SkipExplainRuntime` | 不复制或创建 explain runtime。 | 完全不启用可解释性模型，或交付后另行配置 runtime 时使用。 |
 
 注意：`-Python` 是主程序打包环境，`-ExplainRuntimePython` 是创建可解释性模型 runtime 的环境，二者可以相同，也可以不同。
-

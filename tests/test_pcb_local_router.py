@@ -42,6 +42,67 @@ def test_pcbrouter_local_route_invokes_helper_with_relative_input_paths(monkeypa
     assert result.input_csv_path == Path(captured["work_dir"]) / args[3]
 
 
+def test_pcbrouter_local_route_returns_partial_when_exit_1_has_routed_board(monkeypatch, tmp_path):
+    binary = tmp_path / "pcbrouter.exe"
+    binary.write_bytes(b"MZstub")
+    source_board = tmp_path / "export.kicad_pcb"
+    source_board.write_text(
+        '(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (31 "B.Cu" signal)) (net 1 R_NAND_RDY0))',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(local_router, "resolve_pcbrouter_binary", lambda: binary)
+    monkeypatch.setattr(local_router, "_native_binary_usable", lambda _path: True)
+    monkeypatch.setattr(local_router, "_pcbrouter_binary_args", lambda _binary, *args: [str(_binary), *args])
+
+    def fake_run_process(_args, work_dir, _timeout):
+        output_dir = Path(work_dir) / "output_routed"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "routed.kicad_pcb").write_text(source_board.read_text(encoding="utf-8"), encoding="utf-8")
+        return SimpleNamespace(returncode=1, stdout="partial route exists", stderr="drc failed")
+
+    monkeypatch.setattr(local_router, "_run_process", fake_run_process)
+
+    result = local_router.run_pcbrouter_local_route(
+        project_data=source_board.read_text(encoding="utf-8"),
+        route_params={"selectedNets": ["R_NAND_RDY0"]},
+        work_dir=tmp_path / "work",
+        source_board_path=str(source_board),
+    )
+
+    assert result.status == "partial"
+    assert result.pcbrouter_exit_code == 1
+    assert result.routing_result_path.name == "routed.kicad_pcb"
+    assert "产出 routed board" in result.report
+
+
+def test_pcbrouter_local_route_raises_when_exit_1_has_no_routed_board(monkeypatch, tmp_path):
+    binary = tmp_path / "pcbrouter.exe"
+    binary.write_bytes(b"MZstub")
+    source_board = tmp_path / "export.kicad_pcb"
+    source_board.write_text(
+        '(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (31 "B.Cu" signal)) (net 1 R_NAND_RDY0))',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(local_router, "resolve_pcbrouter_binary", lambda: binary)
+    monkeypatch.setattr(local_router, "_native_binary_usable", lambda _path: True)
+    monkeypatch.setattr(local_router, "_pcbrouter_binary_args", lambda _binary, *args: [str(_binary), *args])
+    monkeypatch.setattr(local_router, "_run_process", lambda _args, _work_dir, _timeout: SimpleNamespace(returncode=1, stdout="failed", stderr="no output"))
+
+    try:
+        local_router.run_pcbrouter_local_route(
+            project_data=source_board.read_text(encoding="utf-8"),
+            route_params={"selectedNets": ["R_NAND_RDY0"]},
+            work_dir=tmp_path / "work",
+            source_board_path=str(source_board),
+        )
+    except RuntimeError as exc:
+        assert "exit 1" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
 def test_local_route_csv_uses_display_layer_names(tmp_path):
     board_text = '(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (31 "B.Cu" signal)))'
 

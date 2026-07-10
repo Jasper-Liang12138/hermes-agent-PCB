@@ -81,7 +81,7 @@ class RerouteLoopConfig:
     provider: str = "vsea"
     pipeline_root: str = ".\\vendor\\VSEA-PCB"
     ai_pcb_eval_path: str = ".\\vendor\\AI-PCB-Eval"
-    drc_agent_package: str = ""
+    drc_agent_package: str = "..\\external_drc\\DRC_0623_v2\\agent_package"
     agent_drc_python: str = ""
     max_rounds: int = 2
     samples: int = 2

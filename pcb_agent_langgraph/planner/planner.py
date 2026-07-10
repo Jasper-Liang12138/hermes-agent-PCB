@@ -30,6 +30,23 @@ def _drc_passed(result: Any) -> bool:
 def _stage_ok(result: Any) -> bool:
     return isinstance(result, dict) and str(result.get("status", "")).lower() == "ok"
 
+
+def _helper_partial(cache: dict[str, Any]) -> bool:
+    for key in ("helpPlannerResult", "rerouteResult"):
+        value = cache.get(key)
+        if isinstance(value, dict) and value.get("helperPartial") is True:
+            return True
+    return False
+
+
+def _helper_reroute_result(cache: dict[str, Any]) -> bool:
+    for key in ("helpPlannerResult", "rerouteResult"):
+        value = cache.get(key)
+        if isinstance(value, dict) and str(value.get("tool") or "").lower() == "help_planner":
+            return True
+    return False
+
+
 # ====== 功能：合并多轮对话抽取到的 fanout 实体和约束。 ======
 def _merge_entities(*items: Any) -> dict[str, Any]:
     # 多轮对话里，用户可能分几次补充 BGA、router 类型、线宽线距等约束。
@@ -228,11 +245,18 @@ class PCBPlanner:
             #     return self._with_calls("reroute", "pcb_reroute_flow", "reroute_retry", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
             # if not cache.get("drcResult"):
             #     return self._with_calls("reroute", "pcb_reroute_flow", "drc", [{"name": "drc_check", "arguments": {}, "timeout": 360.0}])
+            import_file = self._extract_import_file(cache.get("rerouteResult"))
+            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult") and workflow_state != "report":
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_report", "tool_calls": [], "response": "已生成可导入重布结果，请确认是否导入。"}
+            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult") and workflow_state == "report" and not _is_confirm_text(text):
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "wait_reroute_import_confirm", "tool_calls": [], "response": "当前正在等待导入确认。请回复“确认导入”，或说明要重新重布。"}
+            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "confirm_import", [{"name": "importLines", "arguments": {"filePath": import_file}, "timeout": 360.0}])
             if not cache.get("explainabilityReport"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}])
-            import_file = self._extract_import_file(cache.get("rerouteResult"))
             if import_file and not cache.get("importLinesResult") and workflow_state != "report":
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_report", "tool_calls": [], "response": "拆线重布和 DRC 检查已完成，请确认是否导入结果。"}
+                response = "已生成可导入重布结果，请确认是否导入。" if _helper_partial(cache) else "拆线重布和 DRC 检查已完成，请确认是否导入结果。"
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_report", "tool_calls": [], "response": response}
             if import_file and not cache.get("importLinesResult") and workflow_state == "report" and not _is_confirm_text(text):
                 return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "wait_reroute_import_confirm", "tool_calls": [], "response": "当前正在等待导入确认。请回复“确认导入”，或说明要重新重布。"}
             if import_file and not cache.get("importLinesResult"):
@@ -364,6 +388,8 @@ class PCBPlanner:
             #     return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute_retry"
             # if not cache.get("drcResult"):
             #     return [self._tool_call({"name": "drc_check", "arguments": {}, "timeout": 360.0})], "drc"
+            if self._extract_import_file(cache.get("rerouteResult")) and _helper_reroute_result(cache) and not cache.get("importLinesResult"):
+                return [], "reroute_report"
             if not cache.get("explainabilityReport"):
                 return [self._tool_call({"name": "explainability_report", "arguments": {}, "timeout": 360.0})], "explainability"
             import_file = self._extract_import_file(cache.get("rerouteResult"))

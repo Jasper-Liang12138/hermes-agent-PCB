@@ -2,7 +2,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from pcb_agent_langgraph.utils.config import load_config
+from pcb_agent_langgraph.utils.config import RerouteLoopConfig, load_config
 
 
 def test_example_config_does_not_force_agent_drc_python():
@@ -14,7 +14,11 @@ def test_example_config_does_not_force_agent_drc_python():
 def test_example_config_uses_default_relative_external_drc_package():
     config = load_config(Path(__file__).resolve().parents[1] / "config.example.ini")
 
-    assert config.reroute_loop.drc_agent_package == r".\external_drc\DRC_0623_v2\agent_package"
+    assert config.reroute_loop.drc_agent_package == r"..\external_drc\DRC_0623_v2\agent_package"
+
+
+def test_missing_config_uses_default_relative_external_drc_package():
+    assert RerouteLoopConfig().drc_agent_package == r"..\external_drc\DRC_0623_v2\agent_package"
 
 
 def test_vsea_drc_adapter_empty_python_uses_current_interpreter(monkeypatch, tmp_path):

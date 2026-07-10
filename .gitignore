@@ -48,3 +48,5 @@ explain_model/explain_code/inference_runs/
 # Local learning notes
 docs/agent_design_notes.md
 docs/langgraph_research_figure_prompt.md
+
+run-e9936e67-0a1e-42b8-9d4d-0f4fe9bc0b90.jsonl

@@ -859,7 +859,14 @@ def test_help_planner_fails_when_incremental_import_missing(monkeypatch, tmp_pat
                 "report": "completed without useful changes",
             }
 
-    monkeypatch.setattr(external, "_load_module", lambda *_args, **_kwargs: FakeLocalRouter)
+    original_load_module = external._load_module
+
+    def fake_load_module(module_name, file_path):
+        if str(file_path).endswith("pcb_local_router.py"):
+            return FakeLocalRouter
+        return original_load_module(module_name, file_path)
+
+    monkeypatch.setattr(external, "_load_module", fake_load_module)
     monkeypatch.setattr(external, "_write_helper_router_incremental_import_file", lambda **_kwargs: ("", ["helper_router_incremental_import_no_changed_segments"]))
 
     config = load_config("missing-config.ini")
@@ -883,6 +890,78 @@ def test_help_planner_fails_when_incremental_import_missing(monkeypatch, tmp_pat
     assert result["failureType"] == "incremental_import_failed"
     assert "line.out" in result["reason"]
     assert result["routedKicadFilePath"] == str(routed_path)
+
+
+# ====== 功能：验证 helper-router partial 结果只要能生成 line.out，也会进入可导入状态。
+def test_help_planner_partial_result_generates_import(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    routed_path = tmp_path / "routed.kicad_pcb"
+    routed_path.write_text(
+        """
+        (kicad_pcb
+          (net 1 DDR_DQ0)
+          (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+          (segment (start 11 20) (end 12 20) (width 0.1524) (layer F.Cu) (net 1))
+        )
+        """,
+        encoding="utf-8",
+    )
+
+    class FakeLocalRouter:
+        @staticmethod
+        def run_pcbrouter_local_route(**_kwargs):
+            return {
+                "status": "partial",
+                "pcbrouter_exit_code": 1,
+                "routing_result_path": str(routed_path),
+                "output_csv_path": str(tmp_path / "out.csv"),
+                "input_board_path": str(tmp_path / "input.kicad_pcb"),
+                "input_csv_path": str(tmp_path / "local_route_input.csv"),
+                "stdout_path": str(tmp_path / "stdout.log"),
+                "stderr_path": str(tmp_path / "stderr.log"),
+                "report": "pcbrouter 执行未完全成功，但已产出 routed board。",
+            }
+
+    original_load_module = external._load_module
+
+    def fake_load_module(module_name, file_path):
+        if str(file_path).endswith("pcb_local_router.py"):
+            return FakeLocalRouter
+        return original_load_module(module_name, file_path)
+
+    monkeypatch.setattr(external, "_load_module", fake_load_module)
+
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("help_planner", config)
+    result = asyncio.run(
+        tool.ainvoke(
+            {},
+            {
+                "session_id": "s_help_partial",
+                "rerouteInput": {
+                    "kicadBoardText": """
+                    (kicad_pcb
+                      (net 1 DDR_DQ0)
+                      (segment (start 10 20) (end 11 20) (width 0.1524) (layer F.Cu) (net 1))
+                    )
+                    """,
+                    "kicadBoardPath": str(tmp_path / "input.kicad_pcb"),
+                    "selectedNets": ["DDR_DQ0"],
+                    "missingRoutes": [{"net_name": "DDR_DQ0"}],
+                },
+            },
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["helperPartial"] is True
+    assert result["pcbrouterExitCode"] == 1
+    assert result["importLinesFilePath"].endswith(".out")
+    assert result["routedKicadFilePath"] == str(routed_path)
+    assert result["routedLayoutTxtFilePath"].endswith(".txt")
+    assert Path(result["routedLayoutTxtFilePath"]).is_file()
+    assert "可导入重布结果" in result["report"]
 
 
 # ====== 功能：验证 VSEA reroute_loop 成功后生成可导入增量 line.out 并信任 hard DRC。 ======
@@ -1438,6 +1517,74 @@ def test_planner_reroute_loop_failure_calls_help_planner_not_legacy_retry():
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert plan["action"] == "help_planner"
     assert [call["name"] for call in plan["tool_calls"]] == ["help_planner"]
+
+
+# ====== 功能：验证 helper partial 有 line.out 时进入导入确认，并由用户确认后导入 helper 结果。
+def test_planner_helper_partial_imports_helper_line_out_after_confirm():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteLoopResult": {"status": "failed", "failureType": "drc_failed", "importLinesFilePath": "vsea_failed.out"},
+        "helpPlannerResult": {
+            "status": "ok",
+            "helperPartial": True,
+            "importLinesFilePath": "helper_partial.out",
+            "incrementalImportFilePath": "helper_partial.out",
+        },
+        "rerouteResult": {
+            "status": "ok",
+            "helperPartial": True,
+            "importLinesFilePath": "helper_partial.out",
+            "incrementalImportFilePath": "helper_partial.out",
+        },
+        "explainabilityReport": {"status": "ok"},
+    }
+
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "reroute_report"
+    assert plan["tool_calls"] == []
+    assert "已生成可导入重布结果" in plan["response"]
+
+    wait_plan = PCBPlanner(use_model=False).plan({"user_input": "先看一下", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert wait_plan["action"] == "wait_reroute_import_confirm"
+
+    import_plan = PCBPlanner(use_model=False).plan({"user_input": "确认导入", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert import_plan["action"] == "confirm_import"
+    assert import_plan["tool_calls"][0]["name"] == "importLines"
+    assert import_plan["tool_calls"][0]["arguments"]["filePath"] == "helper_partial.out"
+
+
+# ====== 功能：验证 helper 成功产出 line.out 后不再跑依赖 DRC 的 explainability。
+def test_planner_helper_result_skips_explainability_and_waits_for_import_confirm():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteLoopResult": {"status": "failed", "failureType": "dependency_preflight_failed"},
+        "helpPlannerResult": {
+            "status": "ok",
+            "tool": "help_planner",
+            "importLinesFilePath": "helper_line.out",
+            "incrementalImportFilePath": "helper_line.out",
+        },
+        "rerouteResult": {
+            "status": "ok",
+            "tool": "help_planner",
+            "importLinesFilePath": "helper_line.out",
+            "incrementalImportFilePath": "helper_line.out",
+        },
+    }
+
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "reroute_report"
+    assert plan["tool_calls"] == []
+    assert "已生成可导入重布结果" in plan["response"]
+
+    confirm_plan = PCBPlanner(use_model=False).plan({"user_input": "确认导入", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert confirm_plan["action"] == "confirm_import"
+    assert confirm_plan["tool_calls"][0]["name"] == "importLines"
+    assert confirm_plan["tool_calls"][0]["arguments"]["filePath"] == "helper_line.out"
 
 
 # ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======
