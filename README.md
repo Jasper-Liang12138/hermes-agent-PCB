@@ -14,6 +14,17 @@
 
 ## 运行
 
+Windows 首次启动：
+
+```powershell
+cd F:\doctor\hermes-agent\PCB_AGENT_LangGraph
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pcb_agent_langgraph.websocket.server --config .\config.ini
+```
+
+已有虚拟环境时：
+
 ```powershell
 cd F:\doctor\hermes-agent\PCB_AGENT_LangGraph
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -24,6 +35,20 @@ cd F:\doctor\hermes-agent\PCB_AGENT_LangGraph
 
 ```powershell
 .\.venv\Scripts\python.exe -m pcb_agent_langgraph.websocket.server --config .\config.ini
+```
+
+默认 WebSocket 地址是：
+
+```text
+ws://127.0.0.1:7074
+```
+
+如果前端在同局域网其它机器上，需要在 `config.ini` 中允许外部连接：
+
+```ini
+[server]
+host = 0.0.0.0
+port = 7074
 ```
 
 ## 模型调用
@@ -207,7 +232,6 @@ python_executable = .\runtime\explain_python\Scripts\python.exe
 | `-SkipExplainRuntime` | 不复制或创建 explain runtime。 | 完全不启用可解释性模型，或交付后另行配置 runtime 时使用。 |
 
 注意：`-Python` 是主程序打包环境，`-ExplainRuntimePython` 是创建可解释性模型 runtime 的环境，二者可以相同，也可以不同。
-
 
 
 

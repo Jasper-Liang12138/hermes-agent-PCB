@@ -189,15 +189,15 @@ def test_config_explicit_path_precedence(tmp_path):
     assert config.drc.enabled is True
 
 
-# ====== 功能：验证 drc disabled fails clearly 场景。 ======
+# ====== 功能：验证旧 drc_check 已被硬禁用。 ======
 def test_drc_disabled_fails_clearly():
     config = load_config("missing-config.ini")
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, {}))
     assert result["status"] == "failed"
-    assert "DRC is disabled" in result["reason"]
+    assert "legacy drc_check is disabled" in result["reason"]
 
 
-# ====== 功能：验证 drc configured missing input fails after tool resolution 场景。 ======
+# ====== 功能：验证即使配置了 DRC，旧 drc_check 也不会执行。 ======
 def test_drc_configured_missing_input_fails_after_tool_resolution(tmp_path):
     cfg = tmp_path / "config.ini"
     cfg.write_text(
@@ -210,7 +210,7 @@ def test_drc_configured_missing_input_fails_after_tool_resolution(tmp_path):
     config = load_config(cfg)
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, {}))
     assert result["status"] == "failed"
-    assert result["reason"] == "missing original board data for DRC"
+    assert "legacy drc_check is disabled" in result["reason"]
 
 
 # ====== 功能：验证 explain and help config defaults present 场景。 ======
@@ -301,6 +301,34 @@ def test_prepare_reroute_inputs_writes_fixed_route_layer_csv(tmp_path):
     assert result["status"] == "ok"
     assert result["csvMode"] == "fixed_route_layer"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == ["net,route_layer", "DDR_DQ1,F.Cu"]
+
+
+# ====== 功能：验证 reroute 输入准备在缺线包含终点时生成目标点 CSV。 ======
+def test_prepare_reroute_inputs_writes_target_endpoint_csv(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text("(kicad_pcb (version 20240108) (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal)))\n", encoding="utf-8")
+    context = {
+        "session_id": "s3",
+        "deleteTracesResult": {
+            "projectData": str(board_path),
+            "missing_routes": [
+                {
+                    "net_name": "NET_U1_B7",
+                    "start": {"component": "U1", "pad": "B7", "layer": "Top", "x": 47.30, "y": 62.30},
+                    "end": {"layer": "Top", "x": 47.30, "y": 68.30},
+                }
+            ],
+        },
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert result["csvMode"] == "target_endpoint"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
+        "net,target_x,target_y,target_layer",
+        "NET_U1_B7,47.3,68.3,F.Cu",
+    ]
 
 
 # ====== 功能：验证 reroute 输入准备接受 KiCad S-expression 常见根节点空格。
@@ -960,7 +988,7 @@ def test_legacy_reroute_unavailable_does_not_block_vsea_loop():
     assert plan["tool_calls"][0]["name"] == "reroute_loop"
 
 
-# ====== 功能：验证 patch fill 失败不能被 target scoped DRC 误判为通过。 ======
+# ====== 功能：验证旧 drc_check 禁用后不会执行 patch fill。 ======
 def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -988,9 +1016,7 @@ def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
     assert result["status"] == "failed"
-    assert result["passed"] is False
-    assert result["drcExecutionValid"] is False
-    assert result["targetScopedPassed"] is False
+    assert "legacy drc_check is disabled" in result["reason"]
 
 
 # ====== 功能：验证默认 reroute_loop 失败后 planner 直接进入 help_planner。 ======
@@ -1020,7 +1046,7 @@ def test_planner_calls_explainability_only_after_drc_passed():
     assert [call["name"] for call in plan["tool_calls"]] == ["explainability_report"]
 
 
-# ====== 功能：验证 help_planner 完整板输出优先用于 full-board DRC。 ======
+# ====== 功能：验证旧 drc_check 禁用后不会对 help_planner 输出跑 full-board DRC。 ======
 def test_drc_uses_help_planner_full_board_without_routed_text(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -1057,13 +1083,12 @@ def test_drc_uses_help_planner_full_board_without_routed_text(monkeypatch, tmp_p
         "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
-    assert FakeDrcModule.called == "board"
-    assert result["status"] == "ok"
-    assert result["drcInputMode"] == "full_board"
-    assert result["drcInputSource"] in {"helpPlannerResult", "rerouteResult"}
+    assert FakeDrcModule.called == ""
+    assert result["status"] == "failed"
+    assert "legacy drc_check is disabled" in result["reason"]
 
 
-# ====== 功能：验证 full-board 残留非目标错误可和 target scoped 结果区分。 ======
+# ====== 功能：验证旧 drc_check 禁用后不会执行 target scoped DRC。 ======
 def test_drc_target_scoped_pass_with_full_board_residual_issue(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -1092,8 +1117,5 @@ def test_drc_target_scoped_pass_with_full_board_residual_issue(monkeypatch, tmp_
         "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
-    assert result["passed"] is True
-    assert result["fullBoardPassed"] is False
-    assert result["targetScopedPassed"] is True
-    assert result["fullBoardIssueCount"] == 1
-    assert result["targetIssueCount"] == 0
+    assert result["status"] == "failed"
+    assert "legacy drc_check is disabled" in result["reason"]

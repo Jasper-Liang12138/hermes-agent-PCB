@@ -45,11 +45,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Prepare KiCad board input and local route CSV before local reroute.",
         "parameters": {"type": "object", "properties": {"localRouteCsvPath": {"type": "string"}}},
     },
-    {
-        "name": "reroute",
-        "description": "Debug/manual fallback: run one legacy local reroute model attempt after selected traces are removed.",
-        "parameters": {"type": "object", "properties": {"localRerouteCompletionPolicy": {"type": "object"}}},
-    },
+    # Legacy reroute is intentionally not exposed to the planner; VSEA reroute_loop is the only default model path.
+    # {
+    #     "name": "reroute",
+    #     "description": "Debug/manual fallback: run one legacy local reroute model attempt after selected traces are removed.",
+    #     "parameters": {"type": "object", "properties": {"localRerouteCompletionPolicy": {"type": "object"}}},
+    # },
     {
         "name": "reroute_loop",
         "description": "Run the VSEA reroute pipeline for model generation, fill, hard DRC, and repair retry.",
@@ -60,11 +61,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Chunk and retrieve compact KiCad board context before local reroute.",
         "parameters": {"type": "object", "properties": {"chunkChars": {"type": "integer"}, "retrieveK": {"type": "integer"}}},
     },
-    {
-        "name": "drc_check",
-        "description": "Run DRC check over current or routed board data.",
-        "parameters": {"type": "object", "properties": {}},
-    },
+    # Legacy drc_check is intentionally not exposed; VSEA hard DRC is trusted in the default reroute chain.
+    # {
+    #     "name": "drc_check",
+    #     "description": "Run DRC check over current or routed board data.",
+    #     "parameters": {"type": "object", "properties": {}},
+    # },
     {
         "name": "explainability_report",
         "description": "Generate explainability report for PCB result and DRC status.",

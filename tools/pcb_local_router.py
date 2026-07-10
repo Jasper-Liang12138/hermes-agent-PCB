@@ -31,6 +31,15 @@ class PcbRouterRunOutputs:
     stderr_path: Path
 
 
+@dataclass
+class LocalRouteCsvRow:
+    net: str
+    route_layer: str = ""
+    target_x: str = ""
+    target_y: str = ""
+    target_layer: str = ""
+
+
 # ====== 功能：定位当前工具脚本所在项目根目录。 ======
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -214,20 +223,49 @@ def _normalize_route_layer(value: Any, aliases: dict[str, str]) -> str:
     return ""
 
 
+def _csv_number(value: Any) -> str:
+    if isinstance(value, bool):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
+def _local_route_row_from_item(item: dict[str, Any], aliases: dict[str, str]) -> LocalRouteCsvRow | None:
+    net = str(item.get("net") or item.get("net_name") or item.get("netName") or item.get("name") or "").strip()
+    if not net:
+        return None
+    route_layer = _normalize_route_layer(item.get("route_layer") or item.get("layer"), aliases)
+    end = item.get("end") if isinstance(item.get("end"), dict) else {}
+    target_x = _csv_number(item.get("target_x") or item.get("targetX") or end.get("x"))
+    target_y = _csv_number(item.get("target_y") or item.get("targetY") or end.get("y"))
+    target_layer = _normalize_route_layer(
+        item.get("target_layer") or item.get("targetLayer") or end.get("layer") or item.get("route_layer") or item.get("layer"),
+        aliases,
+    )
+    if not (target_x and target_y):
+        target_x = ""
+        target_y = ""
+        target_layer = ""
+    return LocalRouteCsvRow(net=net, route_layer=route_layer, target_x=target_x, target_y=target_y, target_layer=target_layer)
+
+
 # ====== 功能：整理局部布线 CSV 行顺序。 ======
-def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -> list[tuple[str, str]]:
+def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -> list[LocalRouteCsvRow]:
     aliases = _layer_aliases(project_data)
-    rows: list[tuple[str, str]] = []
+    rows: list[LocalRouteCsvRow] = []
     seen: set[str] = set()
     order_lines = route_params.get("orderLines") or []
     for item in order_lines:
         if not isinstance(item, dict):
             continue
-        net = str(item.get("net") or item.get("net_name") or item.get("netName") or "").strip()
-        if not net or net in seen:
+        row = _local_route_row_from_item(item, aliases)
+        if row is None or row.net in seen:
             continue
-        seen.add(net)
-        rows.append((net, _normalize_route_layer(item.get("route_layer") or item.get("layer"), aliases)))
+        seen.add(row.net)
+        rows.append(row)
 
     for key in ("nets", "selectedNets", "localRouteNets", "pcbrouterNets"):
         value = route_params.get(key)
@@ -235,15 +273,14 @@ def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -
             continue
         for raw_net in value:
             if isinstance(raw_net, dict):
-                net = str(raw_net.get("net") or raw_net.get("net_name") or raw_net.get("netName") or raw_net.get("name") or "").strip()
-                layer = _normalize_route_layer(raw_net.get("route_layer") or raw_net.get("layer"), aliases)
+                row = _local_route_row_from_item(raw_net, aliases)
             else:
                 net = str(raw_net or "").strip()
-                layer = ""
-            if not net or net in seen:
+                row = LocalRouteCsvRow(net=net) if net else None
+            if row is None or row.net in seen:
                 continue
-            seen.add(net)
-            rows.append((net, layer))
+            seen.add(row.net)
+            rows.append(row)
     return rows
 
 
@@ -276,15 +313,21 @@ def write_local_route_csv(
     rows = _ordered_local_route_rows(route_params, project_data)
     if not rows:
         raise ValueError("局部布线完善缺少可写入 CSV 的目标 net")
-    has_route_layer = any(layer for _, layer in rows)
+    has_target = any(row.target_x and row.target_y for row in rows)
+    has_route_layer = any(row.route_layer for row in rows)
     with target.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["net", "route_layer"] if has_route_layer else ["net"])
-        for net, layer in rows:
-            if has_route_layer:
-                writer.writerow([net, layer])
+        if has_target:
+            writer.writerow(["net", "target_x", "target_y", "target_layer"])
+        else:
+            writer.writerow(["net", "route_layer"] if has_route_layer else ["net"])
+        for row in rows:
+            if has_target:
+                writer.writerow([row.net, row.target_x, row.target_y, row.target_layer])
+            elif has_route_layer:
+                writer.writerow([row.net, row.route_layer])
             else:
-                writer.writerow([net])
+                writer.writerow([row.net])
     return target
 
 
@@ -482,5 +525,4 @@ def run_pcbrouter_local_route(
         stdout_path=stdout_path.resolve(),
         stderr_path=stderr_path.resolve(),
     )
-
 

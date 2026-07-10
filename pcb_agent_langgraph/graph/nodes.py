@@ -215,7 +215,7 @@ def route_after_plan(state: PCBState) -> str:
 
 # ====== 功能：决定工具执行后继续规划还是结束反思。 ======
 def route_after_tools(state: PCBState) -> str:
-    # 工具成功后回到 plan；reroute 的 DRC 失败可恢复，需要继续回 planner 触发重试或 help_planner。
+    # 工具成功后回到 plan；reroute_loop 失败可恢复，继续回 planner 触发 help_planner。
     if int(state.get("loop_count", 0)) > 18:
         return "reflect"
     failed = [item for item in state.get("tool_history", []) if not item.get("ok") or _result_failed(item.get("result"))]
@@ -228,7 +228,7 @@ def route_after_tools(state: PCBState) -> str:
 def _only_recoverable_drc_failures(failed: list[dict[str, Any]], state: PCBState) -> bool:
     if state.get("workflow_id") != "pcb_reroute_flow":
         return False
-    allowed = {"drc_check", "explainability_report", "reroute_loop"}
+    allowed = {"explainability_report", "reroute_loop"}
     for item in failed:
         call = item.get("call", {}) if isinstance(item, dict) else {}
         if call.get("name") not in allowed:
@@ -543,8 +543,9 @@ def _reroute_stage_label(tool_name: str, action: str = "") -> str:
         "prepare_reroute_inputs": "重布线输入准备",
         "compress_reroute_context": "上下文压缩",
         "reroute_loop": "VSEA 重布线主流程",
-        "reroute": "主模型重布",
-        "drc_check": "DRC 检查",
+        # Legacy reroute/drc_check labels are kept commented for debugging reference only.
+        # "reroute": "主模型重布",
+        # "drc_check": "DRC 检查",
         "explainability_report": "可解释性检查",
         "help_planner": "兜底规则布线",
         "importLines": "导入重布结果",
@@ -562,12 +563,12 @@ def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
         return "reroute_input_prepare_failed"
     if tool_name == "reroute_loop":
         return "reroute_loop_failed"
-    if tool_name == "reroute":
-        return "model_reroute_failed"
+    # if tool_name == "reroute":
+    #     return "model_reroute_failed"
     if tool_name == "compress_reroute_context":
         return "context_compression_failed"
-    if tool_name == "drc_check":
-        return "drc_failed"
+    # if tool_name == "drc_check":
+    #     return "drc_failed"
     if tool_name == "explainability_report":
         return "explainability_failed"
     if tool_name == "help_planner" and ("kicad" in reason_lower or "export.txt" in reason_lower):
@@ -588,8 +589,8 @@ def _reroute_next_action(failure_type: str, tool_name: str) -> str:
         return "确认 deleteTracesForRerouting 返回了 projectData/missing_routes，且项目数据是可解析的 KiCad/板级文本。"
     if failure_type == "invalid_kicad_input":
         return "help_planner 需要 .kicad_pcb 输入；请先确认 export.txt 到 KiCad 输入的转换链路。"
-    if failure_type == "drc_failed":
-        return "默认主链路由 VSEA 内部处理 DRC/repair；旧 drc_check 失败时可手动检查 patch fill 和 DRC 明细。"
+    # if failure_type == "drc_failed":
+    #     return "默认主链路由 VSEA 内部处理 DRC/repair；旧 drc_check 失败时可手动检查 patch fill 和 DRC 明细。"
     if tool_name == "help_planner":
         return "查看 workDir、inputBoardPath、inputCsvPath 和 pcbrouter stderr。"
     return "查看 reportPayload.rerouteDiagnostics 中的路径、stderr 和 tracebackSummary。"

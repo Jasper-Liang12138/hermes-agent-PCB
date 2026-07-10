@@ -219,13 +219,16 @@ class PCBPlanner:
                 return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0}])
             if not cache.get("rerouteResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_loop", [{"name": "reroute_loop", "arguments": {}, "timeout": 900.0}])
-            if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0}])
-            if _drc_failed(cache.get("drcResult")):
-                return self._with_calls("reroute", "pcb_reroute_flow", "reroute_retry", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
-            if not cache.get("drcResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "drc", [{"name": "drc_check", "arguments": {}, "timeout": 360.0}])
-            if _drc_passed(cache.get("drcResult")) and not cache.get("explainabilityReport"):
+            if _drc_failed(cache.get("drcResult")) and not cache.get("helpPlannerResult"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "legacy DRC result failed; legacy drc_check/reroute retry disabled"}, "timeout": 900.0}])
+            # Legacy reroute/drc_check is disabled here. VSEA reroute_loop owns model, fill, hard DRC, and repair retry.
+            # if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
+            #     return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0}])
+            # if _drc_failed(cache.get("drcResult")):
+            #     return self._with_calls("reroute", "pcb_reroute_flow", "reroute_retry", [{"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0}])
+            # if not cache.get("drcResult"):
+            #     return self._with_calls("reroute", "pcb_reroute_flow", "drc", [{"name": "drc_check", "arguments": {}, "timeout": 360.0}])
+            if not cache.get("explainabilityReport"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}])
             import_file = self._extract_import_file(cache.get("rerouteResult"))
             if import_file and not cache.get("importLinesResult") and workflow_state != "report":
@@ -270,7 +273,9 @@ class PCBPlanner:
         if "drc" in lower or "解释" in text or "为什么" in text or "report" in lower:
             if cache.get("drcResult") and cache.get("explainabilityReport") and state.get("task_type") == "qa":
                 return {"intent": "qa", "workflow": "pcb_qa_flow", "action": "finish", "tool_calls": [], "response": "我会检查当前 DRC 结果并生成说明。"}
-            calls = [{"name": "drc_check", "arguments": {}, "timeout": 360.0}, {"name": "explainability_report", "arguments": {}, "timeout": 360.0}]
+            # Legacy drc_check is disabled; explainability_report summarizes existing VSEA/helper context.
+            # calls = [{"name": "drc_check", "arguments": {}, "timeout": 360.0}, {"name": "explainability_report", "arguments": {}, "timeout": 360.0}]
+            calls = [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}]
             return self._with_calls("qa", "pcb_qa_flow", "explain", calls, response="我会检查当前 DRC 结果并生成说明。")
 
         return {"intent": "qa", "workflow": "pcb_qa_flow", "action": "chat", "tool_calls": [], "response": "我可以协助 PCB 工程问答、Fanout 和局部拆线重布。请描述你要处理的对象或约束。"}
@@ -288,7 +293,10 @@ class PCBPlanner:
         for raw in data.get("tool_calls") or data.get("toolCalls") or []:
             if not isinstance(raw, dict) or not raw.get("name"):
                 continue
-            calls.append(self._tool_call(_normalize_model_tool_call(raw, entities)))
+            normalized_call = _normalize_model_tool_call(raw, entities)
+            if normalized_call.get("name") in {"reroute", "drc_check"}:
+                continue
+            calls.append(self._tool_call(normalized_call))
 
         intent = data.get("intent") or data.get("task_type") or self._infer_intent(calls, state.get("user_input", ""))
         if intent == "qa" and (state.get("workflow_id") == "pcb_escape_flow" or _has_fanout_signal(entities, text)):
@@ -347,13 +355,16 @@ class PCBPlanner:
                 return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0})], "help_planner"
             if not cache.get("rerouteResult"):
                 return [self._tool_call({"name": "reroute_loop", "arguments": {}, "timeout": 900.0})], "reroute_loop"
-            if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
-                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0})], "help_planner"
-            if _drc_failed(cache.get("drcResult")):
-                return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute_retry"
-            if not cache.get("drcResult"):
-                return [self._tool_call({"name": "drc_check", "arguments": {}, "timeout": 360.0})], "drc"
-            if _drc_passed(cache.get("drcResult")) and not cache.get("explainabilityReport"):
+            if _drc_failed(cache.get("drcResult")) and not cache.get("helpPlannerResult"):
+                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "legacy DRC result failed; legacy drc_check/reroute retry disabled"}, "timeout": 900.0})], "help_planner"
+            # Legacy reroute/drc_check is disabled here; reroute_loop or help_planner must produce the importable result.
+            # if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
+            #     return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0})], "help_planner"
+            # if _drc_failed(cache.get("drcResult")):
+            #     return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute_retry"
+            # if not cache.get("drcResult"):
+            #     return [self._tool_call({"name": "drc_check", "arguments": {}, "timeout": 360.0})], "drc"
+            if not cache.get("explainabilityReport"):
                 return [self._tool_call({"name": "explainability_report", "arguments": {}, "timeout": 360.0})], "explainability"
             import_file = self._extract_import_file(cache.get("rerouteResult"))
             if import_file and not cache.get("importLinesResult"):
@@ -413,7 +424,7 @@ class PCBPlanner:
     # ====== 功能：根据工具调用和用户文本推断任务意图。 ======
     def _infer_intent(calls: list[ToolCall], text: str) -> str:
         names = {call["name"] for call in calls}
-        if {"deleteTracesForRerouting", "reroute"} & names:
+        if {"deleteTracesForRerouting", "reroute_loop"} & names:
             return "reroute"
         if {"fanout_route", "layer_assign", "escape_order", "getProjectData"} & names:
             return "global_fanout"

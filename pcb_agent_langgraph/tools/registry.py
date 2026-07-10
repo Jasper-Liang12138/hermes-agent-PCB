@@ -20,11 +20,13 @@ def build_tool_registry(config: AppConfig, frontend_sender: FrontendToolSender |
         "fanout_route": ExternalProgramTool("fanout_route", config),
         "prepare_reroute_inputs": ExternalProgramTool("prepare_reroute_inputs", config),
         "reroute_loop": ExternalProgramTool("reroute_loop", config),
-        "reroute": ExternalProgramTool("reroute", config),
+        # Legacy reroute is intentionally not registered; VSEA reroute_loop is the default model/DRC/repair path.
+        # "reroute": ExternalProgramTool("reroute", config),
         "compress_reroute_context": ExternalProgramTool("compress_reroute_context", config),
         "help_planner": ExternalProgramTool("help_planner", config),
         "pcb_extra_bga": AnalysisTool("pcb_extra_bga", config),
-        "drc_check": AnalysisTool("drc_check", config),
+        # Legacy drc_check is intentionally not registered; VSEA hard DRC is trusted for reroute.
+        # "drc_check": AnalysisTool("drc_check", config),
         "explainability_report": AnalysisTool("explainability_report", config),
     }
     return tools
@@ -45,4 +47,3 @@ def tool_context_from_state(state: dict[str, Any], call_id: str, timeout: float)
         **dict(cache.get("fanoutEntities") or {}),
         **cache,
     }
-

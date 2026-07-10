@@ -64,7 +64,9 @@ class ExternalProgramTool:
         if self.name == "reroute_loop":
             return await self._run_reroute_loop(arguments, context)
         if self.name == "reroute":
-            return await self._run_reroute(arguments, context)
+            # Legacy reroute is disabled; keep _run_reroute below only for manual archaeology/debug restoration.
+            # return await self._run_reroute(arguments, context)
+            return {"status": "failed", "tool": self.name, "reason": "legacy reroute is disabled; use reroute_loop"}
         if self.name == "compress_reroute_context":
             return await self._compress_reroute_context(arguments, context)
         if self.name == "help_planner":
@@ -582,7 +584,9 @@ class AnalysisTool:
         if self.name == "pcb_extra_bga":
             return await self._run_bga_extract_script(arguments, context)
         if self.name == "drc_check":
-            return await self._run_drc(arguments, context)
+            # Legacy drc_check is disabled; VSEA reroute_loop owns hard DRC in the default reroute chain.
+            # return await self._run_drc(arguments, context)
+            return {"status": "failed", "tool": self.name, "reason": "legacy drc_check is disabled; use reroute_loop hard DRC"}
         if self.name == "explainability_report":
             # 启用可解释性模型时优先调用真实模型；未启用时退回 DRC 文本摘要，便于离线/单测运行。
             if self.config.explain_model.enabled:
@@ -908,6 +912,8 @@ def _prepare_local_route_csv(project_root: Path, route_params: dict[str, Any], k
     local_router = _load_module("_pcb_agent_langgraph_local_router_prepare", project_root / "tools" / "pcb_local_router.py")
     csv_path = local_router.write_local_route_csv(route_params=route_params, project_data=kicad_text, work_dir=work_dir)
     header = csv_path.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip().lower()
+    if "target_x" in header and "target_y" in header:
+        return csv_path, "target_endpoint"
     return csv_path, "fixed_route_layer" if "route_layer" in header else "net_only"
 
 

@@ -135,19 +135,21 @@ class SimulatedExternalTool:
                 "drcResult": {"status": "ok", "passed": True, "source": "vsea_reroute_pipeline"},
                 "workDir": str(self.output_dir),
             }
-        if self.name == "reroute":
-            path = self.output_dir / f"{session_id}_reroute_lines.out"
-            path.write_text("LINE DDR_DQ0 1 1 11 11\nLINE DDR_DQ1 1 2 11 12\n", encoding="utf-8")
-            return {"status": "ok", "rerouteResult": {"status": "drc_passed_import_pending"}, "importLinesFilePath": str(path), "routedLayoutTxtFilePath": str(path)}
+        # Legacy reroute simulation is disabled with the legacy tool.
+        # if self.name == "reroute":
+        #     path = self.output_dir / f"{session_id}_reroute_lines.out"
+        #     path.write_text("LINE DDR_DQ0 1 1 11 11\nLINE DDR_DQ1 1 2 11 12\n", encoding="utf-8")
+        #     return {"status": "ok", "rerouteResult": {"status": "drc_passed_import_pending"}, "importLinesFilePath": str(path), "routedLayoutTxtFilePath": str(path)}
         if self.name == "help_planner":
             path = self.output_dir / f"{session_id}_help_planner.kicad_pcb"
             path.write_text("(kicad_pcb (version 20240108))\n", encoding="utf-8")
             return {"status": "ok", "routingResult": str(path), "importLinesFilePath": str(path), "routedLayoutTxtFilePath": str(path), "report": "Simulated help planner completed."}
-        if self.name == "drc_check":
-            fail_count = int(self.sample.get("simulate_drc_failures", 0) or 0)
-            if self.call_count <= fail_count:
-                return {"status": "failed", "passed": False, "errors": [f"simulated_drc_failure_{self.call_count}"], "score": 0.0, "source": "simulated_drc"}
-            return {"status": "ok", "passed": True, "errors": [], "score": 1.0, "source": "simulated_drc"}
+        # Legacy drc_check simulation is disabled with the legacy tool.
+        # if self.name == "drc_check":
+        #     fail_count = int(self.sample.get("simulate_drc_failures", 0) or 0)
+        #     if self.call_count <= fail_count:
+        #         return {"status": "failed", "passed": False, "errors": [f"simulated_drc_failure_{self.call_count}"], "score": 0.0, "source": "simulated_drc"}
+        #     return {"status": "ok", "passed": True, "errors": [], "score": 1.0, "source": "simulated_drc"}
         if self.name == "explainability_report":
             return {"status": "ok", "report": "Simulated DRC report: passed."}
         return {"status": "failed", "reason": f"simulated external tool does not implement {self.name}"}
