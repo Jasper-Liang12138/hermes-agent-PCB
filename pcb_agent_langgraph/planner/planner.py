@@ -405,7 +405,7 @@ class PCBPlanner:
     def _extract_import_file(result: Any) -> str:
         if not isinstance(result, dict):
             return ""
-        for key in ("importLinesFilePath", "routedLayoutTxtFilePath", "routingResult"):
+        for key in ("importLinesFilePath", "incrementalImportFilePath"):
             value = str(result.get(key) or "").strip()
             if value:
                 return value

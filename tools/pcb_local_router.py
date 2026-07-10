@@ -17,6 +17,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+PCB_BUILDER_DBU_MM = 0.000254
+PCB_BUILDER_ORIGIN_X = 363386.0
+PCB_BUILDER_ORIGIN_Y = 534646.0
+
 
 @dataclass
 # ====== 功能：描述 pcbrouter 局部布线运行后的输出文件和报告。 ======
@@ -256,6 +260,17 @@ def _kicad_board_bbox_mm(project_data: str) -> tuple[float, float, float, float]
             continue
         for match in re.finditer(r"\(\s*(?:start|end)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block):
             points.append((float(match.group(1)), float(match.group(2))))
+    for block in _sexpr_blocks(text, "segment"):
+        for match in re.finditer(r"\(\s*(?:start|end)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block):
+            points.append((float(match.group(1)), float(match.group(2))))
+    for block in _sexpr_blocks(text, "via"):
+        for match in re.finditer(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\b", block):
+            points.append((float(match.group(1)), float(match.group(2))))
+    for head in ("module", "footprint"):
+        for block in _sexpr_blocks(text, head):
+            match = re.search(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\b", block)
+            if match:
+                points.append((float(match.group(1)), float(match.group(2))))
     if not points:
         return None
     xs = [point[0] for point in points]
@@ -300,25 +315,35 @@ def _convert_target_point_to_mm(x: float, y: float, unit: str, bbox: tuple[float
         return x, y, "mm"
     if normalized in {"mil", "mils"}:
         return x * 0.0254, y * 0.0254, "mil"
+    if normalized in {"pcb_builder", "pcb-builder", "pcb_builder_mil", "line_out", "lineout"}:
+        return _pcb_builder_local_mil_to_kicad_mm(x, y)
     if normalized in {"dbu", "0.01mil", "pcb_dbu"}:
         return x * 0.000254, y * 0.000254, "dbu"
     if bbox is None:
         return (x * 0.0254, y * 0.0254, "mil-auto") if max(abs(x), abs(y)) > 100 else (x, y, "mm-auto")
 
-    raw_inside = _point_inside_bbox(x, y, bbox)
-    mil_x, mil_y = x * 0.0254, y * 0.0254
-    dbu_x, dbu_y = x * 0.000254, y * 0.000254
-    mil_inside = _point_inside_bbox(mil_x, mil_y, bbox)
-    dbu_inside = _point_inside_bbox(dbu_x, dbu_y, bbox)
+    candidates = [
+        (x, y, "mm-auto"),
+        (*_pcb_builder_local_mil_to_kicad_mm(x, y)[:2], "pcb-builder-mil-auto"),
+        (x * 0.0254, y * 0.0254, "mil-auto"),
+        (x * 0.000254, y * 0.000254, "dbu-auto"),
+    ]
     max_board_coord = max(abs(bbox[0]), abs(bbox[1]), abs(bbox[2]), abs(bbox[3]), 1.0)
 
-    if raw_inside and max(abs(x), abs(y)) <= max_board_coord + 5:
-        return x, y, "mm-auto"
-    if mil_inside:
-        return mil_x, mil_y, "mil-auto"
-    if dbu_inside:
-        return dbu_x, dbu_y, "dbu-auto"
+    for candidate_x, candidate_y, candidate_unit in candidates:
+        if candidate_unit == "mm-auto" and max(abs(x), abs(y)) > max_board_coord + 5:
+            continue
+        if _point_inside_bbox(candidate_x, candidate_y, bbox):
+            return candidate_x, candidate_y, candidate_unit
     return x, y, "unknown"
+
+
+def _pcb_builder_local_mil_to_kicad_mm(x: float, y: float) -> tuple[float, float, str]:
+    return (
+        (x * 100.0 + PCB_BUILDER_ORIGIN_X) * PCB_BUILDER_DBU_MM,
+        (y * 100.0 + PCB_BUILDER_ORIGIN_Y) * PCB_BUILDER_DBU_MM,
+        "pcb-builder-mil",
+    )
 
 
 def _local_route_row_from_item(item: dict[str, Any], aliases: dict[str, str], board_bbox: tuple[float, float, float, float] | None) -> LocalRouteCsvRow | None:
@@ -414,12 +439,12 @@ def write_local_route_csv(
     with target.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if has_target:
-            writer.writerow(["net", "target_x_mm", "target_y_mm", "target_layer"])
+            writer.writerow(["net", "route_layer", "target_x_mm", "target_y_mm", "target_layer"])
         else:
             writer.writerow(["net", "route_layer"] if has_route_layer else ["net"])
         for row in rows:
             if has_target:
-                writer.writerow([row.net, row.target_x, row.target_y, row.target_layer])
+                writer.writerow([row.net, row.route_layer or row.target_layer, row.target_x, row.target_y, row.target_layer])
             elif has_route_layer:
                 writer.writerow([row.net, row.route_layer])
             else:

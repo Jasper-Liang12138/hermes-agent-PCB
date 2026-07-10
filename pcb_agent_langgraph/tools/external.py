@@ -607,6 +607,25 @@ class ExternalProgramTool:
                     selected_nets=list(reroute_input.get("selectedNets") or route_params.get("selectedNets") or []),
                     work_dir=work_dir,
                 )
+            if not import_path:
+                return {
+                    "status": "failed",
+                    "tool": self.name,
+                    "reason": "helper-router 已生成完整板文件，但没有生成前端可导入的增量 line.out",
+                    "failureStage": "incremental_import",
+                    "failureType": "incremental_import_failed",
+                    "routingResult": routing_path,
+                    "routedKicadFilePath": routing_path,
+                    "importLinesFilePath": "",
+                    "incrementalImportFilePath": "",
+                    "incrementalImportNotes": import_notes or ["helper_router_incremental_import_not_generated"],
+                    "inputBoardPath": str(payload.get("input_board_path") or ""),
+                    "inputCsvPath": str(payload.get("input_csv_path") or ""),
+                    "outputCsvPath": output_csv_path,
+                    "report": payload.get("report") or "pcbrouter local route completed without importable delta",
+                    "detail": payload,
+                    "workDir": str(work_dir),
+                }
             return {
                 "status": "ok",
                 "tool": self.name,
@@ -1213,7 +1232,10 @@ def _kicad_net_id_to_name(board_text: str) -> dict[str, str]:
         re.compile(r"\(\s*net\s+(\d+)\s+([^\s\)]+)\s*\)", re.IGNORECASE),
     ):
         for match in pattern.finditer(board_text or ""):
-            mapping[match.group(1).strip()] = match.group(2).strip()
+            net_id = match.group(1).strip()
+            if net_id in mapping:
+                continue
+            mapping[net_id] = match.group(2).strip().strip('"')
     return mapping
 
 

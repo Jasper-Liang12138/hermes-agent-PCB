@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
@@ -25,7 +26,7 @@ class AgentHardDRCAdapter:
         timeout_seconds: float = 180.0,
     ):
         self.drc_agent_package = Path(drc_agent_package).resolve()
-        self.python_executable = python_executable or os.getenv("PYTHON", "python")
+        self.python_executable = python_executable or os.getenv("PYTHON") or sys.executable
         self.timeout_seconds = timeout_seconds
 
     def run(
@@ -90,4 +91,3 @@ class AgentHardDRCAdapter:
             report=payload,
             report_path=str(report),
         )
-

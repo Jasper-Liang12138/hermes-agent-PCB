@@ -335,8 +335,8 @@ def test_prepare_reroute_inputs_writes_target_endpoint_csv(tmp_path):
     assert result["status"] == "ok"
     assert result["csvMode"] == "target_endpoint"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
-        "net,target_x_mm,target_y_mm,target_layer",
-        "NET_U1_B7,47.3,68.3,F.Cu",
+        "net,route_layer,target_x_mm,target_y_mm,target_layer",
+        "NET_U1_B7,F.Cu,47.3,68.3,F.Cu",
     ]
 
 
@@ -368,8 +368,76 @@ def test_prepare_reroute_inputs_converts_mil_endpoint_to_mm(tmp_path):
     result = asyncio.run(tool.ainvoke({}, context))
     assert result["status"] == "ok"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
-        "net,target_x_mm,target_y_mm,target_layer",
-        "DDR_D3,14.978888,1.773174,F.Cu",
+        "net,route_layer,target_x_mm,target_y_mm,target_layer",
+        "DDR_D3,F.Cu,14.978888,1.773174,F.Cu",
+    ]
+
+
+# ====== 功能：验证 PCB Builder/line.out 坐标会按 converter 原点反算成 KiCad mm。
+def test_prepare_reroute_inputs_converts_pcb_builder_endpoint_to_mm(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text(
+        """
+        (kicad_pcb
+          (version 20240108)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_line (start 92.300044 135.000084) (end 117.700044 135.000084) (layer Edge.Cuts))
+          (gr_line (start 117.700044 135.000084) (end 117.700044 160.400084) (layer Edge.Cuts))
+          (segment (start 202.36942 186.208416) (end 203 186.208416) (width 0.1524) (layer F.Cu) (net 1))
+          (net 1 R_NAND_RDY0)
+        )
+        """,
+        encoding="utf-8",
+    )
+    context = {
+        "session_id": "s_pcb_builder_coord",
+        "deleteTracesResult": {
+            "projectData": str(board_path),
+            "missing_routes": [{"net_name": "R_NAND_RDY0", "end": {"layer": "Top", "x": 4333.44, "y": 1984.58}}],
+        },
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
+        "net,route_layer,target_x_mm,target_y_mm,target_layer",
+        "R_NAND_RDY0,F.Cu,202.36942,186.208416,F.Cu",
+    ]
+
+
+# ====== 功能：验证大板框下 mil 和 PCB Builder 坐标都合法时，缺省拆线终点优先按 line.out/PCB Builder 解析。
+def test_prepare_reroute_inputs_prefers_pcb_builder_endpoint_when_auto_is_ambiguous(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text(
+        """
+        (kicad_pcb
+          (version 20240108)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_line (start 0 0) (end 250 0) (layer Edge.Cuts))
+          (gr_line (start 250 0) (end 250 250) (layer Edge.Cuts))
+          (gr_line (start 250 250) (end 0 250) (layer Edge.Cuts))
+          (gr_line (start 0 250) (end 0 0) (layer Edge.Cuts))
+        )
+        """,
+        encoding="utf-8",
+    )
+    context = {
+        "session_id": "s_pcb_builder_ambiguous",
+        "deleteTracesResult": {
+            "projectData": str(board_path),
+            "missing_routes": [{"net_name": "R_NAND_RDY0", "end": {"layer": "Top", "x": 4333.44, "y": 1984.58}}],
+        },
+    }
+
+    result = asyncio.run(tool.ainvoke({}, context))
+
+    assert result["status"] == "ok"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
+        "net,route_layer,target_x_mm,target_y_mm,target_layer",
+        "R_NAND_RDY0,F.Cu,202.36942,186.208416,F.Cu",
     ]
 
 
@@ -570,6 +638,14 @@ def test_fanout_route_result_calls_import_lines_directly():
     assert plan["tool_calls"][0]["name"] == "importLines"
     assert plan["tool_calls"][0]["arguments"]["filePath"] == "line.out"
 
+
+# ====== 功能：验证 planner 不会把完整布线结果文件误当成前端增量导入文件。
+def test_planner_extract_import_file_requires_incremental_import_path():
+    assert PCBPlanner._extract_import_file({"status": "ok", "routingResult": "full_board.kicad_pcb"}) == ""
+    assert PCBPlanner._extract_import_file({"status": "ok", "routedLayoutTxtFilePath": "full_board.txt"}) == ""
+    assert PCBPlanner._extract_import_file({"status": "ok", "incrementalImportFilePath": "line.out"}) == "line.out"
+    assert PCBPlanner._extract_import_file({"status": "ok", "importLinesFilePath": "line.out"}) == "line.out"
+
 # ====== 功能：验证 reroute 上下文压缩后不再等待确认。 ======
 def test_reroute_context_calls_reroute_without_confirm():
     cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok", "selectedNets": ["GND"]}, "rerouteContext": {"status": "ok", "selectedNets": ["GND"]}}
@@ -679,6 +755,86 @@ def test_helper_router_routed_board_diff_generates_incremental_line_out(tmp_path
     assert "DDR_DQ0" in text
     assert "DDR_DQ1" not in text
     assert any("generated_helper_router_incremental_line_out" in note for note in notes)
+
+
+# ====== 功能：验证 KiCad quoted net 名不会导致增量 diff 过滤失败。
+def test_helper_router_incremental_diff_matches_quoted_net_names(tmp_path):
+    from pcb_agent_langgraph.tools.external import _write_helper_router_incremental_import_file
+
+    original = """
+    (kicad_pcb
+      (net 1 "DDR_D3")
+      (segment (start 14.0 4.0) (end 14.978888 4.0) (width 0.15) (layer F.Cu) (net 1))
+    )
+    """
+    routed_path = tmp_path / "routed.kicad_pcb"
+    routed_path.write_text(
+        """
+        (kicad_pcb
+          (net 1 "DDR_D3")
+          (segment (start 14.0 4.0) (end 14.978888 4.0) (width 0.15) (layer F.Cu) (net 1))
+          (segment (start 14.978888 4.0) (end 14.978888 1.773174) (width 0.15) (layer F.Cu) (net 1))
+        )
+        """,
+        encoding="utf-8",
+    )
+
+    import_path, notes = _write_helper_router_incremental_import_file(
+        original_board_text=original,
+        routed_board_path=routed_path,
+        selected_nets=["DDR_D3"],
+        work_dir=tmp_path,
+    )
+
+    assert import_path
+    text = Path(import_path).read_text(encoding="utf-8")
+    assert text.count("!LINE!") == 1
+    assert "DDR_D3" in text
+    assert any("generated_helper_router_incremental_line_out" in note for note in notes)
+
+
+# ====== 功能：验证 helper-router 没有生成增量 line.out 时不能伪装成功。
+def test_help_planner_fails_when_incremental_import_missing(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    routed_path = tmp_path / "routed.kicad_pcb"
+    routed_path.write_text("(kicad_pcb (version 20240108))", encoding="utf-8")
+
+    class FakeLocalRouter:
+        @staticmethod
+        def run_pcbrouter_local_route(**_kwargs):
+            return {
+                "routing_result_path": str(routed_path),
+                "output_csv_path": str(tmp_path / "out.csv"),
+                "input_board_path": str(tmp_path / "input.kicad_pcb"),
+                "input_csv_path": str(tmp_path / "local_route_input.csv"),
+                "report": "completed without useful changes",
+            }
+
+    monkeypatch.setattr(external, "_load_module", lambda *_args, **_kwargs: FakeLocalRouter)
+    monkeypatch.setattr(external, "_write_helper_router_incremental_import_file", lambda **_kwargs: ("", ["helper_router_incremental_import_no_changed_segments"]))
+
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("help_planner", config)
+    result = asyncio.run(
+        tool.ainvoke(
+            {},
+            {
+                "session_id": "s_help_no_import",
+                "rerouteInput": {
+                    "kicadBoardText": "(kicad_pcb (version 20240108) (net 1 DDR_DQ0))",
+                    "kicadBoardPath": str(tmp_path / "input.kicad_pcb"),
+                    "selectedNets": ["DDR_DQ0"],
+                    "missingRoutes": [{"net_name": "DDR_DQ0"}],
+                },
+            },
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["failureType"] == "incremental_import_failed"
+    assert "line.out" in result["reason"]
+    assert result["routedKicadFilePath"] == str(routed_path)
 
 
 # ====== 功能：验证 VSEA reroute_loop 成功后生成可导入增量 line.out 并信任 hard DRC。 ======
@@ -978,7 +1134,7 @@ def test_reroute_failure_text_includes_vsea_and_helper_diagnostics():
             "reason": "pcbrouter 局部布线完善执行失败 (exit 1)",
             "failureType": "pcbrouter_execution_failed",
             "inputCsvPath": "/tmp/local_route_input.csv",
-            "inputCsvPreview": "net,target_x_mm,target_y_mm,target_layer\nDDR_D3,14.978888,1.773174,F.Cu",
+            "inputCsvPreview": "net,route_layer,target_x_mm,target_y_mm,target_layer\nDDR_D3,F.Cu,14.978888,1.773174,F.Cu",
         },
     }
     diagnostics = _reroute_diagnostics(cache, record)

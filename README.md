@@ -75,6 +75,16 @@ model: {model}
 
 可复制 `config.example.ini` 为 `config.ini` 后填入真实模型配置。本项目默认只读取 `PCB_AGENT_LangGraph\config.ini`；也可以通过 `--config` 显式指定配置文件。不会自动回退到其他目录。
 
+VSEA reroute 的 hard DRC 依赖外部 `DRC_0623_v2\agent_package`，仓库默认不包含该目录。需要启用 VSEA hard DRC 时，请在 `config.ini` 的 `[reroute_loop]` 中填写本机真实路径：
+
+```ini
+drc_agent_package = D:\path\to\DRC_0623_v2\agent_package
+# agent_drc_python 留空时使用运行环境默认 Python
+agent_drc_python =
+```
+
+`agent_drc_python` 留空时使用运行环境默认 Python；Windows 可按实际环境填 `python`，macOS/Linux 通常填 `python3` 或虚拟环境解释器路径。
+
 ## Live Evaluation
 
 真实/普通评测：
@@ -232,7 +242,5 @@ python_executable = .\runtime\explain_python\Scripts\python.exe
 | `-SkipExplainRuntime` | 不复制或创建 explain runtime。 | 完全不启用可解释性模型，或交付后另行配置 runtime 时使用。 |
 
 注意：`-Python` 是主程序打包环境，`-ExplainRuntimePython` 是创建可解释性模型 runtime 的环境，二者可以相同，也可以不同。
-
-
 
 

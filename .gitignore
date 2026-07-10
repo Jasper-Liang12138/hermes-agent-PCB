@@ -28,6 +28,7 @@ bga_extract_work/
 drc_work/
 
 # Local configuration and secrets
+config.ini
 config.live.ini
 *.local.ini
 .env

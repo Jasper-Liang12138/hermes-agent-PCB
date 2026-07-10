@@ -403,7 +403,7 @@ class VSEARerouteRouter:
         return final_result
 
     def _thread_evaluator(self) -> DRCEvaluator:
-        if not self._drc_path or _env_int("REROUTE_THREAD_LOCAL_DRC", 1) <= 0:
+        if not self._drc_path or _env_int("REROUTE_THREAD_LOCAL_DRC", 0) <= 0:
             return self.evaluator
         evaluator = getattr(self._thread_local, "evaluator", None)
         if evaluator is None:
