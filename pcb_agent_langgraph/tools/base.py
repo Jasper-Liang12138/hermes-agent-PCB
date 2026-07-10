@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from pcb_agent_langgraph.debug_logging import log_debug_event
 from pcb_agent_langgraph.graph.state import ToolCall, ToolRecord
 
 
@@ -31,9 +32,15 @@ class FunctionTool:
 # ====== 功能：统一调用工具并记录耗时、结果和异常。 ======
 async def invoke_tool(tool: Tool, call: ToolCall, context: dict[str, Any]) -> ToolRecord:
     start = time.perf_counter()
+    log_debug_event("tool.start", {"tool": getattr(tool, "name", call.get("name", "")), "call": call, "context": context})
     try:
         result = await tool.ainvoke(call.get("arguments", {}), context)
-        return {"call": call, "result": result, "ok": True, "elapsed_ms": (time.perf_counter() - start) * 1000}
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        record: ToolRecord = {"call": call, "result": result, "ok": True, "elapsed_ms": elapsed_ms}
+        log_debug_event("tool.end", {"tool": getattr(tool, "name", call.get("name", "")), "call": call, "result": result, "ok": True, "elapsed_ms": elapsed_ms})
+        return record
     except Exception as exc:
-        return {"call": call, "result": None, "ok": False, "elapsed_ms": (time.perf_counter() - start) * 1000, "error": str(exc)}
-
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        record = {"call": call, "result": None, "ok": False, "elapsed_ms": elapsed_ms, "error": str(exc)}
+        log_debug_event("tool.error", {"tool": getattr(tool, "name", call.get("name", "")), "call": call, "ok": False, "elapsed_ms": elapsed_ms, "error": str(exc)})
+        return record

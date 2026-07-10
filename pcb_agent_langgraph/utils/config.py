@@ -2,6 +2,7 @@
 
 from configparser import ConfigParser
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -79,6 +80,9 @@ class RerouteLoopConfig:
     enabled: bool = True
     provider: str = "vsea"
     pipeline_root: str = ".\\vendor\\VSEA-PCB"
+    ai_pcb_eval_path: str = ".\\vendor\\AI-PCB-Eval"
+    drc_agent_package: str = ""
+    agent_drc_python: str = ""
     max_rounds: int = 2
     samples: int = 2
     repair_samples: int = 2
@@ -94,6 +98,15 @@ class ServerConfig:
 
 
 @dataclass(slots=True)
+# ====== 功能：保存 Agent 全链路调试日志配置。 ======
+class DebugLogConfig:
+    enabled: bool = True
+    print: bool = True
+    dir: str = ".\\agent_logs"
+    redact_secrets: bool = True
+
+
+@dataclass(slots=True)
 # ====== 功能：聚合当前项目运行所需的全部配置。 ======
 class AppConfig:
     root: Path
@@ -106,6 +119,7 @@ class AppConfig:
     reroute_help: RerouteHelpConfig = field(default_factory=RerouteHelpConfig)
     reroute_loop: RerouteLoopConfig = field(default_factory=RerouteLoopConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    debug_log: DebugLogConfig = field(default_factory=DebugLogConfig)
     board_data_use_file_path: bool = True
 
 
@@ -184,6 +198,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         reroute_loop.enabled = parser.getboolean("reroute_loop", "enabled", fallback=reroute_loop.enabled)
         reroute_loop.provider = parser.get("reroute_loop", "provider", fallback=reroute_loop.provider)
         reroute_loop.pipeline_root = parser.get("reroute_loop", "pipeline_root", fallback=reroute_loop.pipeline_root)
+        reroute_loop.ai_pcb_eval_path = parser.get("reroute_loop", "ai_pcb_eval_path", fallback=reroute_loop.ai_pcb_eval_path)
+        reroute_loop.drc_agent_package = parser.get("reroute_loop", "drc_agent_package", fallback=reroute_loop.drc_agent_package)
+        reroute_loop.agent_drc_python = parser.get("reroute_loop", "agent_drc_python", fallback=reroute_loop.agent_drc_python)
         reroute_loop.max_rounds = parser.getint("reroute_loop", "max_rounds", fallback=reroute_loop.max_rounds)
         reroute_loop.samples = parser.getint("reroute_loop", "samples", fallback=reroute_loop.samples)
         reroute_loop.repair_samples = parser.getint("reroute_loop", "repair_samples", fallback=reroute_loop.repair_samples)
@@ -194,6 +211,19 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if parser.has_section("server"):
         server.host = parser.get("server", "host", fallback=server.host)
         server.port = parser.getint("server", "port", fallback=server.port)
+
+    debug_log = DebugLogConfig()
+    if parser.has_section("debug_log"):
+        debug_log.enabled = parser.getboolean("debug_log", "enabled", fallback=debug_log.enabled)
+        debug_log.print = parser.getboolean("debug_log", "print", fallback=debug_log.print)
+        debug_log.dir = parser.get("debug_log", "dir", fallback=debug_log.dir)
+        debug_log.redact_secrets = parser.getboolean("debug_log", "redact_secrets", fallback=debug_log.redact_secrets)
+    env_enabled = os.environ.get("PCB_AGENT_DEBUG_LOG")
+    if env_enabled is not None:
+        debug_log.enabled = env_enabled.strip().lower() not in {"0", "false", "no", "off", ""}
+    env_dir = os.environ.get("PCB_AGENT_DEBUG_LOG_DIR")
+    if env_dir:
+        debug_log.dir = env_dir
 
     board_data_use_file_path = parser.getboolean("model", "board_data_use_file_path", fallback=True) if parser.has_section("model") else True
     return AppConfig(
@@ -207,6 +237,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         reroute_help=reroute_help,
         reroute_loop=reroute_loop,
         server=server,
+        debug_log=debug_log,
         board_data_use_file_path=board_data_use_file_path,
     )
 
@@ -268,6 +299,9 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
             "enabled": config.reroute_loop.enabled,
             "provider": config.reroute_loop.provider,
             "pipeline_root": config.reroute_loop.pipeline_root,
+            "ai_pcb_eval_path": config.reroute_loop.ai_pcb_eval_path,
+            "drc_agent_package": config.reroute_loop.drc_agent_package,
+            "agent_drc_python": config.reroute_loop.agent_drc_python,
             "max_rounds": config.reroute_loop.max_rounds,
             "samples": config.reroute_loop.samples,
             "repair_samples": config.reroute_loop.repair_samples,
@@ -275,7 +309,11 @@ def as_dict(config: AppConfig) -> dict[str, Any]:
             "timeout_seconds": config.reroute_loop.timeout_seconds,
         },
         "server": {"host": config.server.host, "port": config.server.port},
+        "debug_log": {
+            "enabled": config.debug_log.enabled,
+            "print": config.debug_log.print,
+            "dir": config.debug_log.dir,
+            "redact_secrets": config.debug_log.redact_secrets,
+        },
         "board_data_use_file_path": config.board_data_use_file_path,
     }
-
-

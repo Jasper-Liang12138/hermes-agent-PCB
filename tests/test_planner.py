@@ -8,6 +8,15 @@ from pcb_agent_langgraph.utils.config import load_config
 from pcb_agent_langgraph.websocket.protocol import agent_message
 
 
+def _configure_fake_vsea_dependencies(config, tmp_path):
+    ai_eval = tmp_path / "AI-PCB-Eval"
+    drc_pkg = tmp_path / "agent_package"
+    ai_eval.mkdir(exist_ok=True)
+    drc_pkg.mkdir(exist_ok=True)
+    config.reroute_loop.ai_pcb_eval_path = str(ai_eval)
+    config.reroute_loop.drc_agent_package = str(drc_pkg)
+
+
 # ====== 功能：验证 rule planner fanout 场景。 ======
 def test_rule_planner_fanout():
     plan = PCBPlanner(use_model=False).plan({"user_input": "帮我重新逃逸", "workflow_state": "idle", "intermediate_cache": {}})
@@ -326,9 +335,73 @@ def test_prepare_reroute_inputs_writes_target_endpoint_csv(tmp_path):
     assert result["status"] == "ok"
     assert result["csvMode"] == "target_endpoint"
     assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
-        "net,target_x,target_y,target_layer",
+        "net,target_x_mm,target_y_mm,target_layer",
         "NET_U1_B7,47.3,68.3,F.Cu",
     ]
+
+
+# ====== 功能：验证前端 mil 坐标会按 KiCad 板框自动转换为 mm。
+def test_prepare_reroute_inputs_converts_mil_endpoint_to_mm(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text(
+        """
+        (kicad_pcb
+          (version 20240108)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_line (start 0 0) (end 27.1361 0) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 27.1361 0) (end 27.1361 26.2385) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 27.1361 26.2385) (end 0 26.2385) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 0 26.2385) (end 0 0) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+        )
+        """,
+        encoding="utf-8",
+    )
+    context = {
+        "session_id": "s_mil",
+        "deleteTracesResult": {
+            "projectData": str(board_path),
+            "missing_routes": [{"net_name": "DDR_D3", "end": {"layer": "Top", "x": 589.72, "y": 69.81}}],
+        },
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "ok"
+    assert Path(result["localRouteCsvPath"]).read_text(encoding="utf-8").splitlines() == [
+        "net,target_x_mm,target_y_mm,target_layer",
+        "DDR_D3,14.978888,1.773174,F.Cu",
+    ]
+
+
+# ====== 功能：验证终点坐标无法映射到 KiCad mm 时给出明确输入准备失败。
+def test_prepare_reroute_inputs_rejects_unconvertible_endpoint(tmp_path):
+    config = load_config("missing-config.ini")
+    tool = ExternalProgramTool("prepare_reroute_inputs", config)
+    board_path = tmp_path / "board.kicad_pcb"
+    board_path.write_text(
+        """
+        (kicad_pcb
+          (version 20240108)
+          (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (gr_line (start 0 0) (end 27.1361 0) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 27.1361 0) (end 27.1361 26.2385) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 27.1361 26.2385) (end 0 26.2385) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+          (gr_line (start 0 26.2385) (end 0 0) (stroke (width 0.1) (type default)) (layer Edge.Cuts))
+        )
+        """,
+        encoding="utf-8",
+    )
+    context = {
+        "session_id": "s_bad_coord",
+        "deleteTracesResult": {
+            "projectData": str(board_path),
+            "missing_routes": [{"net_name": "DDR_D3", "end": {"layer": "Top", "x": 99999, "y": 99999, "unit": "mm"}}],
+        },
+    }
+    result = asyncio.run(tool.ainvoke({}, context))
+    assert result["status"] == "failed"
+    assert result["failureType"] == "local_route_csv_prepare_failed"
+    assert "终点坐标无法转换" in result["reason"]
 
 
 # ====== 功能：验证 reroute 输入准备接受 KiCad S-expression 常见根节点空格。
@@ -660,6 +733,7 @@ def test_reroute_loop_vsea_success_generates_incremental_import(monkeypatch, tmp
     pipeline_root.mkdir()
     config = load_config("missing-config.ini")
     config.reroute_loop.pipeline_root = str(pipeline_root)
+    _configure_fake_vsea_dependencies(config, tmp_path)
     monkeypatch.setattr(external, "_import_vsea_module", fake_import)
     tool = ExternalProgramTool("reroute_loop", config)
     context = {
@@ -682,6 +756,7 @@ def test_reroute_loop_vsea_success_generates_incremental_import(monkeypatch, tmp
 
     assert result["status"] == "ok"
     assert result["source"] == "vsea_reroute_pipeline"
+    assert result["modelCalled"] is True
     assert result["drcResult"]["passed"] is True
     import_path = Path(result["importLinesFilePath"])
     assert import_path.suffix == ".out"
@@ -716,6 +791,7 @@ def test_reroute_loop_vsea_failure_has_no_import_path(monkeypatch, tmp_path):
     pipeline_root.mkdir()
     config = load_config("missing-config.ini")
     config.reroute_loop.pipeline_root = str(pipeline_root)
+    _configure_fake_vsea_dependencies(config, tmp_path)
     monkeypatch.setattr(external, "_import_vsea_module", lambda _root, name: FakeSchemas if name.endswith(".schemas") else FakeAgentModule)
     result = asyncio.run(
         ExternalProgramTool("reroute_loop", config).ainvoke(
@@ -730,6 +806,7 @@ def test_reroute_loop_vsea_failure_has_no_import_path(monkeypatch, tmp_path):
 
     assert result["status"] == "failed"
     assert result["failureType"] == "drc_failed"
+    assert result["modelCalled"] is True
     assert "importLinesFilePath" not in result
 
 
@@ -773,6 +850,7 @@ def test_reroute_loop_vsea_completed_text_generates_import(monkeypatch, tmp_path
     pipeline_root.mkdir()
     config = load_config("missing-config.ini")
     config.reroute_loop.pipeline_root = str(pipeline_root)
+    _configure_fake_vsea_dependencies(config, tmp_path)
     monkeypatch.setattr(external, "_import_vsea_module", lambda _root, name: FakeSchemas if name.endswith(".schemas") else FakeAgentModule)
     result = asyncio.run(
         ExternalProgramTool("reroute_loop", config).ainvoke(
@@ -793,6 +871,7 @@ def test_reroute_loop_vsea_completed_text_generates_import(monkeypatch, tmp_path
         )
     )
     assert result["status"] == "ok"
+    assert result["modelCalled"] is True
     assert Path(result["routedKicadFilePath"]).name == "completed_from_vsea.kicad_pcb"
     assert Path(result["importLinesFilePath"]).suffix == ".out"
 
@@ -813,6 +892,102 @@ def test_reroute_loop_missing_pipeline_root_fails(tmp_path):
     )
     assert result["status"] == "failed"
     assert result["failureType"] == "pipeline_unavailable"
+
+
+# ====== 功能：验证 VSEA 依赖缺失时在模型调用前失败，并标记 modelCalled=False。
+def test_reroute_loop_missing_ai_pcb_eval_preflight_fails_before_model(tmp_path):
+    config = load_config("missing-config.ini")
+    pipeline_root = tmp_path / "VSEA-PCB"
+    drc_pkg = tmp_path / "agent_package"
+    pipeline_root.mkdir()
+    drc_pkg.mkdir()
+    config.reroute_loop.pipeline_root = str(pipeline_root)
+    config.reroute_loop.ai_pcb_eval_path = str(tmp_path / "missing-ai-pcb-eval")
+    config.reroute_loop.drc_agent_package = str(drc_pkg)
+    result = asyncio.run(
+        ExternalProgramTool("reroute_loop", config).ainvoke(
+            {},
+            {
+                "session_id": "s_preflight",
+                "rerouteInput": {"kicadBoardText": "( kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteContext": {"contextText": "DDR_DQ0"},
+            },
+        )
+    )
+    assert result["status"] == "failed"
+    assert result["failureStage"] == "dependency_preflight_failed"
+    assert result["failureType"] == "dependency_preflight_failed"
+    assert result["modelCalled"] is False
+    assert "未进入模型调用" in result["reason"]
+
+
+# ====== 功能：验证 VSEA pipeline 导入失败时不会误报为已经调用模型。
+def test_reroute_loop_pipeline_import_failure_is_before_model(monkeypatch, tmp_path):
+    from pcb_agent_langgraph.tools import external
+
+    config = load_config("missing-config.ini")
+    pipeline_root = tmp_path / "VSEA-PCB"
+    pipeline_root.mkdir()
+    config.reroute_loop.pipeline_root = str(pipeline_root)
+    _configure_fake_vsea_dependencies(config, tmp_path)
+
+    def fail_import(_pipeline_root, _module_name):
+        raise ImportError("missing dependency")
+
+    monkeypatch.setattr(external, "_import_vsea_module", fail_import)
+    result = asyncio.run(
+        ExternalProgramTool("reroute_loop", config).ainvoke(
+            {},
+            {
+                "session_id": "s_import_fail",
+                "rerouteInput": {"kicadBoardText": "( kicad_pcb (version 20240108) (net 1 DDR_DQ0))", "selectedNets": ["DDR_DQ0"]},
+                "rerouteContext": {"contextText": "DDR_DQ0"},
+            },
+        )
+    )
+    assert result["status"] == "failed"
+    assert result["failureStage"] == "pipeline_import_failed"
+    assert result["failureType"] == "pipeline_import_failed"
+    assert result["modelCalled"] is False
+    assert "未进入模型调用" in result["reason"]
+
+
+# ====== 功能：验证 helper 失败报告不会吞掉 VSEA 主流程失败原因。
+def test_reroute_failure_text_includes_vsea_and_helper_diagnostics():
+    from pcb_agent_langgraph.graph.nodes import _reroute_diagnostics, _reroute_failure_text
+
+    cache = {
+        "rerouteLoopResult": {
+            "status": "failed",
+            "failureStage": "dependency_preflight_failed",
+            "failureType": "dependency_preflight_failed",
+            "reason": "VSEA 依赖检查失败，未进入模型调用：AI-PCB-Eval path not found",
+            "modelCalled": False,
+            "workDir": "/tmp/vsea",
+            "pipelineRoot": "/tmp/VSEA-PCB",
+            "aiPcbEvalPath": "/tmp/AI-PCB-Eval",
+            "drcAgentPackage": "/tmp/agent_package",
+        },
+        "selectedNets": ["DDR_D3"],
+    }
+    record = {
+        "call": {"name": "help_planner"},
+        "result": {
+            "status": "failed",
+            "tool": "help_planner",
+            "reason": "pcbrouter 局部布线完善执行失败 (exit 1)",
+            "failureType": "pcbrouter_execution_failed",
+            "inputCsvPath": "/tmp/local_route_input.csv",
+            "inputCsvPreview": "net,target_x_mm,target_y_mm,target_layer\nDDR_D3,14.978888,1.773174,F.Cu",
+        },
+    }
+    diagnostics = _reroute_diagnostics(cache, record)
+    text = _reroute_failure_text(diagnostics)
+    assert diagnostics["failureType"] == "pcbrouter_execution_failed"
+    assert "输入 CSV 预览" in text
+    assert "target_x_mm" in text
+    assert "VSEA 主流程：未进入模型调用" in text
+    assert "AI-PCB-Eval path not found" in text
 # ====== 功能：验证普通消息不携带空 selection。 ======
 def test_agent_message_omits_none_selection():
     message = agent_message("s1", "p1", "正文", selection=None)

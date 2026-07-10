@@ -8,6 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from pcb_agent_langgraph.debug_logging import log_debug_event
 from pcb_agent_langgraph.graph.state import ChatMessage
 from pcb_agent_langgraph.utils.config import ModelConfig
 
@@ -48,6 +49,7 @@ class PCBModel:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
 
         start = time.perf_counter()
+        log_debug_event("model.request", {"url": url, "model": self.config.model, "stream": body.get("stream"), "headers": headers, "body": body})
         request = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -58,14 +60,18 @@ class PCBModel:
                     content = _content_from_payload(raw)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
+            log_debug_event("model.error", {"url": url, "model": self.config.model, "elapsed_ms": (time.perf_counter() - start) * 1000, "error": f"HTTP {exc.code}: {detail or exc.reason}"})
             raise RuntimeError(f"pcb-model HTTP {exc.code}: {detail or exc.reason}") from exc
         except urllib.error.URLError as exc:
+            log_debug_event("model.error", {"url": url, "model": self.config.model, "elapsed_ms": (time.perf_counter() - start) * 1000, "error": str(exc)})
             raise RuntimeError(f"pcb-model request failed: {exc}") from exc
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         content = _strip_think_blocks(content)
         if not content:
+            log_debug_event("model.error", {"url": url, "model": self.config.model, "elapsed_ms": elapsed_ms, "raw": raw, "error": "empty content"})
             raise RuntimeError(f"pcb-model returned empty content: raw={_safe_raw_summary(raw)}")
+        log_debug_event("model.response", {"url": url, "model": self.config.model, "content": content, "raw": raw, "usage": raw.get("usage") or {}, "elapsed_ms": elapsed_ms})
         return ModelResult(content=content, raw=raw, elapsed_ms=elapsed_ms, usage=raw.get("usage") or {})
 
 

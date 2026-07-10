@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Any
 
+from pcb_agent_langgraph.debug_logging import log_debug_event
 from pcb_agent_langgraph.agent import PCBLangGraphAgent
 from pcb_agent_langgraph.utils.config import load_config
 from pcb_agent_langgraph.websocket.protocol import agent_message, error_message, parse_tool_result, parse_user_message, tool_call_message
@@ -64,13 +65,16 @@ class PCBWebSocketServer:
         self._session_pending_tools[session_id] = self._session_pending_tools.get(session_id, 0) + 1
         await self.send_progress(session_id, f"正在调用 {tool_name}...")
         print(f"tool_call_sent call_id={call_id} tool={tool_name} session={session_id} projectID={project_id} pending_count={len(self._pending)}")
+        log_debug_event("frontend_tool.sent", {"tool": tool_name, "call_id": call_id, "session_id": session_id, "project_id": project_id, "arguments": tool_arguments, "timeout": timeout})
         await ws.send(json.dumps(tool_call_message(session_id, project_id, call_id, tool_name, tool_arguments), ensure_ascii=False))
         task = asyncio.create_task(asyncio.wait_for(future, timeout=timeout))
         try:
             result = await self._await_with_progress(task, session_id, f"{tool_name} 执行中...", interval=5.0)
             await self.send_progress(session_id, f"{tool_name} 已完成，继续处理...")
+            log_debug_event("frontend_tool.result", {"tool": tool_name, "call_id": call_id, "session_id": session_id, "project_id": project_id, "result": result})
             return result
-        except Exception:
+        except Exception as exc:
+            log_debug_event("frontend_tool.error", {"tool": tool_name, "call_id": call_id, "session_id": session_id, "project_id": project_id, "error": str(exc)})
             self._pending.pop(call_id, None)
             raise
         finally:

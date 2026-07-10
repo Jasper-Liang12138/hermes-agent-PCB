@@ -38,6 +38,7 @@ class LocalRouteCsvRow:
     target_x: str = ""
     target_y: str = ""
     target_layer: str = ""
+    target_unit: str = ""
 
 
 # ====== 功能：定位当前工具脚本所在项目根目录。 ======
@@ -233,14 +234,108 @@ def _csv_number(value: Any) -> str:
     return f"{number:.6f}".rstrip("0").rstrip(".")
 
 
-def _local_route_row_from_item(item: dict[str, Any], aliases: dict[str, str]) -> LocalRouteCsvRow | None:
+def _number_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _format_mm(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _kicad_board_bbox_mm(project_data: str) -> tuple[float, float, float, float] | None:
+    points: list[tuple[float, float]] = []
+    text = project_data or ""
+    for block in _sexpr_blocks(text, "gr_line"):
+        if "Edge.Cuts" not in block:
+            continue
+        for match in re.finditer(r"\(\s*(?:start|end)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)", block):
+            points.append((float(match.group(1)), float(match.group(2))))
+    if not points:
+        return None
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _sexpr_blocks(text: str, head: str) -> list[str]:
+    blocks: list[str] = []
+    pattern = re.compile(r"\(\s*" + re.escape(head) + r"\b", re.IGNORECASE)
+    for match in pattern.finditer(text or ""):
+        depth = 0
+        for pos in range(match.start(), len(text)):
+            char = text[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(text[match.start() : pos + 1])
+                    break
+    return blocks
+
+
+def _unit_from_route_item(item: dict[str, Any], end: dict[str, Any]) -> str:
+    for source in (end, item):
+        for key in ("unit", "coordUnit", "coordinateUnit"):
+            value = str(source.get(key) or "").strip().lower()
+            if value:
+                return value
+    return ""
+
+
+def _point_inside_bbox(x: float, y: float, bbox: tuple[float, float, float, float], margin: float = 2.0) -> bool:
+    min_x, min_y, max_x, max_y = bbox
+    return min_x - margin <= x <= max_x + margin and min_y - margin <= y <= max_y + margin
+
+
+def _convert_target_point_to_mm(x: float, y: float, unit: str, bbox: tuple[float, float, float, float] | None) -> tuple[float, float, str]:
+    normalized = unit.strip().lower()
+    if normalized in {"mm", "millimeter", "millimeters"}:
+        return x, y, "mm"
+    if normalized in {"mil", "mils"}:
+        return x * 0.0254, y * 0.0254, "mil"
+    if normalized in {"dbu", "0.01mil", "pcb_dbu"}:
+        return x * 0.000254, y * 0.000254, "dbu"
+    if bbox is None:
+        return (x * 0.0254, y * 0.0254, "mil-auto") if max(abs(x), abs(y)) > 100 else (x, y, "mm-auto")
+
+    raw_inside = _point_inside_bbox(x, y, bbox)
+    mil_x, mil_y = x * 0.0254, y * 0.0254
+    dbu_x, dbu_y = x * 0.000254, y * 0.000254
+    mil_inside = _point_inside_bbox(mil_x, mil_y, bbox)
+    dbu_inside = _point_inside_bbox(dbu_x, dbu_y, bbox)
+    max_board_coord = max(abs(bbox[0]), abs(bbox[1]), abs(bbox[2]), abs(bbox[3]), 1.0)
+
+    if raw_inside and max(abs(x), abs(y)) <= max_board_coord + 5:
+        return x, y, "mm-auto"
+    if mil_inside:
+        return mil_x, mil_y, "mil-auto"
+    if dbu_inside:
+        return dbu_x, dbu_y, "dbu-auto"
+    return x, y, "unknown"
+
+
+def _local_route_row_from_item(item: dict[str, Any], aliases: dict[str, str], board_bbox: tuple[float, float, float, float] | None) -> LocalRouteCsvRow | None:
     net = str(item.get("net") or item.get("net_name") or item.get("netName") or item.get("name") or "").strip()
     if not net:
         return None
     route_layer = _normalize_route_layer(item.get("route_layer") or item.get("layer"), aliases)
     end = item.get("end") if isinstance(item.get("end"), dict) else {}
-    target_x = _csv_number(item.get("target_x") or item.get("targetX") or end.get("x"))
-    target_y = _csv_number(item.get("target_y") or item.get("targetY") or end.get("y"))
+    raw_x = _number_value(item.get("target_x") or item.get("targetX") or item.get("target_x_mm") or item.get("targetXMm") or end.get("x"))
+    raw_y = _number_value(item.get("target_y") or item.get("targetY") or item.get("target_y_mm") or item.get("targetYMm") or end.get("y"))
+    target_x = target_y = target_unit = ""
+    if raw_x is not None and raw_y is not None:
+        x_mm, y_mm, target_unit = _convert_target_point_to_mm(raw_x, raw_y, _unit_from_route_item(item, end), board_bbox)
+        if board_bbox is not None and not _point_inside_bbox(x_mm, y_mm, board_bbox, margin=5.0):
+            raise ValueError(f"重布线终点坐标无法转换为 KiCad mm: net={net} raw=({raw_x},{raw_y}) converted=({x_mm:.6f},{y_mm:.6f}) unit={target_unit}")
+        target_x = _format_mm(x_mm)
+        target_y = _format_mm(y_mm)
     target_layer = _normalize_route_layer(
         item.get("target_layer") or item.get("targetLayer") or end.get("layer") or item.get("route_layer") or item.get("layer"),
         aliases,
@@ -249,19 +344,20 @@ def _local_route_row_from_item(item: dict[str, Any], aliases: dict[str, str]) ->
         target_x = ""
         target_y = ""
         target_layer = ""
-    return LocalRouteCsvRow(net=net, route_layer=route_layer, target_x=target_x, target_y=target_y, target_layer=target_layer)
+    return LocalRouteCsvRow(net=net, route_layer=route_layer, target_x=target_x, target_y=target_y, target_layer=target_layer, target_unit=target_unit)
 
 
 # ====== 功能：整理局部布线 CSV 行顺序。 ======
 def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -> list[LocalRouteCsvRow]:
     aliases = _layer_aliases(project_data)
+    board_bbox = _kicad_board_bbox_mm(project_data)
     rows: list[LocalRouteCsvRow] = []
     seen: set[str] = set()
     order_lines = route_params.get("orderLines") or []
     for item in order_lines:
         if not isinstance(item, dict):
             continue
-        row = _local_route_row_from_item(item, aliases)
+        row = _local_route_row_from_item(item, aliases, board_bbox)
         if row is None or row.net in seen:
             continue
         seen.add(row.net)
@@ -273,7 +369,7 @@ def _ordered_local_route_rows(route_params: dict[str, Any], project_data: str) -
             continue
         for raw_net in value:
             if isinstance(raw_net, dict):
-                row = _local_route_row_from_item(raw_net, aliases)
+                row = _local_route_row_from_item(raw_net, aliases, board_bbox)
             else:
                 net = str(raw_net or "").strip()
                 row = LocalRouteCsvRow(net=net) if net else None
@@ -318,7 +414,7 @@ def write_local_route_csv(
     with target.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if has_target:
-            writer.writerow(["net", "target_x", "target_y", "target_layer"])
+            writer.writerow(["net", "target_x_mm", "target_y_mm", "target_layer"])
         else:
             writer.writerow(["net", "route_layer"] if has_route_layer else ["net"])
         for row in rows:
@@ -525,4 +621,3 @@ def run_pcbrouter_local_route(
         stdout_path=stdout_path.resolve(),
         stderr_path=stderr_path.resolve(),
     )
-

@@ -15,6 +15,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from pcb_agent_langgraph.debug_logging import log_debug_event
 from pcb_agent_langgraph.models.pcb_model import PCBModel
 from pcb_agent_langgraph.planner.intent_entities import normalize_router_type
 from pcb_agent_langgraph.tools.reroute_context import board_text_from_payload, build_reroute_context, target_nets_from_context
@@ -233,7 +234,17 @@ class ExternalProgramTool:
             "selectedNets": selected_nets,
             "localRouteCsvPath": arguments.get("localRouteCsvPath") or context.get("localRouteCsvPath"),
         }
-        csv_path, csv_mode = _prepare_local_route_csv(self.config.root, route_params, kicad_text, work_dir)
+        try:
+            csv_path, csv_mode = _prepare_local_route_csv(self.config.root, route_params, kicad_text, work_dir)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": str(exc),
+                "failureStage": "local_route_csv_prepare_failed",
+                "failureType": "local_route_csv_prepare_failed",
+                "workDir": str(work_dir),
+            }
         return {
             "status": "ok",
             "tool": self.name,
@@ -284,32 +295,84 @@ class ExternalProgramTool:
     # ====== 功能：调用 VSEA reroute_pipeline 作为主 reroute 模型-DRC loop。
     async def _run_reroute_loop(self, arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0)
+        stages: list[dict[str, Any]] = []
+
+        def mark(stage: str, **payload: Any) -> None:
+            event = {"stage": stage, **payload}
+            stages.append(event)
+            log_debug_event(f"reroute_loop.{stage}", event)
+
+        mark("preflight")
         if not self.config.reroute_loop.enabled:
-            return {"status": "failed", "tool": self.name, "reason": "reroute_loop is disabled in config"}
+            return {"status": "failed", "tool": self.name, "reason": "reroute_loop is disabled in config", "failureStage": "dependency_preflight_failed", "failureType": "reroute_loop_disabled", "modelCalled": False, "vseaStages": stages}
         provider = str(arguments.get("provider") or self.config.reroute_loop.provider or "vsea").strip().lower()
         if provider != "vsea":
-            return {"status": "failed", "tool": self.name, "reason": f"unsupported reroute_loop provider: {provider}"}
+            return {"status": "failed", "tool": self.name, "reason": f"unsupported reroute_loop provider: {provider}", "failureStage": "dependency_preflight_failed", "failureType": "unsupported_provider", "modelCalled": False, "vseaStages": stages}
 
         reroute_input = context.get("rerouteInput") if isinstance(context.get("rerouteInput"), dict) else {}
         kicad_text = str(reroute_input.get("kicadBoardText") or "")
         if not _is_kicad_board_text(kicad_text):
-            return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute_loop", "failureStage": "input", "failureType": "missing_kicad_board_data"}
+            return {"status": "failed", "tool": self.name, "reason": "missing KiCad .kicad_pcb board data for reroute_loop", "failureStage": "input", "failureType": "missing_kicad_board_data", "modelCalled": False, "vseaStages": stages}
         prompt = _vsea_routing_task_prompt(arguments, context, reroute_input)
         if not prompt.strip():
-            return {"status": "failed", "tool": self.name, "reason": "missing routing task prompt for reroute_loop", "failureStage": "input", "failureType": "missing_routing_task_prompt"}
+            return {"status": "failed", "tool": self.name, "reason": "missing routing task prompt for reroute_loop", "failureStage": "input", "failureType": "missing_routing_task_prompt", "modelCalled": False, "vseaStages": stages}
 
         pipeline_root = _resolve_path(self.config.root, arguments.get("pipelineRoot") or self.config.reroute_loop.pipeline_root)
         if not pipeline_root.exists():
-            return {"status": "failed", "tool": self.name, "reason": "VSEA reroute_pipeline root does not exist", "pipelineRoot": str(pipeline_root), "failureStage": "pipeline_config", "failureType": "pipeline_unavailable"}
+            return {"status": "failed", "tool": self.name, "reason": "VSEA reroute_pipeline root does not exist", "pipelineRoot": str(pipeline_root), "failureStage": "dependency_preflight_failed", "failureType": "pipeline_unavailable", "modelCalled": False, "vseaStages": stages}
         work_dir = self._work_dir(context) / "vsea_reroute_pipeline"
         safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(context.get("session_id") or "session")).strip("_") or "session"
         task_id = f"{safe_session}_reroute"
         output_dir = work_dir / task_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        ai_pcb_eval_path, drc_agent_package, agent_drc_python = _vsea_dependency_paths(self.config, arguments)
+        dependency_errors = []
+        if not ai_pcb_eval_path.exists():
+            dependency_errors.append(f"AI-PCB-Eval path not found: {ai_pcb_eval_path}")
+        if drc_agent_package.name == "__missing_drc_agent_package__":
+            dependency_errors.append("DRC agent package is not configured")
+        elif not drc_agent_package.exists():
+            dependency_errors.append(f"DRC agent package not found: {drc_agent_package}")
+        if dependency_errors:
+            mark("preflight_failed", aiPcbEvalPath=str(ai_pcb_eval_path), drcAgentPackage=str(drc_agent_package), errors=dependency_errors)
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": "VSEA 依赖检查失败，未进入模型调用：" + "; ".join(dependency_errors),
+                "failureStage": "dependency_preflight_failed",
+                "failureType": "dependency_preflight_failed",
+                "pipelineRoot": str(pipeline_root),
+                "aiPcbEvalPath": str(ai_pcb_eval_path),
+                "drcAgentPackage": str(drc_agent_package),
+                "agentDrcPython": str(agent_drc_python),
+                "modelCalled": False,
+                "workDir": str(output_dir),
+                "vseaStages": stages,
+            }
 
         try:
+            mark("import_pipeline", pipelineRoot=str(pipeline_root))
             schemas_mod = _import_vsea_module(pipeline_root, "reroute_pipeline.schemas")
             agent_mod = _import_vsea_module(pipeline_root, "reroute_pipeline.agent")
+        except Exception as exc:
+            mark("pipeline_import_failed", error=str(exc))
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": f"VSEA pipeline 导入失败，未进入模型调用：{exc}",
+                "failureStage": "pipeline_import_failed",
+                "failureType": "pipeline_import_failed",
+                "tracebackSummary": _traceback_summary(exc),
+                "pipelineRoot": str(pipeline_root),
+                "aiPcbEvalPath": str(ai_pcb_eval_path),
+                "drcAgentPackage": str(drc_agent_package),
+                "modelCalled": False,
+                "workDir": str(output_dir),
+                "vseaStages": stages,
+            }
+
+        try:
+            mark("build_request", taskId=task_id, promptChars=len(prompt), boardChars=len(kicad_text))
             request = schemas_mod.RerouteInput(
                 task_id=task_id,
                 context_kicad=kicad_text,
@@ -323,29 +386,58 @@ class ExternalProgramTool:
                 repair_samples=int(arguments.get("repair_samples") or arguments.get("repairSamples") or self.config.reroute_loop.repair_samples),
                 repair_retries=int(arguments.get("repair_retries") or arguments.get("repairRetries") or self.config.reroute_loop.repair_retries),
             )
-            with _patched_env(_vsea_env(self.config, arguments, output_dir)):
-                result = await asyncio.to_thread(agent_mod.RerouteAgent.from_env().run, request)
         except Exception as exc:
+            mark("build_request_failed", error=str(exc))
+            return {
+                "status": "failed",
+                "tool": self.name,
+                "reason": f"VSEA 请求构造失败，未进入模型调用：{exc}",
+                "failureStage": "pipeline_import_failed",
+                "failureType": "pipeline_request_failed",
+                "tracebackSummary": _traceback_summary(exc),
+                "pipelineRoot": str(pipeline_root),
+                "aiPcbEvalPath": str(ai_pcb_eval_path),
+                "drcAgentPackage": str(drc_agent_package),
+                "modelCalled": False,
+                "workDir": str(output_dir),
+                "vseaStages": stages,
+            }
+
+        try:
+            mark("llm_start", model=str(arguments.get("model") or self.config.model.model or ""))
+            with _patched_env(_vsea_env(self.config, arguments, output_dir, ai_pcb_eval_path, drc_agent_package, agent_drc_python)):
+                result = await asyncio.to_thread(agent_mod.RerouteAgent.from_env().run, request)
+            mark("llm_done")
+        except Exception as exc:
+            mark("llm_fail", error=str(exc))
             return {
                 "status": "failed",
                 "tool": self.name,
                 "reason": f"重布线主流程失败，已切换兜底布线：{exc}",
-                "failureStage": "pipeline_call",
+                "failureStage": "model_call_failed",
                 "failureType": "pipeline_exception",
                 "tracebackSummary": _traceback_summary(exc),
                 "pipelineRoot": str(pipeline_root),
+                "aiPcbEvalPath": str(ai_pcb_eval_path),
+                "drcAgentPackage": str(drc_agent_package),
+                "modelCalled": True,
                 "workDir": str(output_dir),
+                "vseaStages": stages,
             }
 
         payload = result.to_dict() if hasattr(result, "to_dict") else _dataclass_to_dict(result)
         if not bool(payload.get("success")):
+            failure_type = str(payload.get("status") or "failed")
+            failure_stage = "model_call_failed" if failure_type == "routing_failed" else failure_type if failure_type in {"fill_failed", "drc_failed"} else "pipeline_result"
             return {
                 "status": "failed",
                 "tool": self.name,
                 "reason": f"重布线主流程失败，已切换兜底布线：{payload.get('error') or payload.get('status') or 'unknown error'}",
-                "failureStage": "pipeline_result",
-                "failureType": str(payload.get("status") or "failed"),
+                "failureStage": failure_stage,
+                "failureType": failure_type,
                 "vseaResult": payload,
+                "modelCalled": True,
+                "vseaStages": stages,
                 "workDir": str(output_dir),
             }
 
@@ -363,6 +455,8 @@ class ExternalProgramTool:
                 "failureStage": "pipeline_result",
                 "failureType": "missing_completed_board",
                 "vseaResult": payload,
+                "modelCalled": True,
+                "vseaStages": stages,
                 "workDir": str(output_dir),
             }
         import_path = ""
@@ -383,8 +477,12 @@ class ExternalProgramTool:
                 "incrementalImportNotes": import_notes,
                 "vseaResult": payload,
                 "routedKicadFilePath": routed_path,
+                "modelCalled": True,
+                "vseaStages": stages,
                 "workDir": str(output_dir),
             }
+        mark("fill", routedKicadFilePath=routed_path)
+        mark("hard_drc", passed=True)
         return {
             "status": "ok",
             "tool": self.name,
@@ -397,6 +495,8 @@ class ExternalProgramTool:
             "vseaResult": payload,
             "drcResult": {"status": "ok", "passed": True, "source": "vsea_reroute_pipeline", "detail": payload.get("drc_report") or {}},
             "report": "VSEA reroute_pipeline completed and passed hard DRC.",
+            "modelCalled": True,
+            "vseaStages": stages,
             "workDir": str(output_dir),
             "routingTaskPrompt": prompt,
         }
@@ -527,7 +627,7 @@ class ExternalProgramTool:
             diagnostics = _help_planner_diagnostics(work_dir, pcbrouter_bin, source_board_path)
             tb = _traceback_summary(exc)
             print(f"help_planner_exception traceback_summary={tb}")
-            return {"status": "failed", "tool": self.name, "reason": str(exc), "tracebackSummary": tb, "routeParams": route_params, **diagnostics}
+            return {"status": "failed", "tool": self.name, "reason": str(exc), "failureStage": "pcbrouter_execution_failed", "failureType": "pcbrouter_execution_failed", "tracebackSummary": tb, "routeParams": route_params, **diagnostics}
 
 
     # ====== 功能：根据 router 类型选择真实 layer_assign 命令。 ======
@@ -854,8 +954,8 @@ def _help_planner_diagnostics(work_dir: Path, pcbrouter_bin: Path, source_board_
     run_dir = work_dir / "pcbrouter_local_completion"
     input_board = run_dir / "local_route_input.kicad_pcb"
     input_csv = run_dir / "local_route_input.csv"
-    stdout_path = run_dir / "pcbrouter_stdout.log"
-    stderr_path = run_dir / "pcbrouter_stderr.log"
+    stdout_path = run_dir / "pcbrouter.stdout.log"
+    stderr_path = run_dir / "pcbrouter.stderr.log"
     files: dict[str, Any] = {}
     for label, path in {"inputBoardPath": input_board, "inputCsvPath": input_csv, "stdoutPath": stdout_path, "stderrPath": stderr_path}.items():
         files[label] = str(path)
@@ -869,6 +969,8 @@ def _help_planner_diagnostics(work_dir: Path, pcbrouter_bin: Path, source_board_
         files["stdoutSummary"] = stdout_path.read_text(encoding="utf-8", errors="replace")[:1600]
     if stderr_path.exists():
         files["stderrSummary"] = stderr_path.read_text(encoding="utf-8", errors="replace")[:1600]
+    if input_csv.exists():
+        files["inputCsvPreview"] = "\n".join(input_csv.read_text(encoding="utf-8", errors="replace").splitlines()[:8])
     return {"workDir": str(work_dir), "pcbrouterBin": str(pcbrouter_bin), "sourceBoardPath": source_board_path, **files}
 
 
@@ -934,11 +1036,43 @@ def _patched_env(values: dict[str, str]):
                 os.environ[key] = value
 
 
-def _vsea_env(config: AppConfig, arguments: dict[str, Any], output_dir: Path) -> dict[str, str]:
+def _vsea_dependency_paths(config: AppConfig, arguments: dict[str, Any]) -> tuple[Path, Path, str]:
+    ai_raw = (
+        arguments.get("ai_pcb_eval_path")
+        or arguments.get("aiPcbEvalPath")
+        or os.environ.get("REROUTE_AI_PCB_EVAL_PATH")
+        or os.environ.get("AI_PCB_EVAL_PATH")
+        or config.reroute_loop.ai_pcb_eval_path
+    )
+    drc_raw = (
+        arguments.get("drc_agent_package")
+        or arguments.get("drcAgentPackage")
+        or os.environ.get("REROUTE_DRC_AGENT_PACKAGE")
+        or os.environ.get("VSEA_PCB_AGENT_DRC_TOOL")
+        or config.reroute_loop.drc_agent_package
+    )
+    agent_python = str(
+        arguments.get("agent_drc_python")
+        or arguments.get("agentDrcPython")
+        or os.environ.get("REROUTE_AGENT_DRC_PYTHON")
+        or os.environ.get("VSEA_PCB_AGENT_DRC_PYTHON")
+        or config.reroute_loop.agent_drc_python
+        or ""
+    )
+    missing_drc = config.root / "__missing_drc_agent_package__"
+    return _resolve_path(config.root, ai_raw), _resolve_path(config.root, drc_raw) if str(drc_raw or "").strip() else missing_drc, agent_python
+
+
+def _vsea_env(config: AppConfig, arguments: dict[str, Any], output_dir: Path, ai_pcb_eval_path: Path | None = None, drc_agent_package: Path | None = None, agent_drc_python: str = "") -> dict[str, str]:
+    if ai_pcb_eval_path is None or drc_agent_package is None:
+        ai_pcb_eval_path, drc_agent_package, agent_drc_python = _vsea_dependency_paths(config, arguments)
     return {
         "REROUTE_LLM_API_KEY": str(arguments.get("api_key") or arguments.get("apiKey") or config.model.api_key or ""),
         "REROUTE_LLM_BASE_URL": str(arguments.get("base_url") or arguments.get("baseUrl") or config.model.base_url or ""),
         "REROUTE_MODEL": str(arguments.get("model") or config.model.model or ""),
+        "REROUTE_AI_PCB_EVAL_PATH": str(ai_pcb_eval_path),
+        "REROUTE_DRC_AGENT_PACKAGE": str(drc_agent_package),
+        "REROUTE_AGENT_DRC_PYTHON": str(agent_drc_python or ""),
         "REROUTE_OUTPUT_DIR": str(output_dir),
         "REROUTE_TIMEOUT_SECONDS": str(arguments.get("timeout_seconds") or arguments.get("timeoutSeconds") or config.reroute_loop.timeout_seconds),
     }

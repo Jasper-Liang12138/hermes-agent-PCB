@@ -6,8 +6,9 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
+from pcb_agent_langgraph.debug_logging import log_debug_event
 from pcb_agent_langgraph.graph.state import PCBState, add_trace
 from pcb_agent_langgraph.planner.planner import PCBPlanner
 from pcb_agent_langgraph.reports.markdown import build_fanout_route_report, build_markdown_report
@@ -25,8 +26,23 @@ class GraphNodes:
         self.tools = tools
         self.progress_sender = progress_sender
 
+    # ====== 功能：统一记录节点输入、输出和异常。 ======
+    async def _run_logged_node(self, name: str, state: PCBState, func: Callable[[PCBState], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+        log_debug_event(f"node.{name}.start", {"node": name, "state": state})
+        try:
+            result = await func(state)
+            log_debug_event(f"node.{name}.end", {"node": name, "state": state, "result": result})
+            return result
+        except Exception as exc:
+            log_debug_event(f"node.{name}.error", {"node": name, "state": state, "error": str(exc)})
+            raise
+
     # ====== 功能：记录意图识别节点进入状态。 ======
     async def intent(self, state: PCBState) -> dict[str, Any]:
+        return await self._run_logged_node("intent", state, self._intent)
+
+    # ====== 功能：执行意图识别节点的核心逻辑。 ======
+    async def _intent(self, state: PCBState) -> dict[str, Any]:
         return {
             "current_stage": "intent",
             "loop_count": int(state.get("loop_count", 0)) + 1,
@@ -35,6 +51,10 @@ class GraphNodes:
 
     # ====== 功能：根据当前状态生成下一步执行计划。 ======
     async def plan(self, state: PCBState) -> dict[str, Any]:
+        return await self._run_logged_node("plan", state, self._plan)
+
+    # ====== 功能：执行计划节点的核心逻辑。 ======
+    async def _plan(self, state: PCBState) -> dict[str, Any]:
         plan = self.planner.plan(state)
         cache = state.get("intermediate_cache", {}) or {}
         tool_names = [str(call.get("name")) for call in plan.get("tool_calls", []) if isinstance(call, dict)]
@@ -64,6 +84,10 @@ class GraphNodes:
 
     # ====== 功能：执行 planner 生成的工具调用并更新中间缓存。 ======
     async def execute_tools(self, state: PCBState) -> dict[str, Any]:
+        return await self._run_logged_node("execute_tools", state, self._execute_tools)
+
+    # ====== 功能：执行工具节点的核心逻辑。 ======
+    async def _execute_tools(self, state: PCBState) -> dict[str, Any]:
         records = list(state.get("tool_history", []))
         results = dict(state.get("tool_results", {}))
         cache = dict(state.get("intermediate_cache", {}))
@@ -111,6 +135,10 @@ class GraphNodes:
         return record
     # ====== 功能：根据工具结果生成当前轮回复和流程状态。 ======
     async def reflect(self, state: PCBState) -> dict[str, Any]:
+        return await self._run_logged_node("reflect", state, self._reflect)
+
+    # ====== 功能：执行反思节点的核心逻辑。 ======
+    async def _reflect(self, state: PCBState) -> dict[str, Any]:
         task_type = state.get("task_type", "unknown")
         tool_history = state.get("tool_history", [])
         failed = [item for item in tool_history if not item.get("ok") or _result_failed(item.get("result"))]
@@ -200,6 +228,10 @@ class GraphNodes:
 
     # ====== 功能：收尾当前图执行并写入对话历史。 ======
     async def finish(self, state: PCBState) -> dict[str, Any]:
+        return await self._run_logged_node("finish", state, self._finish)
+
+    # ====== 功能：执行收尾节点的核心逻辑。 ======
+    async def _finish(self, state: PCBState) -> dict[str, Any]:
         history = list(state.get("conversation_history", []))
         if state.get("final_response"):
             history.append({"role": "assistant", "content": state["final_response"]})
@@ -498,10 +530,23 @@ def _reroute_diagnostics(cache: dict[str, Any], record: dict[str, Any] | None, a
         "workDir": result_dict.get("workDir") or result_dict.get("work_dir") or "",
         "nextAction": _reroute_next_action(failure_type, tool_name),
     }
-    for key in ("tracebackSummary", "command", "stdout", "stderr", "stderrSummary", "pcbrouterBin", "sourceBoardPath", "inputBoardPath", "inputCsvPath", "tool_path", "eval_root", "python", "code_dir", "checkpoint", "input"):
+    for key in ("tracebackSummary", "command", "stdout", "stderr", "stdoutSummary", "stderrSummary", "pcbrouterBin", "sourceBoardPath", "inputBoardPath", "inputCsvPath", "inputCsvPreview", "tool_path", "eval_root", "python", "code_dir", "checkpoint", "input", "aiPcbEvalPath", "drcAgentPackage", "pipelineRoot"):
         value = result_dict.get(key)
         if value not in (None, "", [], {}):
             diagnostics[key] = _short_failure_value(value, 1200 if key == "tracebackSummary" else 800)
+    loop_result = cache.get("rerouteLoopResult") if isinstance(cache.get("rerouteLoopResult"), dict) else {}
+    if loop_result and result_dict is not loop_result:
+        diagnostics["rerouteLoopFailure"] = {
+            "status": loop_result.get("status"),
+            "failureStage": loop_result.get("failureStage"),
+            "failureType": loop_result.get("failureType"),
+            "reason": _short_failure_value(loop_result.get("reason"), 1000),
+            "modelCalled": bool(loop_result.get("modelCalled")),
+            "workDir": loop_result.get("workDir"),
+            "pipelineRoot": loop_result.get("pipelineRoot"),
+            "aiPcbEvalPath": loop_result.get("aiPcbEvalPath"),
+            "drcAgentPackage": loop_result.get("drcAgentPackage"),
+        }
     if cache.get("rerouteDrcFailureCount") is not None:
         diagnostics["drcFailureCount"] = cache.get("rerouteDrcFailureCount")
     if cache.get("rerouteDrcFeedbackHistory"):
@@ -528,6 +573,18 @@ def _reroute_failure_text(diagnostics: dict[str, Any], fallback: str = "") -> st
         lines.append(f"输入板文件：{diagnostics.get('inputBoardPath')}")
     if diagnostics.get("inputCsvPath"):
         lines.append(f"输入 CSV：{diagnostics.get('inputCsvPath')}")
+    if diagnostics.get("inputCsvPreview"):
+        lines.append(f"输入 CSV 预览：{diagnostics.get('inputCsvPreview')}")
+    loop_failure = diagnostics.get("rerouteLoopFailure")
+    if isinstance(loop_failure, dict) and loop_failure:
+        called_text = "已进入模型调用" if loop_failure.get("modelCalled") else "未进入模型调用"
+        lines.append(
+            "VSEA 主流程："
+            f"{called_text}；阶段={loop_failure.get('failureStage') or ''}；"
+            f"类型={loop_failure.get('failureType') or ''}；原因={loop_failure.get('reason') or ''}"
+        )
+        if loop_failure.get("workDir"):
+            lines.append(f"VSEA workDir：{loop_failure.get('workDir')}")
     if diagnostics.get("stderr"):
         lines.append(f"stderr：{diagnostics.get('stderr')}")
     if diagnostics.get("tracebackSummary"):
@@ -571,7 +628,7 @@ def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
     #     return "drc_failed"
     if tool_name == "explainability_report":
         return "explainability_failed"
-    if tool_name == "help_planner" and ("kicad" in reason_lower or "export.txt" in reason_lower):
+    if tool_name == "help_planner" and ("requires kicad" in reason_lower or "got pcb builder/export txt" in reason_lower or "current projectdata is not kicad" in reason_lower):
         return "invalid_kicad_input"
     if tool_name == "help_planner":
         return "help_planner_failed"
@@ -589,6 +646,8 @@ def _reroute_next_action(failure_type: str, tool_name: str) -> str:
         return "确认 deleteTracesForRerouting 返回了 projectData/missing_routes，且项目数据是可解析的 KiCad/板级文本。"
     if failure_type == "invalid_kicad_input":
         return "help_planner 需要 .kicad_pcb 输入；请先确认 export.txt 到 KiCad 输入的转换链路。"
+    if failure_type == "pcbrouter_execution_failed":
+        return "查看 inputCsvPreview、pcbrouter stdout/stderr，确认目标 net、target_x_mm/target_y_mm 和 target_layer 是否符合 helper-router 要求。"
     # if failure_type == "drc_failed":
     #     return "默认主链路由 VSEA 内部处理 DRC/repair；旧 drc_check 失败时可手动检查 patch fill 和 DRC 明细。"
     if tool_name == "help_planner":

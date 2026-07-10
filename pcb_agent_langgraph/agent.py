@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any
 
+from pcb_agent_langgraph.debug_logging import AgentDebugLogger, agent_debug_context
 from pcb_agent_langgraph.entry import entry_task_workflow, normalize_entry_module
 from pcb_agent_langgraph.graph.graph import build_graph
 from pcb_agent_langgraph.graph.state import ChatMessage, PCBState, initial_state
@@ -27,38 +29,47 @@ class PCBLangGraphAgent:
 
     # ====== 功能：异步执行当前工具或 Agent 调用。 ======
     async def ainvoke(self, session_id: str, project_id: str, user_input: str, *, entry_module: str = "", entry_action: str = "", entry_payload: dict[str, Any] | None = None) -> PCBState:
-        previous = self._session_states.get(session_id)
-        history: list[ChatMessage] = list(previous.get("conversation_history", [])) if previous else []
-        state = initial_state(session_id=session_id, project_id=project_id, user_input=user_input, history=history)
-        normalized_entry = normalize_entry_module(entry_module)
-        payload = dict(entry_payload or {})
-        if previous:
-            # 多轮对话复用上轮项目状态和中间 cache，使 fanout/reroute 可以被追问后继续执行。
-            state["pcb_project"] = previous.get("pcb_project", {})
-            state["design_state"] = previous.get("design_state", {})
-            state["intermediate_cache"] = self._cache_for_turn(previous.get("intermediate_cache", {}), user_input, previous.get("workflow_state", "idle"))
-            state["workflow_id"] = previous.get("workflow_id", "idle")
-            state["workflow_state"] = previous.get("workflow_state", "idle")
-        if normalized_entry:
-            state["entry_module"] = normalized_entry
-            state["entry_action"] = str(entry_action or "")
-            payload["entry_module"] = normalized_entry
-            if entry_action:
-                payload["entry_action"] = str(entry_action)
-            state["entry_payload"] = payload
-            if normalized_entry == "global_fanout":
-                state["intermediate_cache"] = self._cache_for_entry_payload(state.get("intermediate_cache", {}), payload)
-            task_workflow = entry_task_workflow(normalized_entry)
-            if task_workflow:
-                task_type, workflow_id = task_workflow
-                previous_workflow = previous.get("workflow_id", "idle") if previous else "idle"
-                state["task_type"] = task_type
-                state["workflow_id"] = workflow_id
-                if previous_workflow != workflow_id:
-                    state["workflow_state"] = "idle"
-        result = await self.graph.ainvoke(state)
-        self._session_states[session_id] = result
-        return result
+        run_id = str(uuid.uuid4())
+        logger = AgentDebugLogger(self.config.debug_log, run_id=run_id, session_id=session_id, project_id=project_id, root=self.config.root)
+        with agent_debug_context(logger):
+            logger.log("turn.start", {"user_input": user_input, "entry_module": entry_module, "entry_action": entry_action, "entry_payload": entry_payload or {}})
+            try:
+                previous = self._session_states.get(session_id)
+                history: list[ChatMessage] = list(previous.get("conversation_history", [])) if previous else []
+                state = initial_state(session_id=session_id, project_id=project_id, user_input=user_input, history=history)
+                normalized_entry = normalize_entry_module(entry_module)
+                payload = dict(entry_payload or {})
+                if previous:
+                    # 多轮对话复用上轮项目状态和中间 cache，使 fanout/reroute 可以被追问后继续执行。
+                    state["pcb_project"] = previous.get("pcb_project", {})
+                    state["design_state"] = previous.get("design_state", {})
+                    state["intermediate_cache"] = self._cache_for_turn(previous.get("intermediate_cache", {}), user_input, previous.get("workflow_state", "idle"))
+                    state["workflow_id"] = previous.get("workflow_id", "idle")
+                    state["workflow_state"] = previous.get("workflow_state", "idle")
+                if normalized_entry:
+                    state["entry_module"] = normalized_entry
+                    state["entry_action"] = str(entry_action or "")
+                    payload["entry_module"] = normalized_entry
+                    if entry_action:
+                        payload["entry_action"] = str(entry_action)
+                    state["entry_payload"] = payload
+                    if normalized_entry == "global_fanout":
+                        state["intermediate_cache"] = self._cache_for_entry_payload(state.get("intermediate_cache", {}), payload)
+                    task_workflow = entry_task_workflow(normalized_entry)
+                    if task_workflow:
+                        task_type, workflow_id = task_workflow
+                        previous_workflow = previous.get("workflow_id", "idle") if previous else "idle"
+                        state["task_type"] = task_type
+                        state["workflow_id"] = workflow_id
+                        if previous_workflow != workflow_id:
+                            state["workflow_state"] = "idle"
+                result = await self.graph.ainvoke(state)
+                self._session_states[session_id] = result
+                logger.log("turn.end", {"state": result})
+                return result
+            except Exception as exc:
+                logger.log("turn.error", {"error": str(exc)})
+                raise
 
 
     @staticmethod
