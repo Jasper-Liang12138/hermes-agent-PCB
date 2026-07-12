@@ -300,3 +300,26 @@ def test_handler_passes_entry_signal_to_agent():
 def test_import_lines_defaults_to_approval_for_legacy_callers():
     message = tool_call_message("s1", "p1", "call-legacy", "importLines", {"filePath": "F:/demo/line.out"})
     assert message["body"]["content"]["arguments"]["requireApproval"] is True
+
+def test_parse_bga_escape_routing_protocol_message():
+    parsed = parse_user_message({"projectid": "P1", "type": "BGA_Escape_Routing", "body": {"decision": "RETRY", "stage": "SETTING_PARAMS", "bga": "U5", "algorithm": "135", "type": "RL"}})
+    assert parsed.entry_module == "global_fanout"
+    assert parsed.entry_action == "retry"
+    assert parsed.entry_payload["decision"] == "RETRY"
+    assert parsed.entry_payload["stage"] == "SETTING_PARAMS"
+    assert parsed.entry_payload["routingParamType"] == "RL"
+
+
+def test_restore_tool_call_preserves_arguments():
+    arguments = {"workflow": "fanout", "reason": "retry_routing", "snapshotId": "snap-1"}
+    message = tool_call_message("s1", "p1", "call-restore", "restoreFanoutSnapshot", arguments)
+    assert message["body"]["content"]["arguments"] == arguments
+
+
+def test_all_entry_fields_and_required_aliases_are_supported():
+    aliases = {"qa": "qa", "pcb_qa_flow": "qa", "global_fanout": "global_fanout", "fanout": "global_fanout", "bga_escape_routing": "global_fanout", "pcb_escape_flow": "global_fanout", "reroute": "reroute", "local_reroute": "reroute", "pcb_reroute_flow": "reroute"}
+    fields = ("entry_module", "entryModule", "module", "chain", "taskType", "task_type", "workflow", "workflow_id")
+    for alias, expected in aliases.items():
+        for field in fields:
+            parsed = parse_user_message({"type": "message", "body": {"role": "user", "content": "", field: alias}})
+            assert parsed.entry_module == expected

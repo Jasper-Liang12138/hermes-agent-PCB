@@ -53,8 +53,19 @@ class PCBLangGraphAgent:
                     if entry_action:
                         payload["entry_action"] = str(entry_action)
                     state["entry_payload"] = payload
+                    entry_command = str(payload.get("decision") or entry_action or "").strip().upper()
+                    decision_commands = {"ACCEPT", "COMPLETE", "RETRY", "CANCEL", "DISCARD", "RERUN"}
+                    reentering_completed_flow = bool(previous and previous.get("workflow_state") == "completed" and entry_command not in decision_commands)
+                    if entry_command in {"NEW", "ENTER", "START"} or reentering_completed_flow:
+                        state["intermediate_cache"] = {}
                     if normalized_entry == "global_fanout":
                         state["intermediate_cache"] = self._cache_for_entry_payload(state.get("intermediate_cache", {}), payload)
+                    decision = str(payload.get("decision") or entry_action or "").strip()
+                    decision_workflow = "fanout" if normalized_entry == "global_fanout" else normalized_entry
+                    if decision and _import_result_succeeded(state.get("intermediate_cache", {}).get("importLinesResult")):
+                        state["intermediate_cache"] = _apply_result_decision(
+                            state.get("intermediate_cache", {}), decision_workflow, decision, str(payload.get("stage") or "")
+                        )
                     task_workflow = entry_task_workflow(normalized_entry)
                     if task_workflow:
                         task_type, workflow_id = task_workflow
@@ -115,6 +126,8 @@ class PCBLangGraphAgent:
         if workflow_state == "param_review" and confirmed_params is not None:
             merged_params = _merge_fanout_params(dict(next_cache.get("fanoutParams") or {}), confirmed_params)
             next_cache["fanoutParams"] = merged_params
+            if merged_params.get("snapshotId"):
+                next_cache["snapshotId"] = merged_params.get("snapshotId")
             next_cache["fanoutParamsConfirmed"] = True
             merged_entities = dict(next_cache.get("fanoutEntities") or {})
             for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
@@ -164,6 +177,8 @@ def _cache_for_entry_payload(cache: dict, entry_payload: dict[str, Any]) -> dict
         next_cache["bgaCandidates"] = candidates
 
     selected = _payload_text(payload, ("selectedBGA", "targetBGA", "componentId", "refdes"))
+    if not selected and isinstance(payload.get("bga"), str):
+        selected = str(payload.get("bga") or "").strip()
     if selected:
         selected = selected.upper()
         entities["selectedBGA"] = selected
@@ -190,6 +205,8 @@ def _cache_for_entry_payload(cache: dict, entry_payload: dict[str, Any]) -> dict
     if fanout_params:
         merged_params = _merge_fanout_params(dict(next_cache.get("fanoutParams") or {}), fanout_params)
         next_cache["fanoutParams"] = merged_params
+        if merged_params.get("snapshotId"):
+            next_cache["snapshotId"] = merged_params.get("snapshotId")
         merged_entities = dict(next_cache.get("fanoutEntities") or {})
         for key in ("selectedBGA", "targetBGA", "targetBGAs", "bgaType", "bgaLayoutType", "routerType", "constraints"):
             value = merged_params.get(key)
@@ -221,6 +238,8 @@ def _fanout_params_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     bga = payload.get("bga") if isinstance(payload.get("bga"), dict) else {}
     selected = _payload_text(payload, ("selectedBGA", "targetBGA", "componentId", "refdes"))
+    if not selected and isinstance(payload.get("bga"), str):
+        selected = str(payload.get("bga") or "").strip()
     if selected:
         params["selectedBGA"] = selected.upper()
         params["targetBGAs"] = [selected.upper()]
@@ -240,6 +259,10 @@ def _fanout_params_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     router_type = normalize_router_type(_payload_text(payload, ("routerType", "algorithm", "router", "routeType"))) or normalize_router_type(_first_text_from_dict(routing_plan, ("routerType", "algorithm", "router", "routeType")))
     if router_type:
         params["routerType"] = router_type
+
+    routing_param_type = payload.get("routingParamType")
+    if routing_param_type not in (None, "", [], {}):
+        params["routingParamType"] = routing_param_type
 
     constraints = _merge_constraints_from_payload(payload, routing_plan)
     if constraints:
@@ -449,3 +472,57 @@ def _has_effective_order_lines(value: Any) -> bool:
         if isinstance(item, dict) and (str(item.get("net") or "").strip() or str(item.get("layer") or "").strip()):
             return True
     return False
+
+
+
+# ====== 功能：只有真实成功的自动导入结果才允许进入最终决策。 ======
+def _import_result_succeeded(result: Any) -> bool:
+    if result in (None, "", False):
+        return False
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return False
+        return str(result.get("status") or "").lower() not in {"failed", "error", "failure", "rejected", "cancelled"}
+    text = str(result).lower()
+    return not any(token in text for token in ("failed", "error", "failure", "rejected", "cancel", "失败", "错误", "拒绝", "取消"))
+
+# ====== 功能：把导入后的用户决策转换为接受标记或两阶段版图恢复请求。 ======
+def _apply_result_decision(cache: dict, workflow: str, decision: str, stage: str = "") -> dict:
+    next_cache = dict(cache or {})
+    normalized_workflow = "fanout" if workflow in {"fanout", "global_fanout"} else "reroute"
+    normalized_decision = str(decision or "").strip().upper()
+    normalized_stage = str(stage or "").strip().upper()
+
+    if normalized_decision in {"ACCEPT", "COMPLETE"}:
+        next_cache["resultAccepted"] = True
+        next_cache["resultDecisionPending"] = False
+        next_cache.pop("pendingRestore", None)
+        next_cache.pop("restoreResult", None)
+        return next_cache
+
+    reason = ""
+    if normalized_workflow == "fanout":
+        if normalized_decision == "CANCEL":
+            reason = "cancel"
+        elif normalized_decision == "RETRY":
+            reason = {
+                "CHOOSING_BGA": "retry_choose_bga",
+                "SETTING_PARAMS": "retry_params",
+                "ROUTING": "retry_routing",
+            }.get(normalized_stage, "retry_routing")
+    elif normalized_decision == "DISCARD":
+        reason = "discard"
+    elif normalized_decision in {"RERUN", "RETRY"}:
+        reason = "rerun"
+
+    if reason:
+        request = {"workflow": normalized_workflow, "reason": reason}
+        snapshot_id = next_cache.get("snapshotId") or next_cache.get("originalSnapshotId")
+        if snapshot_id:
+            request["snapshotId"] = snapshot_id
+        if normalized_stage:
+            request["stage"] = normalized_stage
+        next_cache["pendingRestore"] = request
+        next_cache["resultDecisionPending"] = True
+        next_cache.pop("restoreResult", None)
+    return next_cache

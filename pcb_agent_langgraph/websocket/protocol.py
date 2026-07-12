@@ -52,19 +52,26 @@ def _decode_result(value: Any) -> Any:
 def parse_user_message(data: dict[str, Any]) -> UserMessage | None:
     raw = data if isinstance(data, dict) else {}
     data = _payload(raw)
-    if data.get("type") != "message":
+    message_type = str(data.get("type") or "")
+    is_bga_escape = message_type.lower() == "bga_escape_routing"
+    if message_type != "message" and not is_bga_escape:
         return None
     body = data.get("body") if isinstance(data.get("body"), dict) else {}
-    if body.get("role") != "user":
+    if not is_bga_escape and body.get("role") != "user":
         return None
     content_value = body.get("content")
     content_object = content_value if isinstance(content_value, dict) else {}
     session_id = str(data.get("sessionId") or body.get("sessionId") or "")
     project_id = str(data.get("projectid") or data.get("projectId") or data.get("projectID") or body.get("projectid") or body.get("projectId") or body.get("projectID") or "")
     content = _message_content(content_value)
-    entry_module = normalize_entry_module(_first_field((content_object, body, data, raw), ENTRY_MODULE_KEYS))
-    entry_action = str(_first_field((content_object, body, data, raw), ENTRY_ACTION_KEYS) or "").strip()
+    entry_module = "global_fanout" if is_bga_escape else normalize_entry_module(_first_field((content_object, body, data, raw), ENTRY_MODULE_KEYS))
+    decision = str(body.get("decision") or "").strip()
+    entry_action = decision.lower() if is_bga_escape and decision else str(_first_field((content_object, body, data, raw), ENTRY_ACTION_KEYS) or "").strip()
     entry_payload = _entry_payload((data, body, content_object), entry_module, entry_action)
+    if is_bga_escape:
+        entry_payload["decision"] = decision or "NEW"
+        if body.get("type") not in (None, ""):
+            entry_payload["routingParamType"] = body.get("type")
     return UserMessage(session_id, project_id, content, entry_module=entry_module, entry_action=entry_action, entry_payload=entry_payload)
 
 
@@ -176,7 +183,3 @@ def parse_tool_result(data: dict[str, Any]) -> tuple[str, Any] | None:
         return None
     result = content.get("result", content.get("data", content))
     return call_id, _decode_result(result)
-
-
-
-

@@ -242,8 +242,8 @@ def test_reroute_drc_failure_does_not_fallback_to_helper():
         "rerouteDrcFailureCount": 3,
     }
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "finish"
-    assert plan["tool_calls"] == []
+    assert plan["action"] == "explainability"
+    assert plan["tool_calls"][0]["name"] == "explainability_report"
 # ====== 功能：验证真实模型只返回参数时仍由 LangGraph 修复为可执行 fanout 计划。 ======
 def test_model_parameter_only_output_repairs_to_fanout_plan():
     from pcb_agent_langgraph.models.pcb_model import ModelResult
@@ -1445,8 +1445,8 @@ def test_reroute_drc_failure_elapsed_limit_does_not_fallback_to_helper():
         "rerouteStartedAt": time.time() - 5,
     }
     plan = PCBPlanner(use_model=False, config=config).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "finish"
-    assert plan["tool_calls"] == []
+    assert plan["action"] == "explainability"
+    assert plan["tool_calls"][0]["name"] == "explainability_report"
 
 # ====== 功能：验证 fanout 实体跨轮保存，U5 后续选择 135 不会丢失目标 BGA。 ======
 def test_fanout_entities_persist_across_router_turn():
@@ -1572,7 +1572,7 @@ def test_planner_helper_result_runs_full_board_drc_before_import():
     assert plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
 
 
-def test_planner_helper_drc_pass_auto_imports_then_explains():
+def test_planner_helper_drc_pass_explains_then_auto_imports():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
@@ -1583,16 +1583,16 @@ def test_planner_helper_drc_pass_auto_imports_then_explains():
         "drcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
     }
 
-    import_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert import_plan["action"] == "auto_import"
-    assert import_plan["tool_calls"][0]["name"] == "importLines"
-    assert import_plan["tool_calls"][0]["arguments"] == {"filePath": "helper_line.out", "requireApproval": False}
-
-    cache["importLinesResult"] = "布线导入成功"
     explain_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert explain_plan["action"] == "explainability"
     assert explain_plan["tool_calls"][0]["name"] == "explainability_report"
     assert explain_plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
+
+    cache["explainabilityReport"] = {"status": "ok"}
+    import_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert import_plan["action"] == "auto_import"
+    assert import_plan["tool_calls"][0]["name"] == "importLines"
+    assert import_plan["tool_calls"][0]["arguments"] == {"filePath": "helper_line.out", "requireApproval": False}
 
 
 def test_planner_helper_drc_failure_explains_without_import():
@@ -1612,7 +1612,7 @@ def test_planner_helper_drc_failure_explains_without_import():
     assert plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
 
 # ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======
-def test_planner_auto_imports_after_drc_then_calls_explainability():
+def test_planner_generates_report_after_drc_then_auto_imports():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
@@ -1620,15 +1620,15 @@ def test_planner_auto_imports_after_drc_then_calls_explainability():
         "rerouteResult": {"status": "ok", "importLinesFilePath": "vsea_line.out"},
         "drcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
     }
-    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "auto_import"
-    assert plan["tool_calls"][0]["name"] == "importLines"
-    assert plan["tool_calls"][0]["arguments"] == {"filePath": "vsea_line.out", "requireApproval": False}
-
-    cache["importLinesResult"] = "布线导入成功"
-    explain_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "import", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    explain_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
     assert explain_plan["action"] == "explainability"
     assert [call["name"] for call in explain_plan["tool_calls"]] == ["explainability_report"]
+
+    cache["explainabilityReport"] = {"status": "ok"}
+    import_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert import_plan["action"] == "auto_import"
+    assert import_plan["tool_calls"][0]["name"] == "importLines"
+    assert import_plan["tool_calls"][0]["arguments"] == {"filePath": "vsea_line.out", "requireApproval": False}
 
 
 # ====== 功能：验证 help_planner 完整板使用 full-board DRC。 ======
@@ -1998,3 +1998,41 @@ def test_vsea_drc_failure_does_not_auto_import():
     assert plan["action"] == "explainability"
     assert plan["tool_calls"][0]["name"] == "explainability_report"
     assert plan["tool_calls"][0]["arguments"] == {"routedKicadFilePath": "vsea_board.kicad_pcb"}
+
+
+def test_fanout_import_is_automatic_and_waits_for_result_decision():
+    route_cache = {"projectData": "board.txt", "fanoutEntities": {"selectedBGA": "U5", "routerType": "rule_135"}, "layerAssignResult": {"status": "ok"}, "escapeOrderResult": {"status": "ok"}, "fanout_routeResult": {"status": "ok", "importLinesFilePath": "line.out"}}
+    import_plan = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_state": "routing", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": route_cache})
+    assert import_plan["tool_calls"][0]["arguments"]["requireApproval"] is False
+    route_cache["importLinesResult"] = {"status": "ok"}
+    review_plan = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_state": "result_review", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": route_cache})
+    assert review_plan["action"] == "fanout_result_review"
+
+
+def test_restore_requests_route_through_frontend_tools():
+    fanout = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": {"pendingRestore": {"workflow": "fanout", "reason": "retry_params", "stage": "SETTING_PARAMS"}}})
+    assert fanout["tool_calls"][0]["name"] == "restoreFanoutSnapshot"
+    reroute = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": {"pendingRestore": {"workflow": "reroute", "reason": "discard"}}})
+    assert reroute["tool_calls"][0]["name"] == "restoreRerouteSnapshot"
+
+
+def test_reroute_import_and_report_wait_for_result_decision():
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteResult": {"status": "ok", "importLinesFilePath": "line.out"}, "drcResult": {"status": "ok", "passed": True}, "importLinesResult": {"status": "ok"}, "explainabilityReport": {"status": "ok"}}
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_state": "result_review", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "reroute_result_review"
+
+
+def test_accepted_results_finish_without_another_import():
+    fanout = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_id": "pcb_escape_flow", "task_type": "global_fanout", "intermediate_cache": {"resultAccepted": True, "importLinesResult": {"status": "ok"}}})
+    assert fanout["action"] == "finish"
+    assert fanout["tool_calls"] == []
+    reroute = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": {"resultAccepted": True, "importLinesResult": {"status": "ok"}}})
+    assert reroute["action"] == "finish"
+    assert reroute["tool_calls"] == []
+
+
+def test_reroute_without_drc_does_not_auto_import():
+    cache = {"deleteTracesResult": {"status": "ok"}, "rerouteInput": {"status": "ok"}, "rerouteContext": {"status": "ok"}, "rerouteResult": {"status": "ok", "importLinesFilePath": "line.out"}}
+    plan = PCBPlanner(use_model=False).plan({"user_input": "", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "reroute_validation_missing"
+    assert plan["tool_calls"] == []

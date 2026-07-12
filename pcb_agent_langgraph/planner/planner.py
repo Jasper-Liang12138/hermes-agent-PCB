@@ -30,6 +30,16 @@ def _drc_passed(result: Any) -> bool:
 def _stage_ok(result: Any) -> bool:
     return isinstance(result, dict) and str(result.get("status", "")).lower() == "ok"
 
+def _import_succeeded(result: Any) -> bool:
+    if result in (None, "", False):
+        return False
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return False
+        return str(result.get("status") or "").lower() not in {"failed", "error", "failure", "rejected", "cancelled"}
+    text = str(result).lower()
+    return not any(token in text for token in ("failed", "error", "failure", "rejected", "cancel", "失败", "错误", "拒绝", "取消"))
+
 def _reroute_provider(config: AppConfig | None) -> str:
     if config is None:
         return "vsea"
@@ -240,8 +250,25 @@ class PCBPlanner:
         if explicit_entry is None and self._is_cancel(text) and not (workflow_state == "review" and state.get("workflow_id") == "pcb_escape_flow" and _is_reject_import_text(text)):
             return {"intent": "qa", "workflow": "idle", "action": "cancel_flow", "response": "已取消当前 PCB 流程。", "tool_calls": []}
 
+        pending_restore = cache.get("pendingRestore") if isinstance(cache.get("pendingRestore"), dict) else {}
+        if pending_restore:
+            restore_workflow = str(pending_restore.get("workflow") or "")
+            tool_name = "restoreFanoutSnapshot" if restore_workflow == "fanout" else "restoreRerouteSnapshot"
+            arguments = {
+                key: value
+                for key, value in pending_restore.items()
+                if key in {"workflow", "reason", "snapshotId"} and value not in (None, "")
+            }
+            intent = "global_fanout" if restore_workflow == "fanout" else "reroute"
+            workflow = "pcb_escape_flow" if restore_workflow == "fanout" else "pcb_reroute_flow"
+            return self._with_calls(intent, workflow, "restore_snapshot", [{"name": tool_name, "arguments": arguments, "timeout": 360.0}])
+
         if explicit_entry == "reroute" or (explicit_entry is None and (self._is_reroute(text) or state.get("task_type") == "reroute" or state.get("workflow_id") == "pcb_reroute_flow")):
             # reroute 由 LangGraph 控制阶段推进：前端拆线 -> 重布 -> 导入 -> DRC/解释 -> 必要时 help_planner 兜底。
+            if cache.get("resultAccepted"):
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "已接受当前拆线重布结果。"}
+            if cache.get("resultDiscarded"):
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "已恢复拆线重布前的原始版图并放弃本次结果。"}
             if not cache.get("deleteTracesResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_entry", [{"name": "deleteTracesForRerouting", "arguments": {}, "timeout": 360.0}])
             if not _stage_ok(cache.get("rerouteInput")):
@@ -273,27 +300,39 @@ class PCBPlanner:
                 return self._with_calls("reroute", "pcb_reroute_flow", "helper_drc", [{"name": "drc_check", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0}])
             if helper_result:
                 helper_drc = cache.get("helperDrcResult")
+                if helper_board and helper_drc and not cache.get("explainabilityReport"):
+                    return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0}])
                 if _drc_passed(helper_drc) and import_file and not cache.get("importLinesResult"):
                     return self._with_calls("reroute", "pcb_reroute_flow", "auto_import", [{"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0}])
-                if helper_board and helper_drc and not cache.get("explainabilityReport") and (_drc_failed(helper_drc) or cache.get("importLinesResult")):
-                    return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0}])
-
-                response = "helper 结果缺少完整 .kicad_pcb，已停止且未导入。" if not helper_board else "helper 局部布线验证、导入和可解释性报告已完成。"
+                if cache.get("importLinesResult") and not _import_succeeded(cache.get("importLinesResult")):
+                    return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "import_failed", "tool_calls": [], "response": "拆线重布结果自动导入失败，请重试导入或选择恢复原版图。"}
+                if helper_board and _drc_passed(helper_drc) and _import_succeeded(cache.get("importLinesResult")) and cache.get("explainabilityReport"):
+                    return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_result_review", "tool_calls": [], "response": "拆线重布结果已自动导入，DRC 和报告已完成。请选择：接受、放弃或重布。"}
+                response = "helper 结果缺少完整 .kicad_pcb，已停止且未导入。" if not helper_board else "helper 局部布线验证未通过，结果未导入。"
                 return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": response}
-            if _drc_failed(cache.get("drcResult")):
+            if not cache.get("drcResult"):
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_validation_missing", "tool_calls": [], "response": "拆线重布结果缺少有效 DRC 检查，已停止自动导入。"}
+            if cache.get("drcResult") and not cache.get("explainabilityReport"):
                 routed_board = _helper_routed_board(cache)
-                if routed_board and not cache.get("explainabilityReport"):
-                    return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {"routedKicadFilePath": routed_board}, "timeout": 360.0}])
+                arguments = {"routedKicadFilePath": routed_board} if routed_board else {}
+                return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": arguments, "timeout": 360.0}])
+            if not _drc_passed(cache.get("drcResult")):
                 return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "DRC did not pass; reroute output was not imported."}
+            if not import_file:
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "import_unavailable", "tool_calls": [], "response": "拆线重布结果缺少可导入文件，未进入结果确认。"}
             if import_file and not cache.get("importLinesResult"):
                 return self._with_calls("reroute", "pcb_reroute_flow", "auto_import", [{"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0}])
-            if cache.get("importLinesResult") and not cache.get("explainabilityReport"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}])
-            return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "局部拆线重布已自动导入，DRC 和可解释性报告已完成。"}
+            if cache.get("importLinesResult") and not _import_succeeded(cache.get("importLinesResult")):
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "import_failed", "tool_calls": [], "response": "拆线重布结果自动导入失败，请重试导入或选择恢复原版图。"}
+            return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_result_review", "tool_calls": [], "response": "拆线重布结果已自动导入，DRC 和报告已完成。请选择：接受、放弃或重布。"}
 
 
         if explicit_entry == "global_fanout" or (explicit_entry is None and (self._is_fanout(text) or state.get("task_type") == "global_fanout" or state.get("workflow_id") == "pcb_escape_flow" or (workflow_state == "result_review" and re.search(r"重新|重来|again|rerun", lower)))):
             # fanout 允许用户直接指定 U5/BGA 和线宽线距；未指定目标时必须先调用脚本提取 BGA 并展示候选。
+            if cache.get("resultAccepted"):
+                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "finish", "tool_calls": [], "response": "已接受当前逃逸布线结果。"}
+            if cache.get("resultCancelled"):
+                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "finish", "tool_calls": [], "response": "已恢复逃逸布线前的版图并取消本次结果。"}
             candidates = cache.get("bgaCandidates") if isinstance(cache.get("bgaCandidates"), list) else []
             if not cache.get("projectData") and not state.get("pcb_project"):
                 return self._with_calls("global_fanout", "pcb_escape_flow", "get_project", [{"name": "getProjectData", "arguments": {}, "timeout": 360.0}])
@@ -308,7 +347,7 @@ class PCBPlanner:
                 return self._with_calls("global_fanout", "pcb_escape_flow", "layer_assign", [{"name": "layer_assign", "arguments": _fanout_args(entities), "timeout": 360.0}])
             if not cache.get("escapeOrderResult"):
                 return self._with_calls("global_fanout", "pcb_escape_flow", "escape_order", [{"name": "escape_order", "arguments": _fanout_args(entities), "timeout": 360.0}])
-            if not cache.get("fanout_routeResult") and workflow_state != "param_review":
+            if not cache.get("fanout_routeResult") and workflow_state != "param_review" and not cache.get("fanoutParamsConfirmed"):
                 return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "fanout_params_review", "tool_calls": [], "response": "已生成逃逸层分配和逃逸顺序参数，请确认后开始布线。", "entities": entities}
             if not cache.get("fanout_routeResult") and workflow_state == "param_review" and not cache.get("fanoutParamsConfirmed") and not _is_confirm_text(text):
                 return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "wait_fanout_params_confirm", "tool_calls": [], "response": "当前正在等待 fanout 参数确认。请在参数面板确认/修改后提交，或回复“确认”开始布线。", "entities": entities}
@@ -318,9 +357,11 @@ class PCBPlanner:
                 return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "cancel_import", "tool_calls": [], "response": "已取消导入，fanout 结果保留在文件中。", "entities": entities}
             import_file = self._extract_import_file(cache.get("fanout_routeResult"))
             if import_file and not cache.get("importLinesResult"):
-                return self._with_calls("global_fanout", "pcb_escape_flow", "import", [{"name": "importLines", "arguments": {"filePath": import_file, "successPins": [], "failedPins": []}, "timeout": 360.0}])
-            if cache.get("importLinesResult"):
-                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "finish", "tool_calls": [], "response": "Fanout 结果已导入，请在 PCB 版图中确认结果。"}
+                return self._with_calls("global_fanout", "pcb_escape_flow", "import", [{"name": "importLines", "arguments": {"filePath": import_file, "successPins": [], "failedPins": [], "requireApproval": False}, "timeout": 360.0}])
+            if cache.get("importLinesResult") and not _import_succeeded(cache.get("importLinesResult")):
+                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "import_failed", "tool_calls": [], "response": "逃逸布线结果自动导入失败，请重试导入或选择取消。", "entities": entities}
+            if _import_succeeded(cache.get("importLinesResult")):
+                return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "fanout_result_review", "tool_calls": [], "response": "逃逸布线结果已自动导入并生成报告。请选择：接受、重试或取消。"}
             return {"intent": "global_fanout", "workflow": "pcb_escape_flow", "action": "finish", "tool_calls": [], "response": "Fanout 布线已完成，结果尚未导入。"}
         if "drc" in lower or "解释" in text or "为什么" in text or "report" in lower:
             if cache.get("drcResult") and cache.get("explainabilityReport") and state.get("task_type") == "qa":

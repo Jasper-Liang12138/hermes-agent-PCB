@@ -15,6 +15,8 @@ def build_tool_registry(config: AppConfig, frontend_sender: FrontendToolSender |
         "getProjectData": FrontendTool("getProjectData", frontend_sender),
         "importLines": FrontendTool("importLines", frontend_sender),
         "deleteTracesForRerouting": FrontendTool("deleteTracesForRerouting", frontend_sender),
+        "restoreFanoutSnapshot": FrontendTool("restoreFanoutSnapshot", frontend_sender),
+        "restoreRerouteSnapshot": FrontendTool("restoreRerouteSnapshot", frontend_sender),
         "layer_assign": ExternalProgramTool("layer_assign", config),
         "escape_order": ExternalProgramTool("escape_order", config),
         "fanout_route": ExternalProgramTool("fanout_route", config),

@@ -118,7 +118,7 @@ class GraphNodes:
     async def _invoke_with_progress(self, tool: Tool, call: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         session_id = str(context.get("session_id") or "")
         tool_name = str(call.get("name") or "工具")
-        is_frontend_tool = tool_name in {"getProjectData", "importLines", "deleteTracesForRerouting"}
+        is_frontend_tool = tool_name in {"getProjectData", "importLines", "deleteTracesForRerouting", "restoreFanoutSnapshot", "restoreRerouteSnapshot"}
         if self.progress_sender and session_id and not is_frontend_tool:
             await self.progress_sender(session_id, _tool_progress_start_message(call))
         task = asyncio.create_task(invoke_tool(tool, call, context))
@@ -147,9 +147,13 @@ class GraphNodes:
         final_drc_passed = isinstance(cache.get("drcResult"), dict) and cache.get("drcResult", {}).get("passed") is True
         planner_output = state.get("planner_output", {}) or {}
         action = str(planner_output.get("action") or "")
+        terminal_decision = action == "finish" and any(cache.get(key) for key in ("resultAccepted", "resultCancelled", "resultDiscarded"))
         selection = planner_output.get("selection") if isinstance(planner_output.get("selection"), list) else None
         fanout_params = cache.get("fanoutParams") if isinstance(cache.get("fanoutParams"), dict) else None
-        if action == "select_bga":
+        if terminal_decision:
+            message = planner_output.get("response") or "当前布线结果确认流程已结束。"
+            workflow_state = "completed"
+        elif action == "select_bga":
             message = planner_output.get("response") or "检测到多个 BGA/高引脚器件，请选择要逃逸布线的器件。"
             workflow_state = "select_bga"
         elif action == "router_type_prompt":
@@ -158,6 +162,12 @@ class GraphNodes:
         elif action in {"fanout_params_review", "wait_fanout_params_confirm"}:
             message = planner_output.get("response") or "已生成逃逸参数，请确认后开始布线。"
             workflow_state = "param_review"
+        elif action == "fanout_result_review":
+            message = planner_output.get("response") or "逃逸布线结果已导入。请选择：接受、重试或取消。"
+            workflow_state = "result_review"
+        elif action == "reroute_result_review":
+            message = planner_output.get("response") or "拆线重布结果已导入。请选择：接受、放弃或重布。"
+            workflow_state = "result_review"
         elif action in {"route_review", "wait_route_import_confirm"}:
             message = planner_output.get("response") or "逃逸布线已生成，是否导入到 PCB 版图？请回复“确认导入”或“取消导入”。"
             workflow_state = "review"
@@ -201,14 +211,27 @@ class GraphNodes:
             workflow_state = "idle"
         report_payload: dict[str, Any] = {}
         markdown_report = ""
-        if task_type == "global_fanout" and cache.get("importLinesResult"):
+        if task_type == "global_fanout" and _import_lines_succeeded(cache.get("importLinesResult")) and not terminal_decision:
             report_payload = build_fanout_route_report(cache)
+            report_payload["stage"] = "result_review"
+            report_payload["availableActions"] = [
+                {"action": "accept", "label": "接受"},
+                {"action": "retry", "label": "重试", "stages": ["CHOOSING_BGA", "SETTING_PARAMS", "ROUTING"]},
+                {"action": "cancel", "label": "取消"},
+            ]
             message = str(report_payload.get("report") or report_payload.get("markdown") or message)
         elif action in {"route_review", "wait_route_import_confirm"}:
             route = cache.get("fanout_routeResult") if isinstance(cache.get("fanout_routeResult"), dict) else {}
             report_payload = {"task": "global_fanout", "stage": "import_pending", "routingResult": route.get("routingResult"), "importLinesFilePath": route.get("importLinesFilePath"), "workDir": route.get("workDir")}
-        elif action in {"reroute_report", "wait_reroute_import_confirm"} or (task_type == "reroute" and (cache.get("drcResult") or cache.get("importLinesResult"))):
+        elif not terminal_decision and (action in {"reroute_report", "wait_reroute_import_confirm"} or (task_type == "reroute" and (cache.get("drcResult") or cache.get("importLinesResult")))):
             report_payload = build_markdown_report(task_type, cache)
+            if action == "reroute_result_review" or cache.get("importLinesResult"):
+                report_payload["stage"] = "result_review"
+                report_payload["availableActions"] = [
+                    {"action": "accept", "label": "接受"},
+                    {"action": "discard", "label": "放弃"},
+                    {"action": "rerun", "label": "重布"},
+                ]
             markdown_report = str(report_payload.get("markdown") or "")
             if markdown_report:
                 message = markdown_report
@@ -300,6 +323,9 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
     elif tool_name == "deleteTracesForRerouting":
         cache["deleteTracesResult"] = result
         if isinstance(result, dict):
+            snapshot_id = result.get("snapshotId") or result.get("snapshot_id") or result.get("originalSnapshotId")
+            if snapshot_id:
+                cache["originalSnapshotId"] = snapshot_id
             cache["projectData"] = result.get("projectData") or result.get("project_data") or result.get("boardData") or cache.get("projectData")
             missing_routes = result.get("missing_routes") or result.get("missingRoutes") or []
             if isinstance(missing_routes, list):
@@ -325,6 +351,10 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
             cache.pop("importLinesRejected", None)
             cache.pop("importLinesRejectedReason", None)
             cache["importLinesResult"] = result
+    elif tool_name in {"restoreFanoutSnapshot", "restoreRerouteSnapshot"}:
+        cache["restoreResult"] = result
+        if _restore_succeeded(result):
+            _complete_snapshot_restore(cache)
     elif tool_name == "pcb_extra_bga":
         cache["bgaCandidates"] = (result or {}).get("components", []) if isinstance(result, dict) else []
     elif tool_name == "prepare_reroute_inputs":
@@ -527,12 +557,63 @@ def _tool_progress_suffix(record: dict[str, Any]) -> str:
     return "已完成，继续处理..."
 
 
+# ====== 功能：占位恢复工具必须明确返回成功，unavailable/not implemented 不得清缓存。 ======
+def _restore_succeeded(result: Any) -> bool:
+    if isinstance(result, dict):
+        if result.get("success") is True:
+            return True
+        return str(result.get("status") or "").strip().lower() in {"ok", "success", "completed"}
+    if isinstance(result, str):
+        text = result.strip().lower()
+        if any(token in text for token in ("unavailable", "not implemented", "未实现", "未提供", "失败", "错误")):
+            return False
+        return any(token in text for token in ("success", "completed", "成功", "已恢复"))
+    return result is True
+
+# ====== 功能：恢复工具成功后按决策阶段清理本轮结果。 ======
+def _complete_snapshot_restore(cache: dict[str, Any]) -> None:
+    request = cache.get("pendingRestore") if isinstance(cache.get("pendingRestore"), dict) else {}
+    workflow = str(request.get("workflow") or "")
+    reason = str(request.get("reason") or "")
+    if workflow == "fanout":
+        common = ("fanout_routeResult", "importLinesResult", "importLinesRejected", "importLinesRejectedReason", "drcResult", "explainabilityReport", "resultAccepted")
+        for key in common:
+            cache.pop(key, None)
+        if reason == "retry_choose_bga":
+            for key in ("fanoutEntities", "fanoutParams", "fanoutParamsConfirmed", "layerAssignResult", "escapeOrderResult"):
+                cache.pop(key, None)
+            cache["resumeWorkflowState"] = "select_bga"
+        elif reason == "retry_params":
+            for key in ("fanoutParams", "fanoutParamsConfirmed", "layerAssignResult", "escapeOrderResult"):
+                cache.pop(key, None)
+            cache["resumeWorkflowState"] = "idle"
+        elif reason == "retry_routing":
+            cache["fanoutParamsConfirmed"] = True
+            cache["resumeWorkflowState"] = "param_review"
+        elif reason == "cancel":
+            cache["resultCancelled"] = True
+    else:
+        for key in (
+            "deleteTracesResult", "rerouteInput", "localRouteCsvPath", "rerouteContext", "rerouteLoopResult",
+            "rerouteResult", "lastRerouteResult", "rerouteStartedAt", "rerouteAttemptCount",
+            "rerouteDrcFailureCount", "rerouteDrcFeedbackHistory", "helpPlannerResult", "importLinesResult",
+            "helperDrcResult", "drcResult", "lastDrcResult", "explainabilityReport", "resultAccepted",
+        ):
+            cache.pop(key, None)
+        if reason == "discard":
+            cache["resultDiscarded"] = True
+        elif reason == "rerun":
+            cache["resumeWorkflowState"] = "idle"
+    cache["resultDecisionPending"] = False
+    cache.pop("pendingRestore", None)
+
 # ====== 功能：判断工具结果是否表示失败。 ======
 def _result_failed(result: Any) -> bool:
     if _import_lines_rejected(result):
         return True
     return isinstance(result, dict) and (
-        str(result.get("status", "")).lower() in {"failed", "error"}
+        result.get("success") is False
+        or str(result.get("status", "")).lower() in {"failed", "error"}
         or result.get("passed") is False
     )
 
