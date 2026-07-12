@@ -137,6 +137,7 @@ def _frontend_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, 
             "filePath": str(arguments.get("filePath") or arguments.get("path") or ""),
             "successPins": list(arguments.get("successPins") or []),
             "failedPins": list(arguments.get("failedPins") or []),
+            "requireApproval": bool(arguments.get("requireApproval", True)),
         }
     return dict(arguments)
 

@@ -35,11 +35,14 @@ config.live.ini
 .env.*
 
 # Logs and temporary files
+agent_logs/
 *.log
 *.tmp
 *.bak
 Thumbs.db
 .DS_Store
+._*
+__MACOSX/
 
 # Model weights and inference outputs
 explain_model/model/*.pt

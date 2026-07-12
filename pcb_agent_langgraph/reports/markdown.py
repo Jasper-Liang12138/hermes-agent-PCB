@@ -11,35 +11,16 @@ from typing import Any
 def build_markdown_report(task_type: str, cache: dict[str, Any]) -> dict[str, Any]:
     drc = cache.get("drcResult") if isinstance(cache.get("drcResult"), dict) else {}
     explain = cache.get("explainabilityReport") if isinstance(cache.get("explainabilityReport"), dict) else {}
-    route = _route_result(cache, task_type)
-    import_result = cache.get("importLinesResult") if isinstance(cache.get("importLinesResult"), dict) else {}
-
     title = "PCB Reroute Report" if task_type == "reroute" else "PCB Fanout Report" if task_type == "global_fanout" else "PCB Report"
     passed = drc.get("passed")
     status = "passed" if passed is True else str(drc.get("status") or "unknown")
-    lines = [
-        f"# {title}",
-        "",
-        "## Summary",
-        f"- Task: `{task_type or 'unknown'}`",
-        f"- DRC: `{status}`",
-        f"- Imported: `{str(import_result.get('status') or 'unknown')}`",
-    ]
-    route_path = _first_text(route.get("routedKicadFilePath"), route.get("routedLayoutTxtFilePath"), route.get("routingResult"), route.get("importLinesFilePath"))
-    if route_path:
-        lines.append(f"- Routed output: `{route_path}`")
-
-    lines.extend(["", "## DRC"])
-    lines.extend(_drc_lines(drc))
-    lines.extend(["", "## Explainability"])
-    lines.extend(_explain_lines(explain))
-
+    lines = [f"# {title}", "", "## DRC", *_drc_lines(drc), "", "## Explainability", *_explain_lines(explain)]
     report = "\n".join(lines).strip() + "\n"
     return {
         "markdown": report,
         "drcStatus": status,
         "drcPassed": passed is True,
-        "routeOutput": route_path,
+        "routeOutput": "",
         "explainStatus": explain.get("status") if isinstance(explain, dict) else "",
     }
 

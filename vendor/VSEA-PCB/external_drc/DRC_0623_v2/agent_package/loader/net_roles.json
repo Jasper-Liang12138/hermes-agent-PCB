@@ -1,0 +1,23 @@
+{
+  "signal_nets": [
+      "NET_U1_A1",
+      "NET_U1_A2",
+      "NET_U1_B1",
+      "NET_U1_B4"
+
+  ],
+  "power_nets": [
+      "NET_U1_C1",
+      "NET_U1_C4",
+      "NET_U1_D2",
+      "NET_U1_B2"
+  ],
+  "ground_nets": [
+      "NET_U1_B3",
+      "NET_U1_C2",
+      "NET_U1_C3"
+  ],
+  "ignore_nets": [
+    ""
+  ]
+}

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from configparser import ConfigParser
 from dataclasses import dataclass, field
@@ -81,8 +81,8 @@ class RerouteLoopConfig:
     provider: str = "vsea"
     pipeline_root: str = ".\\vendor\\VSEA-PCB"
     ai_pcb_eval_path: str = ".\\vendor\\AI-PCB-Eval"
-    drc_agent_package: str = "..\\external_drc\\DRC_0623_v2\\agent_package"
-    agent_drc_python: str = ""
+    drc_agent_package: str = ".\\vendor\\VSEA-PCB\\external_drc\\DRC_0623_v2\\agent_package"
+    agent_drc_python: str = ".\\runtime\\explain_python\\python.exe"
     max_rounds: int = 2
     samples: int = 2
     repair_samples: int = 2
@@ -140,6 +140,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             parser.read(candidate, encoding="utf-8-sig")
             source = candidate
             break
+
+    config_root = source.resolve().parent if source is not None else root
 
     model = ModelConfig()
     # 统一 pcb-model：意图识别、工具规划和 reroute 都从 [reroute-model] 读取。
@@ -227,7 +229,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     board_data_use_file_path = parser.getboolean("model", "board_data_use_file_path", fallback=True) if parser.has_section("model") else True
     return AppConfig(
-        root=root,
+        root=config_root,
         source_config=source,
         model=model,
         router=router,

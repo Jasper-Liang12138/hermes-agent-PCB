@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
@@ -25,8 +25,7 @@ def build_tool_registry(config: AppConfig, frontend_sender: FrontendToolSender |
         "compress_reroute_context": ExternalProgramTool("compress_reroute_context", config),
         "help_planner": ExternalProgramTool("help_planner", config),
         "pcb_extra_bga": AnalysisTool("pcb_extra_bga", config),
-        # Legacy drc_check is intentionally not registered; VSEA hard DRC is trusted for reroute.
-        # "drc_check": AnalysisTool("drc_check", config),
+        "drc_check": AnalysisTool("drc_check", config),
         "explainability_report": AnalysisTool("explainability_report", config),
     }
     return tools

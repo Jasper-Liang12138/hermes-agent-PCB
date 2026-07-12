@@ -1,0 +1,837 @@
+from collections import defaultdict, deque
+import math
+
+from geometry.geometry_utils import near_point, dist
+from rules.rule_helpers.bga_geometry import is_top_layer
+from rules.rule_helpers.board_filters import _is_signal_net, _is_named_net
+
+PAD_CONN_TOL = 0.12 # pad 与 segment 连接的距离容差
+PAD_NEAR_VIA_TOL = 0.20 # pad 与 via 认为是“直接邻接”的距离容差，考虑到实际设计中可能存在的 pad/via 尺寸和位置误差
+SHARED_POINT_TOL = 0.12 # 用于判断两个 segment 是否通过共享端点相交的距离容差。考虑到实际设计中可能存在的微小重叠或间隙，设置一个合理的容差可以避免误报。
+
+# 新增：允许沿第一跳局部连通搜索 via 的最大路径长度
+FANOUT_SEARCH_MAX_DEPTH = 6
+
+def _point_of_pad(pad):
+    """返回 pad 的坐标点，格式为 (x, y)。"""
+    return (pad.x, pad.y)
+
+
+def _point_of_via(via):
+    """返回 via 的坐标点，格式为 (x, y)。"""
+    return (via.x, via.y)
+
+def _point_to_segment_distance(p, a, b):
+    px, py = p
+    ax, ay = a
+    bx, by = b
+
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+
+    ab_len2 = abx * abx + aby * aby
+    if ab_len2 == 0.0:
+        return math.hypot(px - ax, py - ay)
+
+    t = (apx * abx + apy * aby) / ab_len2
+    t = max(0.0, min(1.0, t))
+
+    cx = ax + t * abx
+    cy = ay + t * aby
+
+    return math.hypot(px - cx, py - cy)
+
+def _segment_touches_pad(seg, pad_p, effective_r):
+    """
+    判断一条 segment 是否接触 pad 的有效区域。
+
+    这里将 pad 近似为以 pad 中心为圆心、effective_r 为半径的圆。
+    如果线段到 pad 中心的最短距离 <= effective_r，则认为接触。
+    """
+    d = _point_to_segment_distance(pad_p, seg.start, seg.end)
+    return d <= effective_r
+
+def _segment_endpoint_touches_pad(seg, pad_p, effective_r):
+    return (
+        math.hypot(seg.start[0] - pad_p[0], seg.start[1] - pad_p[1]) <= effective_r 
+        or
+        math.hypot(seg.end[0] - pad_p[0], seg.end[1] - pad_p[1]) <= effective_r
+    )
+
+def _touching_segments_for_pad(board, pad, tol=None):
+    """
+    返回与 pad 直接接触的同网 signal segment 列表。
+
+    判定原则：
+    1. segment 与 pad 必须同网
+    2. 只考虑 signal net
+    3. 判断整条 segment 是否进入 pad 的有效接触区域
+    """
+    if tol is None:
+        tol = _pad_contact_tol(pad)
+
+    pad_p = _point_of_pad(pad)
+
+    # 注意：这里是否需要 pad_r + tol，要看 _pad_contact_tol 的定义
+    effective_r = tol
+
+    out = []
+
+    for seg in board.segments:
+        if seg.net != pad.net:
+            continue
+        if not _is_signal_net(seg.net):
+            continue
+
+        if _segment_endpoint_touches_pad(seg, pad_p, effective_r):
+            out.append(seg)
+
+    return out
+
+
+def _touching_vias_for_pad(board, pad, tol=None):
+    if tol is None:
+        tol = _pad_contact_tol(pad)
+    """返回与 pad 直接接触的同网 via 列表，考虑到实际设计中可能存在的尺寸和位置误差，使用一个合理的距离容差 tol 来判断接触关系。"""
+    pad_p = _point_of_pad(pad)
+    out = []
+
+    for via in board.vias:
+        if via.net != pad.net:
+            continue
+        if not _is_signal_net(via.net):
+            continue
+
+        if near_point(_point_of_via(via), pad_p, tol):
+            out.append(via)
+
+    return out
+
+def _build_via_spatial_index(board, grid=0.2):
+    """
+    把 via 按空间位置分桶。
+    key 是网格坐标 (gx, gy)，value 是落在这个网格里的 via 列表。
+    """
+    index = defaultdict(list)
+
+    for via in board.vias:
+        if not _is_signal_net(via.net):
+            continue
+
+        gx = int(via.x / grid)
+        gy = int(via.y / grid)
+        index[(gx, gy)].append(via)
+
+    return index
+
+def _query_nearby_vias(via_index, point, grid=0.2):
+    """
+    查询 point 附近 3x3 网格内的所有 via 候选。
+    这里只返回候选，不在这里做精确 near_point 判断。
+    """
+    x, y = point
+    gx = int(x / grid)
+    gy = int(y / grid)
+
+    candidates = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            candidates.extend(via_index.get((gx + dx, gy + dy), []))
+
+    return candidates
+
+def _segments_connected_near_pad(seg1, seg2, pad_p, pad_tol):
+    pts1 = [seg1.start, seg1.end]
+    pts2 = [seg2.start, seg2.end]
+
+    for p1 in pts1:
+        for p2 in pts2:
+            if near_point(p1, p2, PAD_CONN_TOL) and near_point(p1, pad_p, pad_tol):
+                return True
+
+    return False
+
+def _cluster_touching_segments_near_pad(segments, pad_p, pad_tol):
+    clusters = []
+    visited = set()
+
+    for seg in segments:
+        sid = getattr(seg, "id", None)
+        if sid in visited:
+            continue
+
+        cluster = []
+        stack = [seg]
+        visited.add(sid)
+
+        while stack:
+            cur = stack.pop()
+            cluster.append(cur)
+
+            for other in segments:
+                oid = getattr(other, "id", None)
+                if oid in visited:
+                    continue
+                if _segments_connected_near_pad(cur, other, pad_p, pad_tol):
+                    visited.add(oid)
+                    stack.append(other)
+
+        clusters.append(cluster)
+
+    return clusters
+
+def _cluster_external_endpoints(cluster, pad_p, pad_tol):
+    pts = []
+
+    for seg in cluster:
+        pts.append(seg.start)
+        pts.append(seg.end)
+
+    external = []
+
+    for p in pts:
+        if near_point(p, pad_p, pad_tol):
+            continue
+
+        internal_match_count = 0
+        for q in pts:
+            if p is q:
+                continue
+            if near_point(p, q, PAD_CONN_TOL):
+                internal_match_count += 1
+
+        if internal_match_count == 0:
+            external.append(p)
+
+    uniq = []
+    for p in external:
+        if not any(near_point(p, q, PAD_CONN_TOL) for q in uniq):
+            uniq.append(p)
+
+    return uniq
+
+def _count_initial_escape_choices(board, pad):
+    """
+    只统计 BGA pad 在起始层的第一跳 escape 选择数。
+    这一版不追踪 via 后续跨层路径，只看 pad 起点是否同时连出多个对象。
+    """
+    pad_layer = getattr(pad, "layer", None)
+    pad_p = _point_of_pad(pad)
+    pad_tol = _pad_contact_tol(pad)
+
+    # 1) pad 所在层上的直接接触 segments
+    touching_segments = []
+    for seg in _touching_segments_for_pad(board, pad):
+        if seg.layer == pad_layer:
+            touching_segments.append(seg)
+    """
+    # 2) pad 所在层上直接邻接的 via
+    touching_vias = []
+
+    for seg in touching_segments:
+        if near_point(seg.start, (pad.x, pad.y), PAD_CONN_TOL):
+            other = seg.end
+        else:
+            other = seg.start
+
+        candidates = _query_nearby_vias(via_index, other, grid=grid)
+
+        for via in candidates:
+            if via.net != pad.net:
+                continue
+
+            if near_point(other, (via.x, via.y), PAD_CONN_TOL):
+                touching_vias.append(via)
+    """
+
+
+    # 3) 去重：避免同一个几何对象重复统计
+    seg_ids = set()
+    unique_segments = []
+    for seg in touching_segments:
+        sid = getattr(seg, "id", None)
+        if sid in seg_ids:
+            continue
+        seg_ids.add(sid)
+        unique_segments.append(seg)
+    """
+    via_ids = set()
+    unique_vias = []
+    for via in touching_vias:
+        vid = getattr(via, "id", None)
+        if vid in via_ids:
+            continue
+        via_ids.add(vid)
+        unique_vias.append(via)
+    """
+    clusters = _cluster_touching_segments_near_pad(unique_segments, pad_p, pad_tol)
+
+    count = 0
+    for cluster in clusters:
+        external_pts = _cluster_external_endpoints(cluster, pad_p, pad_tol)
+        count += len(external_pts)
+
+    return count, unique_segments
+
+def _segments_of_net(board, net: str):
+    return [s for s in board.segments if s.net == net and _is_signal_net(s.net)]
+
+
+def _arcs_of_net(board, net: str):
+    return [a for a in getattr(board, "arcs", []) if a.net == net and _is_signal_net(a.net)]
+
+
+def _vias_of_net(board, net: str):
+    return [v for v in board.vias if v.net == net and _is_signal_net(v.net)]
+
+def _canonical_point(p, grid=1e-4):
+
+    return (round(p[0] / grid) * grid, round(p[1] / grid) * grid)
+
+def _pad_contact_tol(pad,extra=0.015):
+    # 根据 pad 的尺寸估算一个接触容差，考虑到实际设计中可能存在的尺寸和位置误差，使用一个合理的距离容差来判断接触关系。
+    # 这里简单地根据 pad 的尺寸（例如宽度和长度）来计算一个容差值，可以根据实际情况调整这个函数。
+    r = max(getattr(pad, "size_x", 0.0), getattr(pad, "size_y", 0.0)) * 0.5
+    return r + extra
+"""
+def _pad_connected_segment_endpoints(board, pad):
+
+    pad_layer = getattr(pad, "layer", None)
+    pad_p = _point_of_pad(pad)
+    pad_tol = _pad_contact_tol(pad)
+
+
+
+    pad_p = (pad.x, pad.y)
+    next_points = []
+
+    for seg in _segments_of_net(board, pad.net):
+
+        tol = _pad_contact_tol(pad)
+        hit_start = near_point(seg.start, pad_p, tol)
+        hit_end = near_point(seg.end, pad_p, tol)
+
+        if hit_start and not hit_end:
+            next_points.append(seg.end)
+        elif hit_end and not hit_start:
+            next_points.append(seg.start)
+        elif hit_start and hit_end:
+            # 极短 segment，保守处理
+            next_points.append(seg.start)
+            next_points.append(seg.end)
+
+    return next_points
+"""
+
+def _pad_connected_segment_endpoints(board, pad):
+    pad_layer = getattr(pad, "layer", None)
+    pad_p = _point_of_pad(pad)
+    pad_tol = _pad_contact_tol(pad)
+
+    touching_segments = []
+    for seg in _touching_segments_for_pad(board, pad):
+        if seg.layer == pad_layer:
+            touching_segments.append(seg)
+
+    seg_ids = set()
+    unique_segments = []
+    for seg in touching_segments:
+        sid = getattr(seg, "id", None)
+        if sid in seg_ids:
+            continue
+        seg_ids.add(sid)
+        unique_segments.append(seg)
+
+    clusters = _cluster_touching_segments_near_pad(unique_segments, pad_p, pad_tol)
+
+    seed_points = []
+    for cluster in clusters:
+        external_pts = _cluster_external_endpoints(cluster, pad_p, pad_tol)
+        seed_points.extend(external_pts)
+
+    unique_seeds = []
+    seen = set()
+    for p in seed_points:
+        cp = _canonical_point(p)
+        if cp in seen:
+            continue
+        seen.add(cp)
+        unique_seeds.append(p)
+
+    return unique_seeds
+
+def _build_net_connectivity_graph(board, net: str):
+    """
+    针对单个 net 建一个几何连接图：
+    - segment 两端点是节点
+    - via 中心是节点
+    - segment 本身是边
+    - 若 via 与某 segment 端点重合，则连接
+    """
+    graph = defaultdict(set)
+
+    segs = _segments_of_net(board, net)
+    arcs = _arcs_of_net(board, net)
+    vias = _vias_of_net(board, net)
+
+    seg_points = []
+    arc_points = []
+    via_points = []
+
+    for seg in segs:
+        s = _canonical_point(seg.start)
+        e = _canonical_point(seg.end)
+        seg_points.append((seg, s, e))
+        graph[s].add(e)
+        graph[e].add(s)
+
+    # For connectivity, a routed arc is an edge between its exact start/end.
+    # The midpoint describes curvature and is not needed for graph traversal.
+    for arc in arcs:
+        s = _canonical_point(arc.start)
+        e = _canonical_point(arc.end)
+        arc_points.append((arc, s, e))
+        graph[s].add(e)
+        graph[e].add(s)
+
+    for via in vias:
+        v = _canonical_point((via.x, via.y))
+        via_points.append((via, v))
+        graph[v]  # ensure node exists
+
+    # 连接 via 与 segment 端点
+    for via, vp in via_points:
+        real_vp = (via.x, via.y)
+        for seg, s, e in seg_points:
+            if near_point(seg.start, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(s)
+                graph[s].add(vp)
+            if near_point(seg.end, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(e)
+                graph[e].add(vp)
+        for arc, s, e in arc_points:
+            if near_point(arc.start, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(s)
+                graph[s].add(vp)
+            if near_point(arc.end, real_vp, PAD_NEAR_VIA_TOL):
+                graph[vp].add(e)
+                graph[e].add(vp)
+
+    return graph, vias
+
+def _branch_has_fork_inside_bbox(board, pad, seed, bbox):
+    """
+    判断从 seed 出发的分支在 bbox 内是否存在 fork。
+    这里的 fork 指：沿路径遍历时，某个 bbox 内节点在排除来路后，
+    仍然存在多于 1 个前进方向。
+    注意：这里不区分 segment 还是 via，只要在同网连接图里分叉即可。
+    """
+    graph, _ = _build_net_connectivity_graph(board, pad.net)
+
+    start = _canonical_point(seed)
+    visited = {start}
+    queue = deque([(start, None)])  # (node, parent)
+
+    while queue:
+        cur, parent = queue.popleft()
+
+        if _point_outside_bbox(cur, bbox):
+            continue
+
+        neighbors = graph.get(cur, set())
+        forward_neighbors = [nxt for nxt in neighbors if nxt != parent]
+
+        if len(forward_neighbors) > 1:
+            return True
+
+        for nxt in forward_neighbors:
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, cur))
+
+    return False
+
+
+
+def _find_fanout_via_for_pad(board, pad, max_depth=FANOUT_SEARCH_MAX_DEPTH):
+    """
+    判断 pad 的第一跳/局部逃逸路径上是否存在 via。
+    逻辑：
+    1. 若 pad 直接邻接 via，直接返回
+    2. 否则从 pad 直接连接到的 segment 另一端点出发
+    3. 在同网图里 BFS 搜索，有限深度内找到 via 即认为存在 fanout via
+    """
+    direct_vias = _touching_vias_for_pad(board, pad, tol=PAD_NEAR_VIA_TOL)
+    if direct_vias:
+        # 返回最近的
+        direct_vias = sorted(direct_vias, key=lambda v: dist((v.x, v.y), (pad.x, pad.y)))
+        return direct_vias[0]
+
+    seed_points = _pad_connected_segment_endpoints(board, pad)
+    if not seed_points:
+        return None
+
+    graph, vias = _build_net_connectivity_graph(board, pad.net)
+    via_nodes = []
+    for via in vias:
+        via_nodes.append((via, _canonical_point((via.x, via.y))))
+
+    target_node_to_via = {node: via for via, node in via_nodes}
+
+    visited = set()
+    queue = []
+
+    for p in seed_points:
+        cp = _canonical_point(p)
+        queue.append((cp, 0))
+        visited.add(cp)
+
+    while queue:
+        cur, depth = queue.pop(0)
+
+        if cur in target_node_to_via:
+            return target_node_to_via[cur]
+
+        if depth >= max_depth:
+            continue
+
+        for nxt in graph.get(cur, []):
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, depth + 1))
+
+    return None
+
+def _first_top_fanout_segments_for_pad(board, pad):
+    segs = []
+    for seg in _touching_segments_for_pad(board, pad):
+        if is_top_layer(seg.layer):
+            segs.append(seg)
+    return segs
+
+def _estimate_bga_pitch(board, component):
+    """Estimate the BGA pitch for the given component by analyzing the pad positions.
+    This is a heuristic"""
+    xs = []
+    ys = []
+
+    for p in board.pads:
+        if not getattr(p, "is_bga", False):
+            continue
+        if p.component != component:
+            continue
+        xs.append(p.x)
+        ys.append(p.y)
+
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+
+    xs = sorted(set(xs))
+    ys = sorted(set(ys))
+
+    dx = min(abs(xs[i+1] - xs[i]) for i in range(len(xs)-1)) if len(xs) > 1 else None
+    dy = min(abs(ys[i+1] - ys[i]) for i in range(len(ys)-1)) if len(ys) > 1 else None
+
+    if dx and dy:
+        return min(dx, dy)
+    return dx or dy
+
+def _build_bga_bbox(board, component, margin=0.0):
+    """Build a bounding box for the BGA pads of the given component, optionally with a margin."""
+    xs = []
+    ys = []
+
+    for p in board.pads:
+        if not getattr(p, "is_bga", False):
+            continue
+        if p.component != component:
+            continue
+
+        if getattr(p, "bga_row", None) is None:
+            continue
+
+        if getattr(p, "bga_col", None) is None:
+            continue
+        """
+        if component == "U67":
+            print(
+                f"[BBOX PAD] id={getattr(p, 'id', None)} "
+                f"comp={getattr(p, 'component', None)} "
+                f"is_bga={getattr(p, 'is_bga', None)} "
+                f"row={getattr(p, 'bga_row', None)} "
+                f"col={getattr(p, 'bga_col', None)} "
+                f"x={p.x:.4f} y={p.y:.4f}"
+            )
+        """
+
+        xs.append(p.x)
+        ys.append(p.y)
+
+    if not xs or not ys:
+        return None
+    min_x = min(xs) - margin
+    max_x = max(xs) + margin
+    min_y = min(ys) - margin
+    max_y = max(ys) + margin
+
+
+   # if component == "U67":
+    #    print(f"[BBOX RESULT] component={component} xs=({min(xs):.4f},{max(xs):.4f}) ys=({min(ys):.4f},{max(ys):.4f}) margin={margin}")
+
+    return (min_x, max_x, min_y, max_y)
+    #return (min(xs), max(xs), min(ys), max(ys))
+
+
+def _point_outside_bbox(pt, bbox, tol=1e-6):
+    """Check if a point is outside the bounding box with a tolerance."""
+    if bbox is None:
+        return False
+
+    x, y = pt
+    min_x, max_x, min_y, max_y = bbox
+
+    return (
+        x < min_x - tol
+        or x > max_x + tol
+        or y < min_y - tol
+        or y > max_y + tol
+    )
+
+def _endpoint_is_connected(board, seg, pt, pad, tol=0.12):
+    """Check if the given segment endpoint is connected to the pad through any valid path."""
+    # 1) 端点是否直接回到当前 pad
+    if near_point(pt, (pad.x, pad.y), tol):
+        return True
+
+    # 2) 端点是否接到同网 via
+    for via in board.vias:
+        if via.net != seg.net:
+            continue
+        if near_point(pt, (via.x, via.y), tol):
+            return True
+
+    # 3) 端点是否接到另一条同网 segment 的任一端点
+    for other in board.segments:
+        if other.id == seg.id:
+            continue
+        if other.net != seg.net:
+            continue
+
+        if near_point(pt, other.start, tol) or near_point(pt, other.end, tol):
+            return True
+
+    return False
+
+def _is_valid_escape_endpoint(board, net_name, pt, bbox,tol=0.12):
+    """Check if the given point can be considered a valid escape endpoint for the net, meaning it connects to something outside the BGA region."""
+    # 1) 接到同网、且非BGA的 pad
+    for p in board.pads:
+        if p.net != net_name:
+            continue
+        if getattr(p, "is_bga", False):
+            continue
+
+        if p.layer not in ("F.Cu", "B.Cu","TOP","BOTTOM"):
+            continue
+
+        p_pt = (p.x, p.y)
+        if not _point_outside_bbox(p_pt,bbox):
+            continue
+
+        if near_point(pt, p_pt, tol):
+            return True
+    '''
+    # 2) 接到同网 via
+    for via in board.vias:
+        if via.net != net_name:
+            continue
+
+        v_pt = (via.x, via.y)
+        if not _point_outside_bbox(v_pt,bbox):
+            continue
+
+        if near_point(pt, v_pt, tol):
+            return True
+    '''
+
+    return False
+
+def _classify_branch_escape(board, pad, seed_point, bbox, max_depth=200, log_fn=None):
+    """Classify a branch as outside, pad, via, or incomplete."""
+    graph, vias = _build_net_connectivity_graph(board, pad.net)
+    via_by_node = {
+        _canonical_point((via.x, via.y)): via
+        for via in vias
+    }
+
+    start = _canonical_point(seed_point)
+    visited = {start}
+    queue = [(start, 0)]
+    reached_via = None
+
+    if log_fn:
+        log_fn(
+            "debug", 
+            f"[H3 BFS] pad={pad.id} net={pad.net} seed={seed_point} "
+            f"start={start} graph_nodes={len(graph)}"
+        )
+
+    while queue:
+        cur, depth = queue.pop(0)
+        if log_fn:
+            log_fn("debug", f"[H3 BFS] visiting cur={cur} depth={depth}")
+
+
+        if _point_outside_bbox(cur, bbox):
+            if log_fn:
+                log_fn("debug", f"[H3 BFS] EXIT bbox at cur={cur} depth={depth}")
+            return "outside", cur
+        
+        connected_pad = _node_hits_other_pad(board, pad, cur)
+        if connected_pad is not None:
+            if log_fn:
+                log_fn(
+                    "debug",
+                    f"[H3 BFS] HIT pad={connected_pad.id} "
+                    f"component={connected_pad.component} at cur={cur} depth={depth}",
+                )
+            return "pad", connected_pad
+
+        if reached_via is None and cur in via_by_node:
+            reached_via = via_by_node[cur]
+
+        if depth >= max_depth:
+            if log_fn:
+            
+                log_fn("debug", f"[H3 BFS] depth limit reached at cur={cur}")
+            continue
+
+        neighbors = graph.get(cur, [])
+        if log_fn:
+            log_fn("debug", f"[H3 BFS] cur={cur} neighbors={list(neighbors)}")
+
+        for nxt in neighbors:
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, depth + 1))
+
+    if reached_via is not None:
+        return "via", reached_via
+    if log_fn:
+        log_fn("error", f"[H3 BFS] FAILED seed={seed_point} start={start} did not escape bbox")
+    return "incomplete", None
+
+
+def _branch_reaches_outside_bbox(board, pad, seed_point, bbox, max_depth=200, log_fn=None):
+    """Backward-compatible boolean escape check."""
+    status, _ = _classify_branch_escape(
+        board, pad, seed_point, bbox, max_depth=max_depth, log_fn=log_fn
+    )
+    return status in ("outside", "pad")
+
+def _node_hits_other_pad(board, src_pad, node, tol=0.12):
+    """
+    判断当前 BFS 节点 node 是否命中了一个有效的外部 pad。
+    这里先采用保守定义：
+    1) 同网
+    2) 不是当前 BGA component 内的 pad
+    3) 节点靠近该 pad 中心
+    """
+    for pad in board.pads:
+        if pad.net != src_pad.net:
+            continue
+
+        # 排除当前 BGA 自己内部的 pad
+        if pad is src_pad or (
+            getattr(pad, "component", None) == getattr(src_pad, "component", None)
+            and getattr(pad, "id", None) == getattr(src_pad, "id", None)
+        ):
+            continue
+
+        pad_tol = max(tol, _pad_contact_tol(pad))
+        if near_point(node, (pad.x, pad.y), pad_tol):
+            return pad
+
+    return None
+
+
+def _node_hits_valid_non_bga_pad(board, src_pad, node, tol=0.12):
+    return _node_hits_other_pad(board, src_pad, node, tol=tol) is not None
+
+def _collect_escape_endpoints_for_branch(board, net_name, seed_point, bbox, max_depth=200, tol=0.12):
+    """Collect valid escape endpoints that the branch starting from seed_point can reach outside the bbox."""
+    graph, _ = _build_net_connectivity_graph(board, net_name)
+
+    start = _canonical_point(seed_point)
+    visited = {start}
+    queue = [(start, False, 0)]  # (node, outside_seen, depth)
+
+    endpoints = {}
+
+    while queue:
+        cur, outside_seen, depth = queue.pop(0)
+
+        cur_outside = outside_seen or _point_outside_bbox(cur, bbox)
+
+        # 只有路径已经出 box，才开始收集终点
+        if cur_outside:
+            for p in board.pads:
+                if p.net != net_name:
+                    continue
+                if getattr(p, "is_bga", False):
+                    continue
+                if p.layer not in ("F.Cu", "B.Cu"):
+                    continue
+
+                p_pt = (p.x, p.y)
+                if not _point_outside_bbox(p_pt, bbox):
+                    continue
+
+                if near_point(cur, p_pt, tol):
+                    endpoints[p.id] = p
+
+        if depth >= max_depth:
+            continue
+
+        for nxt in graph.get(cur, []):
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, cur_outside, depth + 1))
+
+    return endpoints
+
+
+
+def _collect_escape_endpoints_for_pad(board, pad, bbox):
+    """Collect valid escape endpoints for the given pad by exploring all branches starting from the pad-connected segments."""
+    seed_points = _pad_connected_segment_endpoints(board, pad)
+    if not seed_points:
+        return {}
+
+    unique_seeds = []
+    seen = set()
+    for seed in seed_points:
+        cseed = _canonical_point(seed)
+        if cseed in seen:
+            continue
+        seen.add(cseed)
+        unique_seeds.append(seed)
+
+    endpoints = {}
+    for seed in unique_seeds:
+        branch_endpoints = _collect_escape_endpoints_for_branch(board, pad.net, seed, bbox)
+        endpoints.update(branch_endpoints)
+
+    return endpoints
+
+def _nearest_center_distance(centers, via): # 计算 via 到最近的 cell center 的距离
+    if not centers:
+        return None
+    dmin = None
+    for c in centers:
+        d = dist(c, (via.x, via.y))
+        if dmin is None or d < dmin:
+            dmin = d
+    return dmin

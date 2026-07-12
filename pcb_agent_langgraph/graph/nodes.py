@@ -143,6 +143,7 @@ class GraphNodes:
         tool_history = state.get("tool_history", [])
         failed = [item for item in tool_history if not item.get("ok") or _result_failed(item.get("result"))]
         cache = state.get("intermediate_cache", {}) or {}
+        import_succeeded = _import_lines_succeeded(cache.get("importLinesResult"))
         final_drc_passed = isinstance(cache.get("drcResult"), dict) and cache.get("drcResult", {}).get("passed") is True
         planner_output = state.get("planner_output", {}) or {}
         action = str(planner_output.get("action") or "")
@@ -175,7 +176,10 @@ class GraphNodes:
         elif task_type == "global_fanout" and cache.get("importLinesRejected"):
             message = "已取消导入，fanout 结果保留在文件中。"
             workflow_state = "result_review"
-        elif failed and not final_drc_passed:
+        elif task_type == "reroute" and cache.get("importLinesResult") and not import_succeeded:
+            message = _failure_message(task_type, failed[-1], cache) if failed else "局部重布结果自动导入失败。"
+            workflow_state = "error"
+        elif failed and not final_drc_passed and not (task_type == "reroute" and import_succeeded):
             message = _failure_message(task_type, failed[-1], cache)
             workflow_state = "error"
         elif task_type == "global_fanout":
@@ -186,7 +190,7 @@ class GraphNodes:
                 message = planner_output.get("response") or "Fanout 流程已执行到当前交互步骤。"
                 workflow_state = state.get("workflow_state", "select_bga")
         elif task_type == "reroute":
-            if cache.get("importLinesResult"):
+            if import_succeeded:
                 message = "局部拆线重布结果已导入，请在 PCB 版图中确认结果。"
                 workflow_state = "import"
             else:
@@ -203,12 +207,12 @@ class GraphNodes:
         elif action in {"route_review", "wait_route_import_confirm"}:
             route = cache.get("fanout_routeResult") if isinstance(cache.get("fanout_routeResult"), dict) else {}
             report_payload = {"task": "global_fanout", "stage": "import_pending", "routingResult": route.get("routingResult"), "importLinesFilePath": route.get("importLinesFilePath"), "workDir": route.get("workDir")}
-        elif action in {"reroute_report", "wait_reroute_import_confirm"} or (task_type == "reroute" and cache.get("drcResult")):
+        elif action in {"reroute_report", "wait_reroute_import_confirm"} or (task_type == "reroute" and (cache.get("drcResult") or cache.get("importLinesResult"))):
             report_payload = build_markdown_report(task_type, cache)
             markdown_report = str(report_payload.get("markdown") or "")
             if markdown_report:
                 message = markdown_report
-        if task_type == "reroute" and (failed or action == "reroute_unavailable" or cache.get("rerouteUnavailable")):
+        if task_type == "reroute" and not import_succeeded and (failed or action == "reroute_unavailable" or cache.get("rerouteUnavailable")):
             diagnostics = _reroute_diagnostics(cache, failed[-1] if failed else None, action)
             report_payload = dict(report_payload or {})
             report_payload["task"] = "reroute"
@@ -260,7 +264,7 @@ def route_after_tools(state: PCBState) -> str:
 def _only_recoverable_drc_failures(failed: list[dict[str, Any]], state: PCBState) -> bool:
     if state.get("workflow_id") != "pcb_reroute_flow":
         return False
-    allowed = {"explainability_report", "reroute_loop"}
+    allowed = {"drc_check", "explainability_report", "importLines", "reroute_loop"}
     for item in failed:
         call = item.get("call", {}) if isinstance(item, dict) else {}
         if call.get("name") not in allowed:
@@ -366,6 +370,14 @@ def _update_cache_from_tool(cache: dict[str, Any], tool_name: str, result: Any) 
             cache["fanoutParams"] = result.get("fanoutParams")
     elif tool_name == "drc_check":
         cache["drcResult"] = result
+        helper_result = cache.get("helpPlannerResult")
+        is_helper_drc = isinstance(helper_result, dict) and (
+            str(helper_result.get("tool") or "").lower() == "help_planner"
+            or str(helper_result.get("status") or "").lower() == "ok"
+        )
+        if is_helper_drc:
+            cache["helperDrcResult"] = result
+            return
         if isinstance(result, dict) and isinstance(cache.get("rerouteResult"), dict):
             detail = result.get("detail") if isinstance(result.get("detail"), dict) else {}
             filled_path = detail.get("filled_board_data_file_path") or result.get("filledBoardDataFilePath")
@@ -525,6 +537,23 @@ def _result_failed(result: Any) -> bool:
     )
 
 
+# ====== 功能：判断前端导入结果是否真实成功。 ======
+def _import_lines_succeeded(result: Any) -> bool:
+    if result in (None, "", False):
+        return False
+    if _import_lines_rejected(result):
+        return False
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return False
+        status = str(result.get("status") or result.get("result") or "").strip().lower()
+        return status not in {"failed", "error", "failure"}
+    if isinstance(result, str):
+        text = result.lower()
+        return not any(token in text for token in ("failed", "error", "失败", "错误"))
+    return True
+
+
 # ====== 功能：识别前端工具审批拒绝 importLines 的返回值。 ======
 def _import_lines_rejected(result: Any) -> bool:
     if isinstance(result, str):
@@ -645,9 +674,9 @@ def _reroute_stage_label(tool_name: str, action: str = "") -> str:
         "prepare_reroute_inputs": "重布线输入准备",
         "compress_reroute_context": "上下文压缩",
         "reroute_loop": "VSEA 重布线主流程",
-        # Legacy reroute/drc_check labels are kept commented for debugging reference only.
+        # Legacy reroute label is kept commented for debugging reference only.
         # "reroute": "主模型重布",
-        # "drc_check": "DRC 检查",
+        "drc_check": "Helper 完整板 DRC 检查",
         "explainability_report": "可解释性检查",
         "help_planner": "兜底规则布线",
         "importLines": "导入重布结果",
@@ -669,8 +698,8 @@ def _reroute_failure_type(tool_name: str, status: str, reason: str) -> str:
     #     return "model_reroute_failed"
     if tool_name == "compress_reroute_context":
         return "context_compression_failed"
-    # if tool_name == "drc_check":
-    #     return "drc_failed"
+    if tool_name == "drc_check":
+        return "drc_failed"
     if tool_name == "explainability_report":
         return "explainability_failed"
     if tool_name == "help_planner" and ("requires kicad" in reason_lower or "got pcb builder/export txt" in reason_lower or "current projectdata is not kicad" in reason_lower):
@@ -693,8 +722,8 @@ def _reroute_next_action(failure_type: str, tool_name: str) -> str:
         return "help_planner 需要 .kicad_pcb 输入；请先确认 export.txt 到 KiCad 输入的转换链路。"
     if failure_type == "pcbrouter_execution_failed":
         return "查看 inputCsvPreview、pcbrouter stdout/stderr，确认目标 net、target_x_mm/target_y_mm 和 target_layer 是否符合 helper-router 要求。"
-    # if failure_type == "drc_failed":
-    #     return "默认主链路由 VSEA 内部处理 DRC/repair；旧 drc_check 失败时可手动检查 patch fill 和 DRC 明细。"
+    if failure_type == "drc_failed":
+        return "Helper 完整板 DRC 未通过；不会导入，但仍会生成可解释性和失败报告。"
     if tool_name == "help_planner":
         return "查看 workDir、inputBoardPath、inputCsvPath 和 pcbrouter stderr。"
     return "查看 reportPayload.rerouteDiagnostics 中的路径、stderr 和 tracebackSummary。"
@@ -773,7 +802,7 @@ def _write_reroute_incremental_import_file(cache: dict[str, Any], reroute_result
             continue
         x1_raw, y1_raw, x2_raw, y2_raw = clipped
         line_records.append(
-            f"{line_layer}!LINE!0!{net_name}!"
+            f"{line_layer}!LINE!257!{net_name}!"
             f"{_kicad_mm_to_line_out_coord_text(str(x1_raw), 'x')}!"
             f"{_kicad_mm_to_line_out_coord_text(str(y1_raw), 'y')}!"
             f"{_kicad_mm_to_line_out_coord_text(str(x2_raw), 'x')}!"
@@ -889,7 +918,10 @@ def _validate_reroute_incremental_import_text(text: str) -> tuple[bool, str, dic
         if len(parts) != 9 or parts[1].upper() != "LINE":
             invalid_reasons.append(f"line {line_no}: 不是 LINE 记录")
             continue
-        layer, _, _, net, x1, y1, x2, y2, width = parts
+        layer, _, net_id, net, x1, y1, x2, y2, width = parts
+        if net_id != "257":
+            invalid_reasons.append(f"line {line_no}: PCB Builder record type 必须是 257")
+            continue
         if not layer or "/" in layer or ".Cu" in layer:
             invalid_reasons.append(f"line {line_no}: 层名不是 line.out 原生层名")
             continue

@@ -199,15 +199,14 @@ def test_config_explicit_path_precedence(tmp_path):
     assert config.drc.enabled is True
 
 
-# ====== 功能：验证旧 drc_check 已被硬禁用。 ======
+# ====== 功能：验证未启用 DRC 时明确失败。 ======
 def test_drc_disabled_fails_clearly():
     config = load_config("missing-config.ini")
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, {}))
     assert result["status"] == "failed"
-    assert "legacy drc_check is disabled" in result["reason"]
+    assert "DRC is disabled" in result["reason"]
 
-
-# ====== 功能：验证即使配置了 DRC，旧 drc_check 也不会执行。 ======
+# ====== 功能：验证 DRC 配置路径按配置根目录解析。 ======
 def test_drc_configured_missing_input_fails_after_tool_resolution(tmp_path):
     cfg = tmp_path / "config.ini"
     cfg.write_text(
@@ -220,8 +219,7 @@ def test_drc_configured_missing_input_fails_after_tool_resolution(tmp_path):
     config = load_config(cfg)
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, {}))
     assert result["status"] == "failed"
-    assert "legacy drc_check is disabled" in result["reason"]
-
+    assert "DRC tool_path does not exist" in result["reason"]
 
 # ====== 功能：验证 explain and help config defaults present 场景。 ======
 def test_explain_and_help_config_defaults_present():
@@ -233,7 +231,7 @@ def test_explain_and_help_config_defaults_present():
 
 
 # ====== 功能：验证 reroute drc failure triggers help planner 场景。 ======
-def test_reroute_drc_failure_triggers_help_planner():
+def test_reroute_drc_failure_does_not_fallback_to_helper():
     cache = {
         "deleteTracesResult": {"status": "ok", "selectedNets": ["DDR_DQ0"]},
         "rerouteInput": {"status": "ok"},
@@ -244,7 +242,8 @@ def test_reroute_drc_failure_triggers_help_planner():
         "rerouteDrcFailureCount": 3,
     }
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["tool_calls"][0]["name"] == "help_planner"
+    assert plan["action"] == "finish"
+    assert plan["tool_calls"] == []
 # ====== 功能：验证真实模型只返回参数时仍由 LangGraph 修复为可执行 fanout 计划。 ======
 def test_model_parameter_only_output_repairs_to_fanout_plan():
     from pcb_agent_langgraph.models.pcb_model import ModelResult
@@ -761,7 +760,7 @@ def test_drc_pass_generates_reroute_incremental_import_file(tmp_path):
     assert import_path.suffix == ".out"
     assert cache["rerouteResult"]["routedKicadFilePath"] == str(routed_kicad)
     assert cache["rerouteResult"]["importLinesFilePath"] != str(routed_kicad)
-    assert import_path.read_text(encoding="utf-8").startswith("TOP!LINE!0!Z7_SPI0_SCK!")
+    assert import_path.read_text(encoding="utf-8").startswith("TOP!LINE!257!Z7_SPI0_SCK!")
 
 
 # ====== 功能：验证 helper-router 的完整板输出会 diff 成前端可导入的 line.out。
@@ -800,9 +799,19 @@ def test_helper_router_routed_board_diff_generates_incremental_line_out(tmp_path
     assert Path(import_path).name == "helper_router_reroute_line.out"
     text = Path(import_path).read_text(encoding="utf-8")
     assert text.count("!LINE!") == 1
-    assert "DDR_DQ0" in text
+    assert "TOP!LINE!257!DDR_DQ0!" in text
     assert "DDR_DQ1" not in text
     assert any("generated_helper_router_incremental_line_out" in note for note in notes)
+
+
+# ====== 功能：验证 reroute 增量导入拒绝 net id 为 0 的无网络线路。
+def test_reroute_incremental_line_out_rejects_non_builder_record_type():
+    from pcb_agent_langgraph.graph.nodes import _validate_reroute_incremental_import_text
+    from pcb_agent_langgraph.tools.external import _validate_line_out_text
+
+    line = "BOTTOM!LINE!0!R_NAND_RDY0!1!2!3!4!6"
+    assert _validate_line_out_text(line)[0] is False
+    assert _validate_reroute_incremental_import_text(line)[0] is False
 
 
 # ====== 功能：验证 KiCad quoted net 名不会导致增量 diff 过滤失败。
@@ -1043,7 +1052,7 @@ def test_reroute_loop_vsea_success_generates_incremental_import(monkeypatch, tmp
     assert result["drcResult"]["passed"] is True
     import_path = Path(result["importLinesFilePath"])
     assert import_path.suffix == ".out"
-    assert "DDR_DQ0" in import_path.read_text(encoding="utf-8")
+    assert "TOP!LINE!257!DDR_DQ0!" in import_path.read_text(encoding="utf-8")
 
 
 # ====== 功能：验证 VSEA reroute_loop 失败不会给前端导入路径。 ======
@@ -1421,7 +1430,7 @@ def test_reroute_model_payload_uses_plain_layer_names_for_routes():
 
 
 # ====== 功能：验证 DRC 失败超过耗时上限会进入 help_planner。 ======
-def test_reroute_drc_failure_elapsed_limit_triggers_help_planner():
+def test_reroute_drc_failure_elapsed_limit_does_not_fallback_to_helper():
     import time
 
     config = load_config("missing-config.ini")
@@ -1436,7 +1445,8 @@ def test_reroute_drc_failure_elapsed_limit_triggers_help_planner():
         "rerouteStartedAt": time.time() - 5,
     }
     plan = PCBPlanner(use_model=False, config=config).plan({"user_input": "继续", "workflow_state": "error", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["tool_calls"][0]["name"] == "help_planner"
+    assert plan["action"] == "finish"
+    assert plan["tool_calls"] == []
 
 # ====== 功能：验证 fanout 实体跨轮保存，U5 后续选择 135 不会丢失目标 BGA。 ======
 def test_fanout_entities_persist_across_router_turn():
@@ -1475,7 +1485,7 @@ def test_legacy_reroute_unavailable_does_not_block_vsea_loop():
     assert plan["tool_calls"][0]["name"] == "reroute_loop"
 
 
-# ====== 功能：验证旧 drc_check 禁用后不会执行 patch fill。 ======
+# ====== 功能：验证 patch fill 失败不能被 target scope 误判为通过。 ======
 def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -1503,11 +1513,11 @@ def test_drc_fill_failed_cannot_target_scope_pass(monkeypatch, tmp_path):
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
     assert result["status"] == "failed"
-    assert "legacy drc_check is disabled" in result["reason"]
-
+    assert result["passed"] is False
+    assert result["drcExecutionValid"] is False
 
 # ====== 功能：验证默认 reroute_loop 失败后 planner 直接进入 help_planner。 ======
-def test_planner_reroute_loop_failure_calls_help_planner_not_legacy_retry():
+def test_planner_reroute_loop_failure_falls_back_to_helper():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
@@ -1520,7 +1530,7 @@ def test_planner_reroute_loop_failure_calls_help_planner_not_legacy_retry():
 
 
 # ====== 功能：验证 helper partial 有 line.out 时进入导入确认，并由用户确认后导入 helper 结果。
-def test_planner_helper_partial_imports_helper_line_out_after_confirm():
+def test_planner_helper_without_full_board_does_not_import():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
@@ -1538,70 +1548,90 @@ def test_planner_helper_partial_imports_helper_line_out_after_confirm():
             "importLinesFilePath": "helper_partial.out",
             "incrementalImportFilePath": "helper_partial.out",
         },
-        "explainabilityReport": {"status": "ok"},
     }
 
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "reroute_report"
+    assert plan["action"] == "finish"
     assert plan["tool_calls"] == []
-    assert "已生成可导入重布结果" in plan["response"]
-
-    wait_plan = PCBPlanner(use_model=False).plan({"user_input": "先看一下", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert wait_plan["action"] == "wait_reroute_import_confirm"
-
-    import_plan = PCBPlanner(use_model=False).plan({"user_input": "确认导入", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert import_plan["action"] == "confirm_import"
-    assert import_plan["tool_calls"][0]["name"] == "importLines"
-    assert import_plan["tool_calls"][0]["arguments"]["filePath"] == "helper_partial.out"
 
 
-# ====== 功能：验证 helper 成功产出 line.out 后不再跑依赖 DRC 的 explainability。
-def test_planner_helper_result_skips_explainability_and_waits_for_import_confirm():
+# ====== 功能：验证 helper 成功产出完整板后先跑 full-board DRC。
+def test_planner_helper_result_runs_full_board_drc_before_import():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
         "rerouteContext": {"status": "ok"},
         "rerouteLoopResult": {"status": "failed", "failureType": "dependency_preflight_failed"},
-        "helpPlannerResult": {
-            "status": "ok",
-            "tool": "help_planner",
-            "importLinesFilePath": "helper_line.out",
-            "incrementalImportFilePath": "helper_line.out",
-        },
-        "rerouteResult": {
-            "status": "ok",
-            "tool": "help_planner",
-            "importLinesFilePath": "helper_line.out",
-            "incrementalImportFilePath": "helper_line.out",
-        },
+        "helpPlannerResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
+        "rerouteResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
     }
 
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "reroute_report"
-    assert plan["tool_calls"] == []
-    assert "已生成可导入重布结果" in plan["response"]
-
-    confirm_plan = PCBPlanner(use_model=False).plan({"user_input": "确认导入", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert confirm_plan["action"] == "confirm_import"
-    assert confirm_plan["tool_calls"][0]["name"] == "importLines"
-    assert confirm_plan["tool_calls"][0]["arguments"]["filePath"] == "helper_line.out"
+    assert plan["action"] == "helper_drc"
+    assert plan["tool_calls"][0]["name"] == "drc_check"
+    assert plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
 
 
-# ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======
-def test_planner_calls_explainability_only_after_drc_passed():
+def test_planner_helper_drc_pass_auto_imports_then_explains():
     cache = {
         "deleteTracesResult": {"status": "ok"},
         "rerouteInput": {"status": "ok"},
         "rerouteContext": {"status": "ok"},
-        "rerouteResult": {"status": "ok"},
+        "helpPlannerResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
+        "rerouteResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
+        "helperDrcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
+        "drcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
+    }
+
+    import_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert import_plan["action"] == "auto_import"
+    assert import_plan["tool_calls"][0]["name"] == "importLines"
+    assert import_plan["tool_calls"][0]["arguments"] == {"filePath": "helper_line.out", "requireApproval": False}
+
+    cache["importLinesResult"] = "布线导入成功"
+    explain_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert explain_plan["action"] == "explainability"
+    assert explain_plan["tool_calls"][0]["name"] == "explainability_report"
+    assert explain_plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
+
+
+def test_planner_helper_drc_failure_explains_without_import():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "helpPlannerResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
+        "rerouteResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper_board.kicad_pcb", "importLinesFilePath": "helper_line.out"},
+        "helperDrcResult": {"status": "failed", "passed": False, "drcExecutionValid": True},
+        "drcResult": {"status": "failed", "passed": False, "drcExecutionValid": True},
+    }
+
+    plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert plan["action"] == "explainability"
+    assert [call["name"] for call in plan["tool_calls"]] == ["explainability_report"]
+    assert plan["tool_calls"][0]["arguments"]["routedKicadFilePath"] == "helper_board.kicad_pcb"
+
+# ====== 功能：验证 DRC 通过后才单独调用 explainability。 ======
+def test_planner_auto_imports_after_drc_then_calls_explainability():
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok", "importLinesFilePath": "vsea_line.out"},
         "drcResult": {"status": "ok", "passed": True, "drcExecutionValid": True},
     }
     plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "report", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
-    assert plan["action"] == "explainability"
-    assert [call["name"] for call in plan["tool_calls"]] == ["explainability_report"]
+    assert plan["action"] == "auto_import"
+    assert plan["tool_calls"][0]["name"] == "importLines"
+    assert plan["tool_calls"][0]["arguments"] == {"filePath": "vsea_line.out", "requireApproval": False}
+
+    cache["importLinesResult"] = "布线导入成功"
+    explain_plan = PCBPlanner(use_model=False).plan({"user_input": "继续", "workflow_state": "import", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache})
+    assert explain_plan["action"] == "explainability"
+    assert [call["name"] for call in explain_plan["tool_calls"]] == ["explainability_report"]
 
 
-# ====== 功能：验证旧 drc_check 禁用后不会对 help_planner 输出跑 full-board DRC。 ======
+# ====== 功能：验证 help_planner 完整板使用 full-board DRC。 ======
 def test_drc_uses_help_planner_full_board_without_routed_text(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -1638,12 +1668,13 @@ def test_drc_uses_help_planner_full_board_without_routed_text(monkeypatch, tmp_p
         "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
-    assert FakeDrcModule.called == ""
-    assert result["status"] == "failed"
-    assert "legacy drc_check is disabled" in result["reason"]
+    assert FakeDrcModule.called == "board"
+    assert result["status"] == "ok"
+    assert result["passed"] is True
+    assert result["drcInputMode"] == "full_board"
 
 
-# ====== 功能：验证旧 drc_check 禁用后不会执行 target scoped DRC。 ======
+# ====== 功能：验证 full-board 有无关残留问题时可按目标网络通过。 ======
 def test_drc_target_scoped_pass_with_full_board_residual_issue(monkeypatch, tmp_path):
     from pcb_agent_langgraph.tools import external
 
@@ -1672,5 +1703,298 @@ def test_drc_target_scoped_pass_with_full_board_residual_issue(monkeypatch, tmp_
         "rerouteResult": {"status": "ok", "routedKicadFilePath": str(routed_board)},
     }
     result = asyncio.run(AnalysisTool("drc_check", config).ainvoke({}, context))
-    assert result["status"] == "failed"
-    assert "legacy drc_check is disabled" in result["reason"]
+    assert result["status"] == "ok"
+    assert result["passed"] is True
+    assert result["fullBoardPassed"] is False
+    assert result["targetScopedPassed"] is True
+
+
+# ====== 功能：验证 helper 自动导入成功不会被历史 VSEA 失败覆盖为 error。
+def test_reflect_keeps_helper_import_success_despite_vsea_failure():
+    from pcb_agent_langgraph.graph.nodes import GraphNodes
+
+    cache = {
+        "rerouteLoopResult": {"status": "failed", "failureType": "dependency_preflight_failed"},
+        "helpPlannerResult": {"status": "ok", "tool": "help_planner", "importLinesFilePath": "helper.out"},
+        "rerouteResult": {"status": "ok", "tool": "help_planner", "importLinesFilePath": "helper.out"},
+        "importLinesResult": "布线导入成功",
+    }
+    state = {
+        "task_type": "reroute",
+        "workflow_state": "running",
+        "planner_output": {"action": "finish", "response": "helper 局部布线结果已自动导入"},
+        "intermediate_cache": cache,
+        "tool_history": [{"ok": True, "call": {"name": "reroute_loop"}, "result": cache["rerouteLoopResult"]}],
+    }
+
+    result = asyncio.run(GraphNodes(PCBPlanner(use_model=False), {})._reflect(state))
+
+    assert result["workflow_state"] == "import"
+    assert "## DRC" in result["final_response"]
+    assert "## Explainability" in result["final_response"]
+    assert "Imported:" not in result["final_response"]
+    assert "未完成" not in result["final_response"]
+
+
+def test_helper_drc_cache_is_separate_and_preserves_helper_result():
+    from pcb_agent_langgraph.graph.nodes import _update_cache_from_tool
+
+    helper_result = {
+        "status": "ok",
+        "tool": "help_planner",
+        "routedKicadFilePath": "helper.kicad_pcb",
+        "importLinesFilePath": "helper.out",
+    }
+    cache = {"helpPlannerResult": helper_result, "rerouteResult": dict(helper_result)}
+    drc = {"status": "failed", "passed": False, "drcExecutionValid": True}
+
+    _update_cache_from_tool(cache, "drc_check", drc)
+
+    assert cache["helperDrcResult"] == drc
+    assert cache["drcResult"] == drc
+    assert cache["rerouteResult"]["importLinesFilePath"] == "helper.out"
+    assert "rerouteDrcFailureCount" not in cache
+
+
+def test_explainability_accepts_explicit_routed_kicad_path(tmp_path):
+    from pcb_agent_langgraph.tools.external import _explain_input_board
+
+    board = tmp_path / "helper.kicad_pcb"
+    board.write_text("(kicad_pcb)", encoding="utf-8")
+
+    assert _explain_input_board({"routedKicadFilePath": str(board)}, {}) == board
+
+
+def test_helper_report_includes_only_drc_and_explainability(tmp_path):
+    from pcb_agent_langgraph.reports.markdown import build_markdown_report
+
+    board = tmp_path / "helper.kicad_pcb"
+    board.write_text('(kicad_pcb (net 447 "R_NAND_RDY0"))', encoding="utf-8")
+    helper = {
+        "status": "ok",
+        "tool": "help_planner",
+        "routedKicadFilePath": str(board),
+        "selectedNets": ["R_NAND_RDY0"],
+    }
+    drc = {"status": "ok", "passed": True, "drcExecutionValid": True, "drcInputMode": "full_board"}
+    cache = {
+        "rerouteLoopResult": {
+            "status": "failed",
+            "failureStage": "dependency_preflight_failed",
+            "failureType": "dependency_preflight_failed",
+            "reason": "DRC agent package not found",
+        },
+        "helpPlannerResult": helper,
+        "rerouteResult": helper,
+        "helperDrcResult": drc,
+        "drcResult": drc,
+        "importLinesResult": {"status": "ok", "pathUnitCount": 2, "recordCount": 11},
+        "explainabilityReport": {"status": "ok", "report": "acceptable"},
+    }
+
+    markdown = build_markdown_report("reroute", cache)["markdown"]
+
+    assert "## DRC" in markdown
+    assert "## Explainability" in markdown
+    assert "Route source:" not in markdown
+    assert "dependency_preflight_failed" not in markdown
+    assert "Helper Full-board DRC" not in markdown
+    assert "Path units" not in markdown
+
+def test_helper_drc_failure_routes_back_to_planner_for_explainability():
+    from pcb_agent_langgraph.graph.nodes import route_after_tools
+
+    drc = {"status": "failed", "passed": False, "drcExecutionValid": True}
+    state = {
+        "workflow_id": "pcb_reroute_flow",
+        "loop_count": 5,
+        "intermediate_cache": {
+            "helpPlannerResult": {"status": "ok", "tool": "help_planner", "routedKicadFilePath": "helper.kicad_pcb"},
+            "helperDrcResult": drc,
+            "drcResult": drc,
+        },
+        "tool_history": [{"ok": True, "call": {"name": "drc_check"}, "result": drc}],
+    }
+
+    assert route_after_tools(state) == "plan"
+
+def test_helper_incremental_rejects_selected_net_missing_from_original_board(tmp_path):
+    from pcb_agent_langgraph.tools.external import _write_helper_router_incremental_import_file
+
+    routed = tmp_path / "routed.kicad_pcb"
+    routed.write_text(
+        '(kicad_pcb (net 447 "R_NAND_RDY0") '
+        '(segment (start 1 1) (end 2 2) (width 0.12446) (layer "B.Cu") (net 447)))',
+        encoding="utf-8",
+    )
+
+    import_path, notes = _write_helper_router_incremental_import_file(
+        original_board_text='(kicad_pcb (net 1 "OTHER"))',
+        routed_board_path=routed,
+        selected_nets=["R_NAND_RDY0"],
+        work_dir=tmp_path / "work",
+    )
+
+    assert import_path == ""
+    assert "helper_router_incremental_import_net_validation_failed" in notes
+    assert "missingOriginalNets:R_NAND_RDY0" in notes
+
+def test_failed_auto_import_routes_to_explainability_but_is_not_reported_as_success():
+    from pcb_agent_langgraph.graph.nodes import GraphNodes, route_after_tools
+
+    import_result = {"status": "failed", "reason": "frontend importer failed"}
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok", "routedKicadFilePath": "board.kicad_pcb", "importLinesFilePath": "line.out"},
+        "drcResult": {"status": "ok", "passed": True},
+        "importLinesResult": import_result,
+    }
+    state = {
+        "workflow_id": "pcb_reroute_flow",
+        "workflow_state": "running",
+        "task_type": "reroute",
+        "loop_count": 4,
+        "intermediate_cache": cache,
+        "tool_history": [{"ok": True, "call": {"name": "importLines"}, "result": import_result}],
+    }
+
+    assert route_after_tools(state) == "plan"
+    plan = PCBPlanner(use_model=False).plan({**state, "user_input": "继续"})
+    assert plan["action"] == "explainability"
+
+    reflected = asyncio.run(
+        GraphNodes(PCBPlanner(use_model=False), {})._reflect(
+            {
+                **state,
+                "planner_output": {"action": "finish", "response": "done"},
+                "intermediate_cache": {**cache, "explainabilityReport": {"status": "ok", "report": "checked"}},
+            }
+        )
+    )
+    assert reflected["workflow_state"] == "error"
+    assert "## DRC" in reflected["markdown_report"]
+    assert "## Explainability" in reflected["markdown_report"]
+    assert "## Auto Import" not in reflected["markdown_report"]
+
+def test_helper_provider_skips_vsea_and_calls_helper_directly():
+    config = load_config("missing-config.ini")
+    config.reroute_loop.provider = "helper"
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+    }
+
+    plan = PCBPlanner(use_model=False, config=config).plan(
+        {"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
+    )
+
+    assert plan["action"] == "help_planner"
+    assert [call["name"] for call in plan["tool_calls"]] == ["help_planner"]
+
+
+def test_vsea_routing_failure_falls_back_to_helper():
+    config = load_config("missing-config.ini")
+    config.reroute_loop.provider = "vsea"
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteLoopResult": {"status": "failed", "failureStage": "model_call_failed", "failureType": "routing_failed", "reason": "openai package is required for LLM routing"},
+    }
+
+    plan = PCBPlanner(use_model=False, config=config).plan(
+        {"user_input": "继续", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
+    )
+
+    assert plan["action"] == "help_planner"
+    assert [call["name"] for call in plan["tool_calls"]] == ["help_planner"]
+    assert plan["tool_calls"][0]["arguments"]["fallbackReason"] == "VSEA reroute failed: routing_failed"
+
+
+def test_helper_incremental_output_includes_cross_layer_via_record(tmp_path):
+    from pcb_agent_langgraph.tools.external import _write_helper_router_incremental_import_file
+
+    original = '(kicad_pcb (net 447 "R_NAND_RDY0"))'
+    routed = tmp_path / "routed.kicad_pcb"
+    routed.write_text(
+        '(kicad_pcb (net 447 "R_NAND_RDY0") '
+        '(segment (start 10 20) (end 11 20) (width 0.12446) (layer "F.Cu") (net 447)) '
+        '(via (at 11 20) (size 0.4064) (drill 0.2032) (layers "F.Cu" "B.Cu") (net 447)) '
+        '(segment (start 11 20) (end 12 20) (width 0.12446) (layer "B.Cu") (net 447)))',
+        encoding="utf-8",
+    )
+
+    import_path, _ = _write_helper_router_incremental_import_file(
+        original_board_text=original,
+        routed_board_path=routed,
+        selected_nets=["R_NAND_RDY0"],
+        work_dir=tmp_path / "work",
+    )
+
+    text = Path(import_path).read_text(encoding="utf-8")
+    assert "TOP!BOTTOM!CIRCLE!2!R_NAND_RDY0!" in text
+    assert "!8.00!16.00" in text
+
+
+def test_helper_incremental_output_omits_circle_without_new_via(tmp_path):
+    from pcb_agent_langgraph.tools.external import _write_helper_router_incremental_import_file
+
+    original = '(kicad_pcb (net 447 "R_NAND_RDY0"))'
+    routed = tmp_path / "routed.kicad_pcb"
+    routed.write_text(
+        '(kicad_pcb (net 447 "R_NAND_RDY0") '
+        '(segment (start 10 20) (end 12 20) (width 0.12446) (layer "B.Cu") (net 447)))',
+        encoding="utf-8",
+    )
+
+    import_path, _ = _write_helper_router_incremental_import_file(
+        original_board_text=original,
+        routed_board_path=routed,
+        selected_nets=["R_NAND_RDY0"],
+        work_dir=tmp_path / "work",
+    )
+
+    assert "!CIRCLE!" not in Path(import_path).read_text(encoding="utf-8")
+
+
+def test_reroute_markdown_report_contains_only_drc_and_explainability_sections():
+    from pcb_agent_langgraph.reports.markdown import build_markdown_report
+
+    report = build_markdown_report(
+        "reroute",
+        {
+            "drcResult": {"status": "ok", "passed": True, "targetIssueCount": 0},
+            "explainabilityReport": {"status": "ok", "report": "布线较好。"},
+            "rerouteResult": {"status": "ok", "tool": "help_planner"},
+            "rerouteLoopResult": {"status": "failed", "failureStage": "dependency_preflight_failed"},
+        },
+    )["markdown"]
+
+    assert "## DRC" in report
+    assert "## Explainability" in report
+    assert "## VSEA Preflight" not in report
+    assert "## Helper Full-board DRC" not in report
+    assert "## Auto Import" not in report
+    assert "Route source" not in report
+
+def test_vsea_drc_failure_does_not_auto_import():
+    config = load_config("missing-config.ini")
+    config.reroute_loop.provider = "vsea"
+    cache = {
+        "deleteTracesResult": {"status": "ok"},
+        "rerouteInput": {"status": "ok"},
+        "rerouteContext": {"status": "ok"},
+        "rerouteResult": {"status": "ok", "routedKicadFilePath": "vsea_board.kicad_pcb", "importLinesFilePath": "vsea_line.out"},
+        "drcResult": {"status": "failed", "passed": False},
+    }
+
+    plan = PCBPlanner(use_model=False, config=config).plan(
+        {"user_input": "continue", "workflow_state": "running", "workflow_id": "pcb_reroute_flow", "task_type": "reroute", "intermediate_cache": cache}
+    )
+
+    assert plan["action"] == "explainability"
+    assert plan["tool_calls"][0]["name"] == "explainability_report"
+    assert plan["tool_calls"][0]["arguments"] == {"routedKicadFilePath": "vsea_board.kicad_pcb"}

@@ -30,6 +30,10 @@ def _drc_passed(result: Any) -> bool:
 def _stage_ok(result: Any) -> bool:
     return isinstance(result, dict) and str(result.get("status", "")).lower() == "ok"
 
+def _reroute_provider(config: AppConfig | None) -> str:
+    if config is None:
+        return "vsea"
+    return str(config.reroute_loop.provider or "vsea").strip().lower()
 
 def _helper_partial(cache: dict[str, Any]) -> bool:
     for key in ("helpPlannerResult", "rerouteResult"):
@@ -42,9 +46,21 @@ def _helper_partial(cache: dict[str, Any]) -> bool:
 def _helper_reroute_result(cache: dict[str, Any]) -> bool:
     for key in ("helpPlannerResult", "rerouteResult"):
         value = cache.get(key)
-        if isinstance(value, dict) and str(value.get("tool") or "").lower() == "help_planner":
+        if isinstance(value, dict) and (
+            str(value.get("tool") or "").lower() == "help_planner"
+            or (key == "helpPlannerResult" and _stage_ok(value))
+        ):
             return True
     return False
+
+def _helper_routed_board(cache: dict[str, Any]) -> str:
+    for key in ("helpPlannerResult", "rerouteResult"):
+        value = cache.get(key)
+        if isinstance(value, dict):
+            path = str(value.get("routedKicadFilePath") or "").strip()
+            if path:
+                return path
+    return ""
 
 
 # ====== 功能：合并多轮对话抽取到的 fanout 实体和约束。 ======
@@ -232,12 +248,17 @@ class PCBPlanner:
                 return self._with_calls("reroute", "pcb_reroute_flow", "prepare_reroute_inputs", [{"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0}])
             if not cache.get("rerouteResult") and not _stage_ok(cache.get("rerouteContext")):
                 return self._with_calls("reroute", "pcb_reroute_flow", "compress_context", [{"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0}])
-            if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0}])
             if not cache.get("rerouteResult"):
+                provider = _reroute_provider(self.config)
+                if provider == "helper":
+                    return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {}, "timeout": 900.0}])
+                if provider != "vsea":
+                    return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_provider_invalid", "tool_calls": [], "response": f"Unsupported reroute provider: {provider}"}
+                if cache.get("rerouteLoopResult") and not _stage_ok(cache.get("rerouteLoopResult")):
+                    failure = cache.get("rerouteLoopResult") or {}
+                    failure_reason = str(failure.get("failureType") or failure.get("failureStage") or failure.get("status") or "unknown")
+                    return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": f"VSEA reroute failed: {failure_reason}"}, "timeout": 900.0}])
                 return self._with_calls("reroute", "pcb_reroute_flow", "reroute_loop", [{"name": "reroute_loop", "arguments": {}, "timeout": 900.0}])
-            if _drc_failed(cache.get("drcResult")) and not cache.get("helpPlannerResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "legacy DRC result failed; legacy drc_check/reroute retry disabled"}, "timeout": 900.0}])
             # Legacy reroute/drc_check is disabled here. VSEA reroute_loop owns model, fill, hard DRC, and repair retry.
             # if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
             #     return self._with_calls("reroute", "pcb_reroute_flow", "help_planner", [{"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0}])
@@ -246,22 +267,29 @@ class PCBPlanner:
             # if not cache.get("drcResult"):
             #     return self._with_calls("reroute", "pcb_reroute_flow", "drc", [{"name": "drc_check", "arguments": {}, "timeout": 360.0}])
             import_file = self._extract_import_file(cache.get("rerouteResult"))
-            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult") and workflow_state != "report":
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_report", "tool_calls": [], "response": "已生成可导入重布结果，请确认是否导入。"}
-            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult") and workflow_state == "report" and not _is_confirm_text(text):
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "wait_reroute_import_confirm", "tool_calls": [], "response": "当前正在等待导入确认。请回复“确认导入”，或说明要重新重布。"}
-            if import_file and _helper_reroute_result(cache) and not cache.get("importLinesResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "confirm_import", [{"name": "importLines", "arguments": {"filePath": import_file}, "timeout": 360.0}])
-            if not cache.get("explainabilityReport"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}])
-            if import_file and not cache.get("importLinesResult") and workflow_state != "report":
-                response = "已生成可导入重布结果，请确认是否导入。" if _helper_partial(cache) else "拆线重布和 DRC 检查已完成，请确认是否导入结果。"
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "reroute_report", "tool_calls": [], "response": response}
-            if import_file and not cache.get("importLinesResult") and workflow_state == "report" and not _is_confirm_text(text):
-                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "wait_reroute_import_confirm", "tool_calls": [], "response": "当前正在等待导入确认。请回复“确认导入”，或说明要重新重布。"}
+            helper_result = _helper_reroute_result(cache)
+            helper_board = _helper_routed_board(cache)
+            if helper_result and helper_board and not cache.get("helperDrcResult"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "helper_drc", [{"name": "drc_check", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0}])
+            if helper_result:
+                helper_drc = cache.get("helperDrcResult")
+                if _drc_passed(helper_drc) and import_file and not cache.get("importLinesResult"):
+                    return self._with_calls("reroute", "pcb_reroute_flow", "auto_import", [{"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0}])
+                if helper_board and helper_drc and not cache.get("explainabilityReport") and (_drc_failed(helper_drc) or cache.get("importLinesResult")):
+                    return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0}])
+
+                response = "helper 结果缺少完整 .kicad_pcb，已停止且未导入。" if not helper_board else "helper 局部布线验证、导入和可解释性报告已完成。"
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": response}
+            if _drc_failed(cache.get("drcResult")):
+                routed_board = _helper_routed_board(cache)
+                if routed_board and not cache.get("explainabilityReport"):
+                    return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {"routedKicadFilePath": routed_board}, "timeout": 360.0}])
+                return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "DRC did not pass; reroute output was not imported."}
             if import_file and not cache.get("importLinesResult"):
-                return self._with_calls("reroute", "pcb_reroute_flow", "confirm_import", [{"name": "importLines", "arguments": {"filePath": import_file}, "timeout": 360.0}])
-            return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "局部拆线重布、导入、DRC 和分析报告已完成。"}
+                return self._with_calls("reroute", "pcb_reroute_flow", "auto_import", [{"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0}])
+            if cache.get("importLinesResult") and not cache.get("explainabilityReport"):
+                return self._with_calls("reroute", "pcb_reroute_flow", "explainability", [{"name": "explainability_report", "arguments": {}, "timeout": 360.0}])
+            return {"intent": "reroute", "workflow": "pcb_reroute_flow", "action": "finish", "tool_calls": [], "response": "局部拆线重布已自动导入，DRC 和可解释性报告已完成。"}
 
 
         if explicit_entry == "global_fanout" or (explicit_entry is None and (self._is_fanout(text) or state.get("task_type") == "global_fanout" or state.get("workflow_id") == "pcb_escape_flow" or (workflow_state == "result_review" and re.search(r"重新|重来|again|rerun", lower)))):
@@ -318,7 +346,7 @@ class PCBPlanner:
             if not isinstance(raw, dict) or not raw.get("name"):
                 continue
             normalized_call = _normalize_model_tool_call(raw, entities)
-            if normalized_call.get("name") in {"reroute", "drc_check"}:
+            if normalized_call.get("name") == "reroute":
                 continue
             calls.append(self._tool_call(normalized_call))
 
@@ -375,12 +403,17 @@ class PCBPlanner:
                 return [self._tool_call({"name": "prepare_reroute_inputs", "arguments": {}, "timeout": 360.0})], "prepare_reroute_inputs"
             if not cache.get("rerouteResult") and not _stage_ok(cache.get("rerouteContext")):
                 return [self._tool_call({"name": "compress_reroute_context", "arguments": {}, "timeout": 360.0})], "compress_context"
-            if cache.get("rerouteLoopResult") and _drc_failed(cache.get("rerouteLoopResult")) and not cache.get("helpPlannerResult"):
-                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute_loop failed"}, "timeout": 900.0})], "help_planner"
             if not cache.get("rerouteResult"):
+                provider = _reroute_provider(self.config)
+                if provider == "helper":
+                    return [self._tool_call({"name": "help_planner", "arguments": {}, "timeout": 900.0})], "help_planner"
+                if provider != "vsea":
+                    return [], "reroute_provider_invalid"
+                if cache.get("rerouteLoopResult") and not _stage_ok(cache.get("rerouteLoopResult")):
+                    failure = cache.get("rerouteLoopResult") or {}
+                    failure_reason = str(failure.get("failureType") or failure.get("failureStage") or failure.get("status") or "unknown")
+                    return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": f"VSEA reroute failed: {failure_reason}"}, "timeout": 900.0})], "help_planner"
                 return [self._tool_call({"name": "reroute_loop", "arguments": {}, "timeout": 900.0})], "reroute_loop"
-            if _drc_failed(cache.get("drcResult")) and not cache.get("helpPlannerResult"):
-                return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "legacy DRC result failed; legacy drc_check/reroute retry disabled"}, "timeout": 900.0})], "help_planner"
             # Legacy reroute/drc_check is disabled here; reroute_loop or help_planner must produce the importable result.
             # if _drc_failed(cache.get("drcResult")) and (int(cache.get("rerouteDrcFailureCount", 0)) >= 3 or self._reroute_elapsed_limit_reached(cache)) and not cache.get("helpPlannerResult"):
             #     return [self._tool_call({"name": "help_planner", "arguments": {"fallbackReason": "reroute DRC failed after retry/time limit"}, "timeout": 900.0})], "help_planner"
@@ -388,13 +421,28 @@ class PCBPlanner:
             #     return [self._tool_call({"name": "reroute", "arguments": {"attempt": int(cache.get("rerouteAttemptCount", 0)) + 1}, "timeout": 900.0})], "reroute_retry"
             # if not cache.get("drcResult"):
             #     return [self._tool_call({"name": "drc_check", "arguments": {}, "timeout": 360.0})], "drc"
-            if self._extract_import_file(cache.get("rerouteResult")) and _helper_reroute_result(cache) and not cache.get("importLinesResult"):
-                return [], "reroute_report"
-            if not cache.get("explainabilityReport"):
-                return [self._tool_call({"name": "explainability_report", "arguments": {}, "timeout": 360.0})], "explainability"
             import_file = self._extract_import_file(cache.get("rerouteResult"))
+            helper_result = _helper_reroute_result(cache)
+            helper_board = _helper_routed_board(cache)
+            if helper_result and helper_board and not cache.get("helperDrcResult"):
+                return [self._tool_call({"name": "drc_check", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0})], "helper_drc"
+            if helper_result:
+                helper_drc = cache.get("helperDrcResult")
+                if _drc_passed(helper_drc) and import_file and not cache.get("importLinesResult"):
+                    return [self._tool_call({"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0})], "auto_import"
+                if helper_board and helper_drc and not cache.get("explainabilityReport") and (_drc_failed(helper_drc) or cache.get("importLinesResult")):
+                    return [self._tool_call({"name": "explainability_report", "arguments": {"routedKicadFilePath": helper_board}, "timeout": 360.0})], "explainability"
+
+                return [], "finish"
+            if _drc_failed(cache.get("drcResult")):
+                routed_board = _helper_routed_board(cache)
+                if routed_board and not cache.get("explainabilityReport"):
+                    return [self._tool_call({"name": "explainability_report", "arguments": {"routedKicadFilePath": routed_board}, "timeout": 360.0})], "explainability"
+                return [], "finish"
             if import_file and not cache.get("importLinesResult"):
-                return [], "reroute_report"
+                return [self._tool_call({"name": "importLines", "arguments": {"filePath": import_file, "requireApproval": False}, "timeout": 360.0})], "auto_import"
+            if cache.get("importLinesResult") and not cache.get("explainabilityReport"):
+                return [self._tool_call({"name": "explainability_report", "arguments": {}, "timeout": 360.0})], "explainability"
             return [], "finish"
 
         return [], "plan"
@@ -647,7 +695,7 @@ def _state_prompt(state: PCBState) -> str:
         "fanoutEntities": cache.get("fanoutEntities") or cache.get("fanoutParams") or {},
         "next_step_rules": [
             "global_fanout 顺序：getProjectData -> pcb_extra_bga/selection -> router选择(135或arc) -> layer_assign -> escape_order -> fanoutParams确认 -> fanout_route -> importLines(由前端工具审批确认/拒绝) -> result_review(导入成功后生成本轮work_dir报告)；fanout 不调用 DRC/Explainability",
-            "reroute 顺序：deleteTracesForRerouting -> prepare_reroute_inputs -> compress_reroute_context -> reroute_loop(VSEA内部模型/fill/hard DRC/repair) -> explainability_report -> report确认 -> importLines；reroute_loop失败直接 help_planner 兜底；默认不调用旧reroute/drc_check",
+            "reroute 顺序：deleteTracesForRerouting -> prepare_reroute_inputs -> compress_reroute_context；provider=vsea 先执行 reroute_loop，失败后自动进入 helper -> full-board drc_check；provider=helper 直接进入 helper；DRC 通过自动 importLines，DRC 失败不导入；可解释性始终读取完整 .kicad_pcb；不调用旧 reroute。",
             "用户指定 U5/U22 等器件时直接作为 selectedBGA，不要再要求选择 BGA",
             "用户指定线宽线距时写入 entities.constraints.LineWidth 和 LineSpacing，并传给工具 arguments.constraints",
         ],

@@ -326,6 +326,17 @@ class ExternalProgramTool:
         output_dir = work_dir / task_id
         output_dir.mkdir(parents=True, exist_ok=True)
         ai_pcb_eval_path, drc_agent_package, agent_drc_python = _vsea_dependency_paths(self.config, arguments)
+        mark(
+            "dependency_paths",
+            configuredPipelineRoot=str(self.config.reroute_loop.pipeline_root),
+            pipelineRoot=str(pipeline_root),
+            configuredAiPcbEvalPath=str(self.config.reroute_loop.ai_pcb_eval_path),
+            aiPcbEvalPath=str(ai_pcb_eval_path),
+            configuredDrcAgentPackage=str(self.config.reroute_loop.drc_agent_package),
+            drcAgentPackage=str(drc_agent_package),
+            configuredAgentDrcPython=str(self.config.reroute_loop.agent_drc_python),
+            agentDrcPython=str(agent_drc_python),
+        )
         dependency_errors = []
         if not ai_pcb_eval_path.exists():
             dependency_errors.append(f"AI-PCB-Eval path not found: {ai_pcb_eval_path}")
@@ -413,7 +424,7 @@ class ExternalProgramTool:
             return {
                 "status": "failed",
                 "tool": self.name,
-                "reason": f"重布线主流程失败，已切换兜底布线：{exc}",
+                "reason": f"VSEA 重布线主流程失败：{exc}",
                 "failureStage": "model_call_failed",
                 "failureType": "pipeline_exception",
                 "tracebackSummary": _traceback_summary(exc),
@@ -432,7 +443,7 @@ class ExternalProgramTool:
             return {
                 "status": "failed",
                 "tool": self.name,
-                "reason": f"重布线主流程失败，已切换兜底布线：{payload.get('error') or payload.get('status') or 'unknown error'}",
+                "reason": f"VSEA 重布线主流程失败：{payload.get('error') or payload.get('status') or 'unknown error'}",
                 "failureStage": failure_stage,
                 "failureType": failure_type,
                 "vseaResult": payload,
@@ -451,7 +462,7 @@ class ExternalProgramTool:
             return {
                 "status": "failed",
                 "tool": self.name,
-                "reason": "重布线主流程失败，已切换兜底布线：VSEA did not return completed board data",
+                "reason": "VSEA 重布线主流程失败：VSEA did not return completed board data",
                 "failureStage": "pipeline_result",
                 "failureType": "missing_completed_board",
                 "vseaResult": payload,
@@ -471,7 +482,7 @@ class ExternalProgramTool:
             return {
                 "status": "failed",
                 "tool": self.name,
-                "reason": "重布线主流程失败，已切换兜底布线：VSEA completed board could not be converted to incremental import lines",
+                "reason": "VSEA 重布线主流程失败：VSEA completed board could not be converted to incremental import lines",
                 "failureStage": "incremental_import",
                 "failureType": "incremental_import_failed",
                 "incrementalImportNotes": import_notes,
@@ -655,6 +666,7 @@ class ExternalProgramTool:
                 "stderrPath": stderr_path,
                 "pcbrouterExitCode": pcbrouter_exit_code,
                 "helperPartial": helper_partial,
+                "selectedNets": list(reroute_input.get("selectedNets") or route_params.get("selectedNets") or []),
                 "report": report,
                 "detail": payload,
                 "workDir": str(work_dir),
@@ -720,9 +732,7 @@ class AnalysisTool:
         if self.name == "pcb_extra_bga":
             return await self._run_bga_extract_script(arguments, context)
         if self.name == "drc_check":
-            # Legacy drc_check is disabled; VSEA reroute_loop owns hard DRC in the default reroute chain.
-            # return await self._run_drc(arguments, context)
-            return {"status": "failed", "tool": self.name, "reason": "legacy drc_check is disabled; use reroute_loop hard DRC"}
+            return await self._run_drc(arguments, context)
         if self.name == "explainability_report":
             # 启用可解释性模型时优先调用真实模型；未启用时退回 DRC 文本摘要，便于离线/单测运行。
             if self.config.explain_model.enabled:
@@ -879,6 +889,8 @@ class AnalysisTool:
         code_dir = _resolve_path(self.config.root, self.config.explain_model.code_dir)
         checkpoint = _resolve_path(self.config.root, self.config.explain_model.checkpoint_path)
         board_path = _explain_input_board(arguments, context)
+        if board_path is not None:
+            board_path = board_path.resolve()
         if not python_exe.exists():
             return {"status": "failed", "tool": self.name, "reason": "explain python executable does not exist", "python": str(python_exe)}
         if not code_dir.exists():
@@ -1109,7 +1121,8 @@ def _vsea_dependency_paths(config: AppConfig, arguments: dict[str, Any]) -> tupl
         or ""
     )
     missing_drc = config.root / "__missing_drc_agent_package__"
-    return _resolve_path(config.root, ai_raw), _resolve_path(config.root, drc_raw) if str(drc_raw or "").strip() else missing_drc, agent_python
+    resolved_python = str(_resolve_path(config.root, agent_python)) if agent_python.strip() else ""
+    return _resolve_path(config.root, ai_raw), _resolve_path(config.root, drc_raw) if str(drc_raw or "").strip() else missing_drc, resolved_python
 
 
 def _vsea_env(config: AppConfig, arguments: dict[str, Any], output_dir: Path, ai_pcb_eval_path: Path | None = None, drc_agent_package: Path | None = None, agent_drc_python: str = "") -> dict[str, str]:
@@ -1200,7 +1213,18 @@ def _write_helper_router_incremental_import_file(
         return "", [f"helper_router_routed_board_missing:{routed_board_path}"]
     routed_board_text = routed_board_path.read_text(encoding="utf-8", errors="ignore")
     original_segments = {_segment_diff_key(segment) for segment in _parse_kicad_segments(original_board_text)}
+    original_vias = {_via_diff_key(via) for via in _parse_kicad_vias(original_board_text)}
     selected_net_names = {str(item).strip() for item in selected_nets if str(item).strip()}
+    original_net_names = set(_kicad_net_id_to_name(original_board_text).values())
+    routed_net_names = set(_kicad_net_id_to_name(routed_board_text).values())
+    missing_original = sorted(selected_net_names - original_net_names)
+    missing_routed = sorted(selected_net_names - routed_net_names)
+    if missing_original or missing_routed:
+        return "", [
+            "helper_router_incremental_import_net_validation_failed",
+            f"missingOriginalNets:{','.join(missing_original)}",
+            f"missingRoutedNets:{','.join(missing_routed)}",
+        ]
     changed_segments: list[dict[str, Any]] = []
     for segment in _parse_kicad_segments(routed_board_text):
         if _segment_diff_key(segment) in original_segments:
@@ -1208,19 +1232,42 @@ def _write_helper_router_incremental_import_file(
         if selected_net_names and str(segment.get("netName") or "") not in selected_net_names:
             continue
         changed_segments.append(segment)
-    if not changed_segments:
-        return "", ["helper_router_incremental_import_no_changed_segments"]
+    changed_vias: list[dict[str, Any]] = []
+    for via in _parse_kicad_vias(routed_board_text):
+        if _via_diff_key(via) in original_vias:
+            continue
+        if selected_net_names and str(via.get("netName") or "") not in selected_net_names:
+            continue
+        changed_vias.append(via)
+    if not changed_segments and not changed_vias:
+        return "", ["helper_router_incremental_import_no_changed_objects"]
+    invalid_bindings = [
+        item
+        for item in [*changed_segments, *changed_vias]
+        if not str(item.get("netName") or "").strip()
+        or str(item.get("netName") or "").strip() not in original_net_names
+        or str(item.get("netName") or "").strip() not in routed_net_names
+    ]
+    if invalid_bindings:
+        return "", ["helper_router_incremental_import_net_validation_failed", "new segments are not bound to a net present in both boards"]
 
     import_dir = work_dir / "import"
     import_dir.mkdir(parents=True, exist_ok=True)
     output_path = import_dir / "helper_router_reroute_line.out"
-    line_records = [_segment_to_line_out(segment) for segment in changed_segments]
-    import_text = "\n".join(record for record in line_records if record) + "\n"
+    records = [_segment_to_line_out(segment) for segment in changed_segments]
+    records.extend(_via_to_line_out(via) for via in changed_vias)
+    import_text = "\n".join(record for record in records if record) + "\n"
     passed, reason, stats = _validate_line_out_text(import_text)
     if not passed:
         return "", [f"helper_router_incremental_import_invalid:{reason}"]
     output_path.write_text(import_text, encoding="utf-8")
-    return str(output_path), [f"generated_helper_router_incremental_line_out:{output_path}", f"lineCount:{stats.get('lineCount', 0)}"]
+    bindings = sorted({f"{item.get('netId')}/{item.get('netName')}" for item in [*changed_segments, *changed_vias]})
+    return str(output_path), [
+        f"generated_helper_router_incremental_line_out:{output_path}",
+        f"lineCount:{stats.get('lineCount', 0)}",
+        f"circleCount:{stats.get('circleCount', 0)}",
+        f"netBindings:{','.join(bindings)}",
+    ]
 
 
 def _write_routed_layout_txt_artifact(project_root: Path, routed_board_path: str, work_dir: Path) -> tuple[str, list[str]]:
@@ -1268,6 +1315,31 @@ def _parse_kicad_segments(board_text: str) -> list[dict[str, Any]]:
             }
         )
     return segments
+
+
+def _parse_kicad_vias(board_text: str) -> list[dict[str, Any]]:
+    net_id_to_name = _kicad_net_id_to_name(board_text)
+    vias: list[dict[str, Any]] = []
+    for block in _extract_balanced_sexpr_blocks(board_text, "via"):
+        at = re.search(r"\(\s*at\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)", block, re.IGNORECASE)
+        size = re.search(r"\(\s*size\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        drill = re.search(r"\(\s*drill\s+(-?\d+(?:\.\d+)?)\s*\)", block, re.IGNORECASE)
+        layers = re.search(r"\(\s*layers\s+([^\)]+)\)", block, re.IGNORECASE)
+        net = re.search(r"\(\s*net\s+(\d+)\s*\)", block, re.IGNORECASE)
+        if not (at and size and drill and layers and net):
+            continue
+        layer_values = re.findall(r'"([^\"]+)"|([^\s]+)', layers.group(1))
+        layer_names = [quoted or bare for quoted, bare in layer_values if (quoted or bare).strip()]
+        if len(layer_names) < 2:
+            continue
+        net_id = net.group(1).strip()
+        vias.append({
+            "x": float(at.group(1)), "y": float(at.group(2)),
+            "size": float(size.group(1)), "drill": float(drill.group(1)),
+            "layers": layer_names, "netId": net_id,
+            "netName": net_id_to_name.get(net_id, net_id).replace("!", "_"),
+        })
+    return vias
 
 
 def _extract_balanced_sexpr_blocks(text: str, head: str) -> list[str]:
@@ -1328,7 +1400,7 @@ def _segment_diff_key(segment: dict[str, Any]) -> tuple[Any, ...]:
 
 def _segment_to_line_out(segment: dict[str, Any]) -> str:
     return (
-        f"{_kicad_layer_to_line_out_layer(str(segment.get('layer') or ''))}!LINE!0!{str(segment.get('netName') or segment.get('netId') or '').replace('!', '_')}!"
+        f"{_kicad_layer_to_line_out_layer(str(segment.get('layer') or ''))}!LINE!257!{str(segment.get('netName') or '').replace('!', '_')}!"
         f"{_kicad_mm_to_line_out_coord_text(float(segment.get('x1') or 0), 'x')}!"
         f"{_kicad_mm_to_line_out_coord_text(float(segment.get('y1') or 0), 'y')}!"
         f"{_kicad_mm_to_line_out_coord_text(float(segment.get('x2') or 0), 'x')}!"
@@ -1336,6 +1408,27 @@ def _segment_to_line_out(segment: dict[str, Any]) -> str:
         f"{_kicad_mm_to_mil_text(float(segment.get('width') or 0))}"
     )
 
+
+def _via_diff_key(via: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        round(float(via.get("x") or 0), 6), round(float(via.get("y") or 0), 6),
+        round(float(via.get("size") or 0), 6), round(float(via.get("drill") or 0), 6),
+        tuple(str(layer) for layer in via.get("layers") or []),
+        str(via.get("netName") or via.get("netId") or ""),
+    )
+
+
+def _via_to_line_out(via: dict[str, Any]) -> str:
+    layers = list(via.get("layers") or [])
+    if len(layers) < 2:
+        return ""
+    return (
+        f"{_kicad_layer_to_line_out_layer(str(layers[0]))}!{_kicad_layer_to_line_out_layer(str(layers[-1]))}!CIRCLE!2!"
+        f"{str(via.get('netName') or '').replace('!', '_')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(via.get('x') or 0), 'x')}!"
+        f"{_kicad_mm_to_line_out_coord_text(float(via.get('y') or 0), 'y')}!"
+        f"{_kicad_mm_to_mil_text(float(via.get('drill') or 0))}!{_kicad_mm_to_mil_text(float(via.get('size') or 0))}"
+    )
 
 def _kicad_layer_to_line_out_layer(layer: str) -> str:
     layer = str(layer or "").strip().strip('"')
@@ -1365,15 +1458,27 @@ def _kicad_mm_to_mil_text(value: float) -> str:
 def _validate_line_out_text(text: str) -> tuple[bool, str, dict[str, Any]]:
     stripped = str(text or "").lstrip()
     if not stripped:
-        return False, "增量导入文件为空", {"lineCount": 0}
-    valid_count = 0
+        return False, "incremental import file is empty", {"lineCount": 0, "circleCount": 0}
+    line_count = 0
+    circle_count = 0
     for raw in stripped.splitlines():
         parts = [part.strip() for part in raw.split("!")]
-        if len(parts) == 9 and parts[1].upper() == "LINE" and parts[0] and parts[3]:
-            valid_count += 1
-    if valid_count <= 0:
-        return False, "增量导入文件未包含有效 LINE 记录", {"lineCount": 0}
-    return True, "", {"lineCount": valid_count}
+        if len(parts) == 9 and parts[1].upper() == "LINE" and parts[0] and parts[2] == "257" and parts[3]:
+            try:
+                [float(value) for value in parts[4:]]
+            except ValueError:
+                continue
+            line_count += 1
+        elif len(parts) == 9 and parts[2].upper() == "CIRCLE" and parts[0] and parts[1] and parts[3] == "2" and parts[4]:
+            try:
+                [float(value) for value in parts[5:]]
+            except ValueError:
+                continue
+            circle_count += 1
+    if line_count <= 0:
+        return False, "incremental import file contains no valid LINE records", {"lineCount": 0, "circleCount": circle_count}
+    return True, "", {"lineCount": line_count, "circleCount": circle_count}
+
 
 def _project_data_text(context: dict[str, Any]) -> str:
     project = context.get("projectData") or context.get("project_data")
@@ -1488,7 +1593,7 @@ def _help_route_params(arguments: dict[str, Any], context: dict[str, Any]) -> di
 
 # ====== 功能：解析可解释性模型需要的 kicad_pcb 输入文件。 ======
 def _explain_input_board(arguments: dict[str, Any], context: dict[str, Any]) -> Path | None:
-    for value in (arguments.get("input"), arguments.get("filePath"), arguments.get("boardPath")):
+    for value in (arguments.get("routedKicadFilePath"), arguments.get("input"), arguments.get("filePath"), arguments.get("boardPath")):
         if isinstance(value, str) and value.strip():
             return Path(value)
     for item in (context.get("helpPlannerResult"), context.get("rerouteResult"), context.get("fanout_routeResult"), context.get("importLinesResult"), context.get("projectData")):
@@ -1544,7 +1649,7 @@ def _resolve_path(root: Path, value: str | Path) -> Path:
     if re.match(r"^[A-Za-z]:[\\/]", text):
         return Path(text.replace("\\", "/"))
     path = Path(text.replace("\\", "/"))
-    return path if path.is_absolute() else root / path
+    return path if path.is_absolute() else (root / path).resolve()
 
 
 # ====== 功能：按命令行规则拆分外部工具命令。 ======

@@ -1,0 +1,20 @@
+{
+  "diff_rules": [
+    {
+      "name": "CLK_DIFF_RULE",
+      "pairs": ["CLK", "CLK2"],
+      "layers": {
+        "default": {
+          "width_mm": 0.1,
+          "width_tol_mm": 0.01,
+          "pair_gap_mm": 0.15,
+          "pair_gap_tol_mm": 0.02
+        }
+      },
+      "length_match": {
+        "enabled": true,
+        "tolerance_mm": 0.127
+      }
+    }
+  ]
+}

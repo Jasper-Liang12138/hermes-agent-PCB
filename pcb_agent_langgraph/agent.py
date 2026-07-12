@@ -139,7 +139,7 @@ class PCBLangGraphAgent:
                 for key in ("layerAssignResult", "escapeOrderResult", "fanout_routeResult", "importLinesResult", "importLinesRejected", "importLinesRejectedReason", "drcResult", "explainabilityReport", "fanoutParamsConfirmed"):
                     next_cache.pop(key, None)
             if any(token in text for token in ("reroute", "rip-up", "ripup")) or any(token in user_input for token in ("拆线", "重布")):
-                for key in ("deleteTracesResult", "rerouteInput", "localRouteCsvPath", "rerouteContext", "rerouteLoopResult", "rerouteResult", "lastRerouteResult", "rerouteStartedAt", "rerouteAttemptCount", "rerouteDrcFailureCount", "rerouteDrcFeedbackHistory", "rerouteUnavailable", "rerouteUnavailableReason", "helpPlannerResult", "importLinesResult", "drcResult", "lastDrcResult", "explainabilityReport"):
+                for key in ("deleteTracesResult", "rerouteInput", "localRouteCsvPath", "rerouteContext", "rerouteLoopResult", "rerouteResult", "lastRerouteResult", "rerouteStartedAt", "rerouteAttemptCount", "rerouteDrcFailureCount", "rerouteDrcFeedbackHistory", "rerouteUnavailable", "rerouteUnavailableReason", "helpPlannerResult", "importLinesResult", "helperDrcResult", "drcResult", "lastDrcResult", "explainabilityReport"):
                     next_cache.pop(key, None)
         return next_cache
 # ====== 功能：判断用户本轮是否在继续或重新发起 fanout。 ======

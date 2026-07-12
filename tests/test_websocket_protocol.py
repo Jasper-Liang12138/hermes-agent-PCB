@@ -120,11 +120,12 @@ def test_delete_traces_for_rerouting_tool_call_has_no_arguments():
 
 # ====== 功能：验证 importLines 按 v0.6 协议补齐导入参数。 ======
 def test_import_lines_tool_call_normalizes_arguments():
-    message = tool_call_message("s1", "p1", "call-3", "importLines", {"filePath": "F:/demo/line.out"})
+    message = tool_call_message("s1", "p1", "call-3", "importLines", {"filePath": "F:/demo/line.out", "requireApproval": False})
     assert message["body"]["content"]["arguments"] == {
         "filePath": "F:/demo/line.out",
         "successPins": [],
         "failedPins": [],
+        "requireApproval": False,
     }
 
 
@@ -294,3 +295,8 @@ def test_handler_passes_entry_signal_to_agent():
         await handler_task
 
     asyncio.run(scenario())
+
+
+def test_import_lines_defaults_to_approval_for_legacy_callers():
+    message = tool_call_message("s1", "p1", "call-legacy", "importLines", {"filePath": "F:/demo/line.out"})
+    assert message["body"]["content"]["arguments"]["requireApproval"] is True

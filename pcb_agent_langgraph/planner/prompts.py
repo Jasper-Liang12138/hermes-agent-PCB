@@ -61,12 +61,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Chunk and retrieve compact KiCad board context before local reroute.",
         "parameters": {"type": "object", "properties": {"chunkChars": {"type": "integer"}, "retrieveK": {"type": "integer"}}},
     },
-    # Legacy drc_check is intentionally not exposed; VSEA hard DRC is trusted in the default reroute chain.
-    # {
-    #     "name": "drc_check",
-    #     "description": "Run DRC check over current or routed board data.",
-    #     "parameters": {"type": "object", "properties": {}},
-    # },
+    {
+        "name": "drc_check",
+        "description": "Run full-board DRC for a helper-routed KiCad board.",
+        "parameters": {"type": "object", "properties": {"routedKicadFilePath": {"type": "string"}}},
+    },
     {
         "name": "explainability_report",
         "description": "Generate explainability report for PCB result and DRC status.",
@@ -97,9 +96,11 @@ def planner_system_prompt() -> str:
         "If fanout route is completed and import file exists, call importLines directly; the frontend importLines approval UI is the only import confirmation. "
         "After fanout importLines succeeds, stop with result_review/report; never call drc_check or explainability_report for fanout. "
         "For reroute, after deleteTracesForRerouting completes, call prepare_reroute_inputs, then compress_reroute_context, then reroute_loop. "
-        "If reroute_loop succeeds, trust its hard DRC result and call explainability_report before reporting import confirmation. "
-        "If reroute_loop fails, call help_planner fallback directly; when help_planner returns importLinesFilePath, report import confirmation without calling explainability_report. "
-        "Do not call legacy reroute or drc_check in the default reroute flow. "
+        "If reroute_loop succeeds, trust its hard DRC result, auto-import with requireApproval=false, then call explainability_report. "
+        "If reroute_loop fails, call help_planner fallback directly. When help_planner returns a routedKicadFilePath, call drc_check on that full board. "
+        "If helper DRC passes, auto-import with requireApproval=false, then call explainability_report with the helper routedKicadFilePath. "
+        "If helper DRC fails, never import, but still call explainability_report with the helper routedKicadFilePath and return the failure report. "
+        "Do not call legacy reroute. Only call drc_check for a helper full-board result. "
         "Example: {\"intent\":\"global_fanout\",\"workflow\":\"pcb_escape_flow\",\"action\":\"get_project\","
         "\"tool_calls\":[{\"name\":\"getProjectData\",\"arguments\":{\"selectedBGA\":\"U22\","
         "\"routerType\":\"rule_135\",\"constraints\":{\"LineWidth\":4,\"LineSpacing\":3}}}],"
