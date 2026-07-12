@@ -16,12 +16,19 @@ def build_markdown_report(task_type: str, cache: dict[str, Any]) -> dict[str, An
     status = "passed" if passed is True else str(drc.get("status") or "unknown")
     lines = [f"# {title}", "", "## DRC", *_drc_lines(drc), "", "## Explainability", *_explain_lines(explain)]
     report = "\n".join(lines).strip() + "\n"
+    debug = {}
+    drc_debug = drc.get("debug") if isinstance(drc.get("debug"), dict) else {}
+    smoke = drc_debug.get("explainabilitySmoke") if isinstance(drc_debug.get("explainabilitySmoke"), dict) else {}
+    if smoke:
+        debug["explainabilitySmoke"] = smoke
+        debug["explainabilitySmokeReportPath"] = smoke.get("report_path") or drc_debug.get("explainabilitySmokeReportPath") or ""
     return {
         "markdown": report,
         "drcStatus": status,
         "drcPassed": passed is True,
         "routeOutput": "",
         "explainStatus": explain.get("status") if isinstance(explain, dict) else "",
+        "debug": debug,
     }
 
 
@@ -116,6 +123,29 @@ def _drc_lines(drc: dict[str, Any]) -> list[str]:
     if drc.get("score") is not None:
         lines.append(f"- Score: `{drc.get('score')}`")
     errors = drc.get("errors") or []
+    if "fullBoardPassed" in drc:
+        lines.append(f"- Full-board DRC passed: `{bool(drc.get('fullBoardPassed'))}`")
+    if "targetScopedPassed" in drc:
+        lines.append(f"- Target-scoped DRC passed: `{bool(drc.get('targetScopedPassed'))}`")
+    target_nets = drc.get("targetNets") or []
+    if target_nets:
+        lines.append(f"- Target nets: `{', '.join(str(item) for item in target_nets)}`")
+    if drc.get("targetIssueCount") is not None:
+        lines.append(f"- Target issue count: `{drc.get('targetIssueCount')}`")
+    if drc.get("fullBoardIssueCount") is not None:
+        lines.append(f"- Full-board issue count: `{drc.get('fullBoardIssueCount')}`")
+    input_mode = drc.get("drcInputMode")
+    input_source = drc.get("drcInputSource")
+    routed_board_path = drc.get("routedBoardPath")
+    routed_text_chars = drc.get("routedTextChars")
+    if input_mode:
+        lines.append(f"- DRC input mode: `{input_mode}`")
+    if input_source:
+        lines.append(f"- DRC input source: `{input_source}`")
+    if routed_board_path:
+        lines.append(f"- DRC board input: `{routed_board_path}`")
+    if routed_text_chars is not None:
+        lines.append(f"- Routed text chars: `{routed_text_chars}`")
     if errors:
         lines.append("- Errors:")
         lines.extend(f"  - {_short_text(item)}" for item in errors[:8])
@@ -128,6 +158,14 @@ def _drc_lines(drc: dict[str, Any]) -> list[str]:
     summary = detail.get("failure_summary") or detail.get("reason")
     if summary:
         lines.append(f"- Detail: {_short_text(summary)}")
+    target_issues = drc.get("targetDrcIssues") if isinstance(drc.get("targetDrcIssues"), list) else []
+    residual_issues = drc.get("fullBoardResidualIssues") if isinstance(drc.get("fullBoardResidualIssues"), list) else []
+    if target_issues:
+        lines.append("- Target DRC issues:")
+        lines.extend(f"  - {_short_text((item or {}).get('message') or item, limit=500)}" for item in target_issues[:8])
+    if residual_issues:
+        lines.append("- Full-board residual issues not on target nets:")
+        lines.extend(f"  - {_short_text((item or {}).get('message') or item, limit=500)}" for item in residual_issues[:8])
     tool_path = drc.get("tool_path")
     eval_root = drc.get("eval_root")
     if tool_path:
